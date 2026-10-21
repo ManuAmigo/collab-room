@@ -1,0 +1,42 @@
+# The same checks as scripts/ci, on GitHub Actions: lint, format and types, the full suite on Linux and
+# macOS, and the Python 3.9 start.
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: npm install -g pyright@1
+      - run: scripts/ci --quick
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: sudo apt-get install -y tmux
+        if: runner.os == 'Linux'
+      - run: brew install tmux
+        if: runner.os == 'macOS'
+      - run: TMPDIR="$(mktemp -d)" python3 -m unittest discover -s tests
+  py39:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - name: the part before the hand-over parses on 3.9, and install starts
+        run: |
+          python3 -c 'import ast; ast.parse(open("collab").read(), feature_version=(3, 9))'
+          HOME="$(mktemp -d)" python3 collab install --dry-run --bin-dir "$(mktemp -d)" </dev/null

@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "session": "collab-room",
+  "participants": [
+    { "id": "owner", "label": "Product owner", "command": ["collab", "chat", "--as", "owner"], "delivery": "pull" },
+    { "id": "claude", "label": "Claude Code", "command": ["claude"], "delivery": "pull" },
+    { "id": "codex", "label": "Codex", "command": ["codex"], "delivery": "tmux", "idle": "^› Ask Codex", "busy": "Working \\(", "cwd": "." },
+    { "id": "reviewer", "label": "Independent reviewer", "command": ["review-cli"], "delivery": "pull" }
+  ]
+}

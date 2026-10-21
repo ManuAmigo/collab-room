@@ -1,0 +1,14 @@
+# The same checks scripts/ci runs, on each commit. Install once: pre-commit install.
+# The full test suite is not here — it takes minutes; scripts/ci runs it.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1
+    hooks:
+      - id: ruff
+        files: ^(collab|(scripts|tests|tools|src)/.*\.py)$
+        types_or: [python, file]
+      # Not collab: it is the package's build, checked by tools/build_collab.py --check (scripts/ci);
+      # formatting it would break that.
+      - id: ruff-format
+        files: ^(scripts|tests|tools|src)/.*\.py$
+        types_or: [python, file]

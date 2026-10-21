@@ -1,0 +1,5 @@
+.collab/
+.DS_Store
+__pycache__/
+*.py[cod]
+_local/

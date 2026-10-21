@@ -1,0 +1,11 @@
+{
+  "name": "collab-room",
+  "owner": { "name": "collab-room" },
+  "plugins": [
+    {
+      "name": "collab-room",
+      "source": "./integrations/claude-code",
+      "description": "Join a local collab-room: read messages addressed to you, reply, claim work, report commits."
+    }
+  ]
+}

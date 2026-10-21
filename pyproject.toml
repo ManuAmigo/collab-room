@@ -1,0 +1,36 @@
+# Development checks only — collab itself has no dependencies (ruff + pyright are for development).
+# Run from the checkout — all of them at once: scripts/ci:
+#   uvx ruff check          (or: ruff check)
+#   uvx ruff format --check (one style for all the code; `uvx ruff format` writes it)
+#   pyright                 (npm i -g pyright / brew install pyright)
+
+[tool.ruff]
+target-version = "py39"
+line-length = 130
+extend-include = ["collab"]          # the program is one file without .py
+
+[tool.ruff.format]
+# One style for all the code: ruff's defaults; the line stays 130 as above.
+# Formatting never changes the AST — checked when it was first applied.
+
+[tool.ruff.lint]
+# Correctness first: pyflakes (unused/undefined names), pycodestyle errors, bugbear (likely bugs).
+select = ["F", "E", "B"]
+ignore = [
+    "E501",   # long lines: the file keeps long, commented lines on purpose
+    "E731",   # lambdas assigned to names are used deliberately in tests
+    "E702",   # «a; b» on one line — the tests' style for key-then-wait
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The one file is laid out as the package it is built from: each module's part begins
+# with its own imports, so imports stand mid-file and repeat. Only these two, only in collab.
+"collab" = ["E402", "F811"]
+
+[tool.pyright]
+pythonVersion = "3.9"
+include = ["collab", "scripts", "tests", "tools", "src"]
+extraPaths = ["src", "tests"]
+typeCheckingMode = "basic"
+# The core in strict mode: pure modules, every type known.
+strict = ["src/collab/text.py", "src/collab/term.py", "src/collab/store.py", "src/collab/log.py", "src/collab/screen.py", "src/collab/usage.py"]

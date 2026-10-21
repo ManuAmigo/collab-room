@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# All the checks, one command; .github/workflows/ci.yml runs the same on GitHub Actions.
+# Run from anywhere in the checkout:
+#   scripts/ci            lint, format, types, then the full suite here (macOS or Linux), in two
+#                         processes at once by default (scripts/ci_parallel.py)
+#   scripts/ci --serial   the same with the suite in one process, as unittest discover runs it
+#   scripts/ci --quick    lint, format, types only — seconds, for while you work
+#   scripts/ci --linux    the full suite in a Linux container (Docker), Python 3.11–3.13, and the
+#                         Python 3.9 checks: the program must still parse and start install there
+# The suite runs on its own tmux server in a temporary folder (tests/_isolation.py); nothing here
+# touches a running room or the person's files.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# What the program is made of; tools/ and src/ come with the package — checked
+# from the moment they exist.
+paths() { for p in collab scripts tests tools src; do if [ -e "$p" ]; then echo "$p"; fi; done; }
+
+# pyright on the program's own code: no new findings. The count is the current debt; lower it
+# here when a fix brings it down (the check says so). Tests are not gated: their mocks are untyped.
+PYRIGHT_DEBT=1
+
+lint() {
+    local code
+    echo "== ruff check"
+    uvx ruff check $(paths)
+    echo "== ruff format --check"
+    # Not collab: it is the package's build — its empty lines stand for imports the build empties —
+    # checked below.
+    uvx ruff format --check $(paths | grep -v '^collab$')
+    echo "== pyright (program code: at most $PYRIGHT_DEBT, the current debt)"
+    # Not collab once src is there: it is src's build (checked below), and its findings are src's, counted twice.
+    code=$(paths | grep -v '^tests$' | { if [ -d src ]; then grep -v '^collab$'; else cat; fi; })
+    local found
+    # pyright exits non-zero whenever it finds anything; the count decides here, not its exit code.
+    found=$( (pyright $code 2>&1 || true) | sed -n 's/^\([0-9][0-9]*\) errors\{0,1\},.*/\1/p')
+    if [ -z "$found" ]; then pyright $code; return 1; fi
+    if [ "$found" -gt "$PYRIGHT_DEBT" ]; then pyright $code; echo "pyright: $found findings, more than the debt $PYRIGHT_DEBT" >&2; return 1; fi
+    if [ "$found" -lt "$PYRIGHT_DEBT" ]; then echo "pyright: $found findings — lower PYRIGHT_DEBT in scripts/ci to $found"; fi
+    echo "pyright: $found"
+    # The file people and Codex run is the build: the committed one must equal a fresh build.
+    if [ -f tools/build_collab.py ]; then
+        echo "== build: committed collab == fresh build"
+        python3 tools/build_collab.py --check
+    fi
+}
+
+suite() {
+    echo "== full suite ($(python3 --version), in parallel)"
+    # Its own tests point it at another folder with CI_PARALLEL_TESTS; the suite is always tests/.
+    env -u CI_PARALLEL_TESTS python3 scripts/ci_parallel.py
+}
+
+serial() {
+    echo "== full suite ($(python3 --version), one process)"
+    TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/collab-ci.XXXXXX")" python3 -m unittest discover -s tests
+}
+
+linux() {
+    # The checkout goes in read-only and is copied inside: the container never writes here. It runs as
+    # an ordinary user — tests that check «nobody else may write» mean nothing as root. No network once
+    # the image is built, and nothing of the person's home is mounted (~/.claude, ~/.codex,
+    # ~/.collab-room stay out).
+    local image=collab-room-ci
+    docker build -q -t "$image" -f scripts/ci-linux.Dockerfile scripts >/dev/null
+    # Every version runs, red or green, and the summary says which failed — one red version must not
+    # hide how the others did.
+    local failed=""
+    for version in 3.11 3.12 3.13; do
+        echo "== Linux, Python $version"
+        docker run --rm --network none -v "$PWD:/src:ro" "$image" "$version" suite || failed="$failed $version"
+    done
+    echo "== Linux, Python 3.9: syntax and install start"
+    docker run --rm --network none -v "$PWD:/src:ro" "$image" 3.9 py39 || failed="$failed 3.9"
+    if [ -n "$failed" ]; then echo "Linux: red on Python$failed" >&2; return 1; fi
+    echo "Linux: green on 3.11, 3.12, 3.13; 3.9 starts"
+}
+
+case "${1:-}" in
+    --quick) lint ;;
+    --serial) lint; serial ;;
+    --linux) linux ;;
+    "") lint; suite ;;
+    *) echo "usage: scripts/ci [--quick | --serial | --linux]" >&2; exit 2 ;;
+esac

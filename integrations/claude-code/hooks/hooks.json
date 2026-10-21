@@ -1,0 +1,71 @@
+{
+  "description": "collab-room: keep this Claude's state in the room automatically — working while it acts, idle when its turn ends. Silent outside a room.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v collab >/dev/null && collab status --as \"${COLLAB_AS:-claude}\" working --if-room --hook >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v collab >/dev/null && collab status --as \"${COLLAB_AS:-claude}\" working --if-room --hook >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v collab >/dev/null && collab status --as \"${COLLAB_AS:-claude}\" idle --if-room --hook >/dev/null 2>&1 || true"
+          },
+          {
+            "type": "command",
+            "command": "command -v collab >/dev/null && collab hook-model --as \"${COLLAB_AS:-claude}\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v collab >/dev/null && collab status --as \"${COLLAB_AS:-claude}\" needs_owner --note \"permission prompt\" --if-room --hook >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v collab >/dev/null && collab hook-model --as \"${COLLAB_AS:-claude}\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ],
+    "PostModelSwitch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v collab >/dev/null && collab hook-model --as \"${COLLAB_AS:-claude}\" >/dev/null 2>&1 || true"
+          }
+        ]
+      }
+    ]
+  }
+}
