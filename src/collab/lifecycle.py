@@ -604,6 +604,8 @@ def open_room_windows(
     """A new room's windows: the session with its own seats, the agents it starts again, panes.json.
     Returns the agents delivered to in windows of their own."""
     rp = m_store.room().paths
+    # «"layout": "tiled"» in the room's settings: every seat a pane of the chat's window, as rooms opened before.
+    tiled = config.get("layout") == "tiled"
     for i, p in enumerate(own):
         cwd = str((rp.root / p.get("cwd", ".")).resolve())
         # The program is the pane's own process, not a line typed into a login shell: a login
@@ -631,7 +633,9 @@ def open_room_windows(
                 *m_tmuxio.pane_env(),
                 *run_cmd,
             )
-        else:
+        # People's chats stay together in the chat's window: the clients of one session share its
+        # current window, and a second person's chat in a window of its own was not where they were.
+        elif tiled or m_store.is_chat_command(p.get("command")):
             out = m_tmuxio.tmux(
                 "split-window",
                 "-d",
@@ -646,6 +650,25 @@ def open_room_windows(
                 *run_cmd,
             )
             m_tmuxio.tmux("select-layout", "-t", f"{session}:room", "tiled")
+        else:
+            # Each agent in a window of its own, as /add opens one: four panes in one window were a maze for a
+            # person who knew no tmux keys, and the chat is seen whole. The name never a room window's own.
+            name = p["id"] if p["id"] not in (m_text.ROOM, "deliver") else f"{p['id']}-agent"
+            out = m_tmuxio.tmux(
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                f"={session}:",
+                "-n",
+                name,
+                "-c",
+                m_tmuxio.tmux_dir(cwd),
+                *m_tmuxio.pane_env(),
+                *run_cmd,
+            )
         pane = out.stdout.strip()
         panes[p["id"]] = pane
         # -T is a tmux format: an agent's own name «#(…)» ran a command at start on tmux 3.4.

@@ -145,6 +145,9 @@ are preserved.
 - `collab init` writes a `.collab.json` for the current folder without opening the room: your
   `owner` seat plus an entry for each installed Claude Code and Codex, asking for names in a
   terminal (`--no-ask` skips that, `--force` replaces an existing file).
+- `collab start` opens the chat in the room's window and each agent in a window of its own;
+  you watch and answer them from the chat (`/view`, `/answer`). `"layout": "tiled"` at the top level of
+  `.collab.json` puts every seat a room starts into the chat's window as panes instead.
 - [examples/team.json](../examples/team.json) is a hand-written four-participant example (a person,
   Claude Code, Codex and a reviewer); replace the placeholder reviewer command before using it.
   collab-room does not read it by itself — it is for manual setups.

@@ -110,7 +110,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -7486,6 +7486,8 @@ def open_room_windows(
     """A new room's windows: the session with its own seats, the agents it starts again, panes.json.
     Returns the agents delivered to in windows of their own."""
     rp = room().paths
+    # «"layout": "tiled"» in the room's settings: every seat a pane of the chat's window, as rooms opened before.
+    tiled = config.get("layout") == "tiled"
     for i, p in enumerate(own):
         cwd = str((rp.root / p.get("cwd", ".")).resolve())
         # The program is the pane's own process, not a line typed into a login shell: a login
@@ -7513,7 +7515,9 @@ def open_room_windows(
                 *pane_env(),
                 *run_cmd,
             )
-        else:
+        # People's chats stay together in the chat's window: the clients of one session share its
+        # current window, and a second person's chat in a window of its own was not where they were.
+        elif tiled or is_chat_command(p.get("command")):
             out = tmux(
                 "split-window",
                 "-d",
@@ -7528,6 +7532,25 @@ def open_room_windows(
                 *run_cmd,
             )
             tmux("select-layout", "-t", f"{session}:room", "tiled")
+        else:
+            # Each agent in a window of its own, as /add opens one: four panes in one window were a maze for a
+            # person who knew no tmux keys, and the chat is seen whole. The name never a room window's own.
+            name = p["id"] if p["id"] not in (ROOM, "deliver") else f"{p['id']}-agent"
+            out = tmux(
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                f"={session}:",
+                "-n",
+                name,
+                "-c",
+                tmux_dir(cwd),
+                *pane_env(),
+                *run_cmd,
+            )
         pane = out.stdout.strip()
         panes[p["id"]] = pane
         # -T is a tmux format: an agent's own name «#(…)» ran a command at start on tmux 3.4.
@@ -10549,7 +10572,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
             paint(
                 "Welcome to your room\n  Write to your agents here.\n"
                 "  Tab chooses who receives your message. Enter sends it.\n"
-                "  Type / to choose an action. You don't need to remember commands.",
+                "  Type / to choose an action. You don't need to remember commands.\n"
+                "  Each agent works in a window of its own — you never need to go there:\n"
+                "  /view shows its screen, /answer opens it to reply, Ctrl+] brings you back.",
                 "1;38;5;252",
             )
             + "\n" * 4

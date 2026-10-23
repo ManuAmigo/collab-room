@@ -418,7 +418,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
             m_text.paint(
                 "Welcome to your room\n  Write to your agents here.\n"
                 "  Tab chooses who receives your message. Enter sends it.\n"
-                "  Type / to choose an action. You don't need to remember commands.",
+                "  Type / to choose an action. You don't need to remember commands.\n"
+                "  Each agent works in a window of its own — you never need to go there:\n"
+                "  /view shows its screen, /answer opens it to reply, Ctrl+] brings you back.",
                 "1;38;5;252",
             )
             + "\n" * 4

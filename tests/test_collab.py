@@ -6169,9 +6169,67 @@ class DeliveryTest(Base):
             out = self.run_collab("start")
             self.assertEqual(out.returncode, 0, out.stderr)
             started = subprocess.run(
-                ["tmux", "list-panes", "-t", f"={session}:room", "-F", "#{pane_start_path}"], capture_output=True, text=True
+                ["tmux", "list-panes", "-s", "-t", f"={session}", "-F", "#{window_name} #{pane_start_path}"],
+                capture_output=True,
+                text=True,
             ).stdout.split("\n")[:-1]
-            self.assertEqual(started, [os.path.realpath(folder)] * 2)
+            seats = sorted(line for line in started if not line.startswith("deliver "))
+            self.assertEqual(seats, [f"agent {os.path.realpath(folder)}", f"room {os.path.realpath(folder)}"])
+        finally:
+            subprocess.run(["tmux", "kill-session", "-t", f"={session}"], capture_output=True)
+
+    def _seat_windows(self, session):
+        listed = subprocess.run(
+            ["tmux", "list-panes", "-s", "-t", f"={session}", "-F", "#{window_name} #{pane_id}"], capture_output=True, text=True
+        ).stdout.split("\n")[:-1]
+        windows = {}
+        for line in listed:
+            name, pane = line.split(" ")
+            windows.setdefault(name, []).append(pane)
+        windows.pop("deliver", None)
+        return windows
+
+    def test_start_gives_each_agent_a_window_of_its_own_and_keeps_the_people_in_the_room_window(self):
+        # Chat and agents were panes «tiled» in one window: a person who knew no tmux keys could
+        # not move between them. The chat is alone in its window; each agent is in its own, as /add does.
+        session = f"collab-own-{uuid.uuid4().hex[:6]}"
+        self.write_config(
+            [
+                {"id": "owner", "command": ["sleep", "60"]},
+                {"id": "claude", "command": ["sleep", "60"]},
+                {"id": "room", "command": ["sleep", "60"]},  # an id that is a room window's own name
+                {"id": "maria", "command": ["python3", str(COLLAB), "chat", "--as", "maria"]},  # a second person
+            ],
+            session=session,
+        )
+        try:
+            out = self.run_collab("start")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            panes = json.loads((self.state / "panes.json").read_text())["panes"]
+            windows = self._seat_windows(session)
+            self.assertEqual(sorted(windows.get("room", [])), sorted([panes["owner"], panes["maria"]]), windows)
+            self.assertEqual(windows.get("claude"), [panes["claude"]], windows)
+            self.assertEqual(windows.get("room-agent"), [panes["room"]], windows)
+            current = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", f"={session}:", "#{window_name}"], capture_output=True, text=True
+            ).stdout.strip()
+            self.assertEqual(current, "room", "the person lands on the chat")
+        finally:
+            subprocess.run(["tmux", "kill-session", "-t", f"={session}"], capture_output=True)
+
+    def test_layout_tiled_keeps_every_seat_in_the_chat_window(self):
+        session = f"collab-tile-{uuid.uuid4().hex[:6]}"
+        self.write_config(
+            [{"id": "owner", "command": ["sleep", "60"]}, {"id": "claude", "command": ["sleep", "60"]}], session=session
+        )
+        data = json.loads(self.cfg.read_text())
+        data["layout"] = "tiled"
+        self.cfg.write_text(json.dumps(data))
+        try:
+            out = self.run_collab("start")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            panes = json.loads((self.state / "panes.json").read_text())["panes"]
+            self.assertEqual(self._seat_windows(session), {"room": [panes["owner"], panes["claude"]]})
         finally:
             subprocess.run(["tmux", "kill-session", "-t", f"={session}"], capture_output=True)
 
@@ -12835,6 +12893,8 @@ class DeliveryTest(Base):
         pane, keys = self._chat_room()
         self.assertTrue(self.wait_for(pane, "Welcome to your room  ↑↓"), self.screen(pane))
         self.assertIn("Tab chooses who receives your message", self.screen(pane))
+        self.assertIn("you never need to go there", self.screen(pane))
+        self.assertIn("Ctrl+] brings you back", self.screen(pane))
         keys("Escape")  # = Skip for now
         self.assertTrue(self.wait_for(pane, "type /help"), self.screen(pane))
         self.assertTrue((self.root / "welcomed").exists(), "seen once — not again")
