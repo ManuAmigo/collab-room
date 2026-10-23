@@ -17,6 +17,7 @@ import datetime as dt
 import unittest
 from unittest import mock
 import uuid
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -152,6 +153,7 @@ class Base(unittest.TestCase):
         self.addCleanup(patcher.stop)
         # The first-visit welcome is shown once per person; for every other test it has been seen.
         (self.root / "welcomed").write_text("seen\n", encoding="utf-8")
+        (self.root / "language").write_text("en\n", encoding="utf-8")  # chosen at the first run: not asked again
         # The room's files live outside the project now: its home, by the same rule.
         home = _ROOM_HOME(self.root)
         self.cfg, self.state = home / ".collab.json", home / ".collab"
@@ -1862,6 +1864,82 @@ class RoomTest(Base):
 
         self.enterContext(seam(mod, "tmuxio.tmux", tmux))
         return mod
+
+    def test_the_rooms_words_are_in_both_languages_with_the_same_parameters_and_number_forms(self):
+        # A key missing in one language fails here, not as a quiet English line in a Russian room.
+        mod = _Loader(f"collab_i18n_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        names = lambda text: sorted(re.findall(r"\{(\w+)\}", text))
+        for key, entry in mod.CATALOG.items():
+            self.assertEqual(sorted(entry), ["en", "ru"], key)
+            forms = {"en": ("one", "other"), "ru": ("one", "few", "many")}
+            texts = {}
+            for lang in ("en", "ru"):
+                value = entry[lang]
+                if isinstance(value, dict):
+                    self.assertEqual(sorted(value), sorted(forms[lang]), f"{key}: the forms of a number in {lang}")
+                    texts[lang] = list(value.values())
+                else:
+                    texts[lang] = [value]
+                for text in texts[lang]:
+                    self.assertTrue(text.strip(), f"{key}: empty in {lang}")
+            self.assertEqual({tuple(names(x)) for x in texts["en"]}, {tuple(names(x)) for x in texts["ru"]}, f"{key}: parameters")
+        agents = {n: mod.words_in("n.agents", "ru", n=n) for n in (1, 2, 5, 11, 12, 14, 21, 22, 25, 111)}
+        self.assertEqual(agents, {1: "1 агент", 2: "2 агента", 5: "5 агентов", 11: "11 агентов", 12: "12 агентов", 14: "14 агентов",
+                                  21: "21 агент", 22: "22 агента", 25: "25 агентов", 111: "111 агентов"})  # fmt: skip
+        self.assertEqual(mod.words_in("n.agents", "en", n=1), "1 agent")
+        self.assertEqual(mod.words_in("team.what", "xx"), "What will we do?", "a language not known: English")
+
+    def test_every_command_has_its_russian_name_and_either_name_does_the_same(self):
+        mod = _Loader(f"collab_cmds_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        for en, ru in mod.COMMANDS:
+            self.assertEqual(mod.command(ru), en, ru)
+            self.assertEqual(mod.command(en), en)
+            self.assertEqual(mod.command(ru.upper()), en, "case")
+        self.assertEqual(mod.command("/личное Ирина"), "/dm Ирина", "a name stays as it is")
+        self.assertEqual(mod.command("/личное закрыть"), "/dm close")
+        self.assertEqual(mod.command("/dm закрыть"), "/dm close", "a Russian subcommand after the English name")
+        self.assertEqual(mod.command("/имя claude Ирина Петровна"), "/name claude Ирина Петровна")
+        for line in ("привет /добавить", "//добавить", "/добавитьагента", "/unknown"):
+            self.assertEqual(mod.command(line), line, "not a command: as it came")
+        decomposed = unicodedata.normalize("NFD", "/язык")
+        self.assertEqual(mod.command(decomposed), "/language", "NFC")
+        self.assertEqual(mod.shown_command("/add", "ru"), "/добавить")
+        self.assertEqual(mod.shown_command("/add", "en"), "/add")
+
+    def test_a_russian_room_briefs_its_agents_in_russian_and_an_old_room_stays_english(self):
+        people = [
+            {"id": "owner", "label": "Андрей"},
+            {"id": "mira", "label": "Мира", "kind": "claude", "pane": False, "role": "lead"},
+            {"id": "a", "label": "Ann", "kind": "claude", "pane": False, "idle": "x", "role": "worker", "topic": "цены"},
+        ]
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+
+        def brief(pid, **room):
+            self.cfg.write_text(
+                json.dumps({"version": 2, "session": "t", "participants": people, "team": {}, **room}), encoding="utf-8"
+            )
+            r = self.run_collab("brief", "--as", pid)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout
+
+        ru = brief("a", language="ru")
+        for part in ("Ваше назначение в этой комнате (версия 1):", "- Роль: исполнитель — вы делаете свою часть",
+                     "- Тема: цены.", "- Кому отвечаете: Мира.", "- Отвечайте по-русски.", "Кто даст задачу: Мира."):  # fmt: skip
+            self.assertIn(part, ru)
+        self.assertIn("- Ваша команда: Ann — исполнитель, цены.", brief("mira", language="ru"))
+        old = brief("a")
+        self.assertIn("Your assignment in this room", old, "a room made before speaks English, as it did")
+        self.assertIn("- Answer in English.", old)
+        team = self.run_collab("team")
+        self.cfg.write_text(
+            json.dumps(
+                {"version": 2, "session": "t", "participants": people, "team": {"scenario": "research"}, "language": "ru"}
+            ),
+            encoding="utf-8",
+        )
+        team = self.run_collab("team").stdout
+        self.assertTrue(team.startswith("Команда: Исследование · итог: в чате · без вас: ничего внешнего"), team)
+        self.assertIn("Ann · исполнитель · цены · модель по умолчанию", team)
 
     def test_settings_go_by_layers_seat_room_agent_and_a_bad_one_is_skipped(self):
         # One chain for every setting: built-in by kind, the seat in the room's scenario, the room (only the
@@ -13828,6 +13906,32 @@ class DeliveryTest(Base):
         self.assertTrue(self.wait_for(pane, "Declined."), self.screen(pane))
         self.assertNotIn("topic", ann())
         self.assertIn("Your proposal is declined.", [m["text"] for m in self.messages() if m["to"] == ["lea"]])
+
+    def test_a_room_made_in_russian_speaks_russian_and_language_switches_it(self):
+        # The person's default (saved at the first run) gives a new room its language; /язык changes the room's.
+        (self.root / "language").write_text("ru\n", encoding="utf-8")
+        self.cfg.unlink(missing_ok=True)
+        r = self.run_collab("start", "--session", self.session)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(self.cfg.read_text()).get("language"), "ru")
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+        self.assertTrue(self.wait_for(pane, "The room calls you"), self.screen(pane))
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Что будем делать?  ↑↓"), self.screen(pane))
+        self.assertIn("› Без шаблона — добавьте агентов через /добавить", self.screen(pane))
+        self.assertIn("Исследование — Собрать сведения", self.screen(pane))
+        keys("Enter")  # no template
+        self.assertTrue(self.wait_for(pane, "Без шаблона: добавьте агента через"), self.screen(pane))
+        keys("-l", "/язык")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Выберите язык / Choose language"), self.screen(pane))
+        keys("Enter")  # English, first
+        self.assertTrue(self.wait_for(pane, "Change this room's language to English?"), self.screen(pane))
+        keys("Enter")  # Apply
+        self.assertTrue(self.until(lambda: json.loads(self.cfg.read_text()).get("language") == "en"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "The room speaks English now"), self.screen(pane))
+        self.assertEqual((self.root / "language").read_text().strip(), "ru", "the default for new rooms is not changed by Apply")
 
     def test_first_visit_welcomes_once_and_sends_nothing(self):
         # «the user must learn all this easily».

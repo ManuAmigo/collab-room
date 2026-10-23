@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
@@ -400,7 +401,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         wizard=lambda: wizard,
     )
     if tty and not welcome:
-        feed(m_chat_help.HELP(me, ids=known))
+        feed(m_chat_help.HELP(me, ids=known, lang=m_store.room_language(config)))
     # The latest messages last, right above the input: under the guide they scrolled out of a
     # small window, and with the mouse off the reopened room looked empty.
     everything = m_log.read_messages()
@@ -443,7 +444,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         )
     if tty and not welcome and args.as_ in m_store.people_ids(config) and m_chat_wizard.offer_team(config):
         # A new room: «What will we do?» first — a ready team, or none (Esc, or «No ready team»).
-        m_chat_wizard.open_scenarios_into(wizard)
+        m_chat_wizard.open_scenarios_into(wizard, m_store.room_language(config))
     if tty and args.as_ in m_store.people_ids(config) and m_store.name_asked(args.as_):
         # Named after the computer's account («Andreynaumov»): asked before anything else, the welcome after.
         mine = m_store.label_of(config, args.as_)
@@ -579,28 +580,15 @@ def cmd_chat(args: argparse.Namespace) -> None:
     ui.suggested = False  # the draft is a suggested name: typing replaces it, ← → edit it
     ui.came_back = False  # Esc just stepped back from a command's menu to «/»
     after_lock: list[Any] = []  # what runs once a key is handled, without the chat's lock (the popup)
+    # The menu's order; each shown in the room's language when the menu is drawn (chat_cmds.chat_menu_items).
     COMMANDS = [
-        ("/add", "start a new agent"),
-        ("/remove", "disconnect a participant"),
-        ("/mute", "room-wide messages stop; by name still arrive"),
-        ("/unmute", "deliver to an agent again"),
-        ("/unlimit", "an agent is back from its usage limit: deliver to it again"),
-        ("/name", "rename yourself or an agent"),
-        ("/view", "see an agent's screen (read-only)"),
-        ("/answer", "respond in an agent terminal over the chat"),
-        ("/open", "open an agent's window in a new tab"),
-        ("/pause", "pause the room: agents get no messages"),
-        ("/resume", "resume the room: waiting messages go out"),
-        ("/clear", "clear the history (moved to an archive)"),
-        ("/help", "what would you like to do? — tasks and the guide"),
-        ("/mine", "what is for you: unread messages, agents waiting for you"),
-        ("/dm", "talk privately with an agent in a panel beside the chat"),
-        ("/restart", "restart an agent, its conversation continues"),
-        ("/team", "the team: see it, or start a ready one"),
-        ("/stop", "stop the room: close its windows and agents"),
-        ("/exit", "close this chat panel"),
-    ]
-    slash_commands = tuple(c for c, _ in COMMANDS)
+        (c, m_i18n.words_in(f"cmd.{c[1:]}", "en"))
+        for c in (
+            "/add", "/remove", "/mute", "/unmute", "/unlimit", "/name", "/view", "/answer", "/open", "/pause",
+            "/resume", "/clear", "/help", "/mine", "/dm", "/restart", "/team", "/language", "/stop", "/exit",
+        )
+    ]  # fmt: skip
+    slash_commands = tuple(c for c, _ in COMMANDS) + tuple(m_i18n.shown_command(c, "ru") for c, _ in COMMANDS)
 
     def people_for(cmd: str) -> list[str]:
         return m_chat_cmds.chat_people_for(command_context, cmd)

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.term as m_term
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
@@ -777,9 +778,12 @@ def start_scenario(name: str, folder: str) -> tuple[list[str], list[str]]:
 def team_started(config: dict[str, Any], started: list[str], failed: list[str]) -> str:
     """One line for a team started: how many of how many, who leads — and each that did not start, with why.
     Not «all started» when some did not."""
-    lead = m_store.lead_of(config)
-    head = f"Team started: {len(started)} of {len(started) + len(failed)} agents." + (
-        f" Lead — {m_store.label_of(config, lead)}." if lead else " No lead started: /add one, or start the team again."
+    lead, lang = m_store.lead_of(config), m_store.room_language(config)
+    total = m_i18n.words_in("n.agents", lang, n=len(started) + len(failed))
+    head = m_i18n.words_in("team.started", lang, started=len(started), total=total) + (
+        m_i18n.words_in("team.started.lead", lang, lead=m_store.label_of(config, lead))
+        if lead
+        else m_i18n.words_in("team.started.nolead", lang)
     )
     return "\n".join([head, *(f"  ! {m_text.visible(why)}" for why in failed)])
 

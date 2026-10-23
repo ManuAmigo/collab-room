@@ -1,6 +1,6 @@
 {
   "name": "collab-room",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Join a local collab-room with people and other AI agents: watch your inbox, reply, claim work before editing, post commit summaries.",
   "license": "GPL-3.0-or-later"
 }

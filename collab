@@ -110,7 +110,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -824,6 +824,520 @@ def until_hm(until: float) -> str:
     at = dt.datetime.fromtimestamp(until)
     return at.strftime("%H:%M") if at.date() == dt.date.today() else at.strftime("%d.%m %H:%M")
 
+import hashlib
+import unicodedata
+from typing import Any
+
+# The room's own words in each language it speaks: one catalog, a key for each text, the same keys in every
+# language, a parameter by its name — never a sentence put together from translated pieces. Names, ids, paths,
+# models and commands to run go in as parameters, as they are. A number takes its form by the language's rule
+# (one / few / many in Russian). A key missing in one language is a test's failure, not a quiet English line.
+LANGS = ("en", "ru")
+LANG_NAMES = {"en": "English", "ru": "Русский"}
+
+CATALOG: dict[str, dict[str, Any]] = {
+    # The first run: both languages at once, before anything else.
+    "lang.choose": {"en": "Выберите язык / Choose language", "ru": "Выберите язык / Choose language"},
+    "lang.room": {"en": "Room language: {language}", "ru": "Язык комнаты: {language}"},
+    "lang.change.question": {
+        "en": "Change this room's language to {language}?",
+        "ru": "Язык комнаты: {language}. Применить?",
+    },
+    "lang.change.apply": {"en": "Apply", "ru": "Применить"},
+    "lang.change.cancel": {"en": "Cancel", "ru": "Отмена"},
+    "lang.change.also_new": {"en": "Also for new rooms", "ru": "Использовать и для новых комнат"},
+    "lang.changed": {
+        "en": "The room speaks English now. Agents get it with their next assignment.",
+        "ru": "Язык комнаты изменён на русский. Агенты получат указание отвечать по-русски со следующей вводной.",
+    },
+    "lang.unchanged": {"en": "Language unchanged.", "ru": "Язык не изменён."},
+    # Counts.
+    "n.agents": {
+        "en": {"one": "{n} agent", "other": "{n} agents"},
+        "ru": {"one": "{n} агент", "few": "{n} агента", "many": "{n} агентов"},
+    },
+    # The chat's command menu.
+    "cmd.add": {"en": "start a new agent", "ru": "запустить нового агента"},
+    "cmd.remove": {"en": "disconnect a participant", "ru": "отключить участника от комнаты"},
+    "cmd.mute": {
+        "en": "room-wide messages stop; by name still arrive",
+        "ru": "общие сообщения не доставляются; по имени — доходят",
+    },
+    "cmd.unmute": {"en": "deliver to an agent again", "ru": "снова доставлять агенту общие сообщения"},
+    "cmd.unlimit": {
+        "en": "an agent is back from its usage limit: deliver to it again",
+        "ru": "возобновить доставку агенту после окончания лимита",
+    },
+    "cmd.name": {"en": "rename yourself or an agent", "ru": "переименовать себя или агента"},
+    "cmd.view": {"en": "see an agent's screen (read-only)", "ru": "посмотреть экран агента (только чтение)"},
+    "cmd.answer": {"en": "respond in an agent terminal over the chat", "ru": "ответить в терминале агента поверх чата"},
+    "cmd.open": {"en": "open an agent's window in a new tab", "ru": "открыть окно агента в новой вкладке"},
+    "cmd.pause": {"en": "pause the room: agents get no messages", "ru": "приостановить доставку сообщений агентам"},
+    "cmd.resume": {"en": "resume the room: waiting messages go out", "ru": "возобновить доставку ожидающих сообщений"},
+    "cmd.clear": {"en": "clear the history (moved to an archive)", "ru": "очистить историю комнаты (переносится в архив)"},
+    "cmd.help": {"en": "what would you like to do? — tasks and the guide", "ru": "что вы хотите сделать? — задачи и справка"},
+    "cmd.mine": {
+        "en": "what is for you: unread messages, agents waiting for you",
+        "ru": "сообщения и вопросы к вам",
+    },
+    "cmd.dm": {
+        "en": "talk privately with an agent in a panel beside the chat",
+        "ru": "личный разговор с агентом в панели рядом с чатом",
+    },
+    "cmd.restart": {"en": "restart an agent, its conversation continues", "ru": "перезапустить агента, разговор продолжится"},
+    "cmd.team": {"en": "the team: see it, or start a ready one", "ru": "команда: посмотреть, изменить или запустить готовую"},
+    "cmd.stop": {
+        "en": "stop the room: close its windows and agents",
+        "ru": "остановить комнату: закрыть её окна и остановить запущенных ею агентов",
+    },
+    "cmd.exit": {"en": "close this chat panel", "ru": "закрыть этот чат, агенты продолжат работу"},
+    "cmd.language": {"en": "the room's language", "ru": "язык комнаты"},
+    # The scenarios' picker and preview.
+    "team.what": {"en": "What will we do?", "ru": "Что будем делать?"},
+    "team.none": {
+        "en": "No template — nothing automatic, add agents with /add",
+        "ru": "Без шаблона — добавьте агентов через /добавить",
+    },
+    "team.none.said": {
+        "en": "No template: nothing automatic — /add adds an agent, /team picks a ready team later.",
+        "ru": "Без шаблона: добавьте агента через /добавить или позже выберите готовую команду через /команда.",
+    },
+    "team.preview.head": {
+        "en": "{title} — {hint}. This is a starting team: change it with /team once it runs.",
+        "ru": "{title} — {hint}. Это начальный состав: после запуска его можно изменить через /команда.",
+    },
+    "team.preview.result": {
+        "en": "Result: {output}. Without you: nothing external.",
+        "ru": "Итог: {output}. Без вас: ничего внешнего.",
+    },
+    "team.result.chat": {"en": "in the chat", "ru": "в чате"},
+    "team.launch.question": {"en": "Launch this team?", "ru": "Запустить эту команду?"},
+    "team.launch": {"en": "Launch the team — {agents}", "ru": "Запустить команду — {agents}"},
+    "team.back": {"en": "Back", "ru": "Назад"},
+    "team.unavailable": {"en": "Not available: {what}", "ru": "Недоступно: {what}"},
+    "team.has_one": {
+        "en": "This room has a team already: /team shows it.",
+        "ru": "В этой комнате уже есть команда. Посмотреть состав: /команда.",
+    },
+    "team.starting": {"en": "Starting the {title} team…", "ru": "Запускаю команду «{title}»…"},
+    "team.view.head": {
+        "en": "Team: {title} · result: {output} · without you: {without}",
+        "ru": "Команда: {title} · итог: {output} · без вас: {without}",
+    },
+    "team.view.none": {"en": "No scenario", "ru": "Без сценария"},
+    "team.view.nothing": {"en": "nothing external", "ru": "ничего внешнего"},
+    "team.view.empty": {
+        "en": "No agents yet: /team picks a ready team, /add adds one agent.",
+        "ru": "Агентов пока нет. Выберите готовую команду через /команда или добавьте агента через /добавить.",
+    },
+    "team.started": {"en": "Team started: {started} of {total}.", "ru": "Команда запущена: {started} из {total}."},
+    "team.started.lead": {"en": " Lead — {lead}.", "ru": " Ведущий — {lead}."},
+    "team.started.nolead": {
+        "en": " No lead started: /add one, or start the team again.",
+        "ru": " Ведущий не запустился: добавьте его через /добавить или запустите команду снова.",
+    },
+    "state.starting": {"en": "Starting", "ru": "Запускается"},
+    "state.getting": {"en": "Getting its assignment", "ru": "Получает назначение"},
+    "state.acknowledged": {"en": "Assignment acknowledged", "ru": "Назначение подтверждено"},
+    "state.replied": {"en": "Replied to its assignment — read it", "ru": "Агент ответил на вводную — прочитайте ответ"},
+    # The guide (/help): each line by its English words' key.
+    "help.cc3cb7ce9b": {"en": "Choose a recipient", "ru": "Выбрать получателя"},
+    "help.f7ec8b2413": {
+        "en": "Open the command menu; ↑/↓ to choose, Enter to select",
+        "ru": "Открыть меню команд; ↑/↓ — выбор, Enter — выполнить",
+    },
+    "help.4b0fd81d82": {"en": "Go back or close the menu", "ru": "Назад или закрыть меню"},
+    "help.096c43bb67": {
+        "en": "Send a message; multiline pastes stay in one message",
+        "ru": "Отправить сообщение; вставка из нескольких строк — одним сообщением",
+    },
+    "help.2c4259714f": {
+        "en": "Earlier messages, one at a time; Esc — back to the newest",
+        "ru": "Прежние сообщения по одному; Esc — к последним",
+    },
+    "help.edda33e098": {
+        "en": "An agent needs you — /answer opens its terminal",
+        "ru": "Агент ждёт вашего действия — /ответить откроет его терминал",
+    },
+    "help.ad15d1c0f8": {"en": "Rename yourself or an agent", "ru": "Переименовать себя или агента"},
+    "help.105f29f801": {"en": "Add an agent · disconnect a participant", "ru": "Добавить агента · отключить участника"},
+    "help.ccdbc7ccb5": {
+        "en": "See an agent's screen · open its window in a new tab",
+        "ru": "Экран агента · его окно в новой вкладке",
+    },
+    "help.a1ac7cf483": {"en": "Show this guide", "ru": "Показать эту справку"},
+    "help.e9137ff5be": {"en": "Choose a recipient; shown by the input", "ru": "Выбрать получателя; он показан у строки ввода"},
+    "help.c58fb8dff4": {
+        "en": "New line inside a message (or end the line with \\)",
+        "ru": "Новая строка внутри сообщения (или \\ в конце строки)",
+    },
+    "help.86018ecc92": {
+        "en": "Clear the whole draft, even a long pasted one",
+        "ru": "Стереть весь черновик, даже длинную вставку",
+    },
+    "help.b33880db0e": {
+        "en": "Earlier messages: one at a time, or a page; Esc — back to the newest",
+        "ru": "Прежние сообщения: по одному или страницей; Esc — к последним",
+    },
+    "help.0bc491285d": {
+        "en": "Send to someone without changing the chosen recipient",
+        "ru": "Написать кому-то, не меняя выбранного получателя",
+    },
+    "help.d7eee0ba1f": {
+        "en": "An agent needs your input — use /answer, then Ctrl+] to return",
+        "ru": "Агенту нужен ваш ответ — /ответить, затем Ctrl+] назад",
+    },
+    "help.c1ffaa1441": {
+        "en": "Green: ready · Yellow: working · Orange: muted or limit · Red !: act in its window",
+        "ru": "Зелёный: свободен · Жёлтый: работает · Оранжевый: заглушён или лимит · Красный !: нужен ответ в его окне",
+    },
+    "help.50af86a220": {
+        "en": "× muted · ◷ limit reached · ? no recent data · … connecting",
+        "ru": "× заглушён · ◷ лимит · ? нет свежих данных · … подключается",
+    },
+    "help.85d38c9be9": {
+        "en": "Green with a spinner and a number: ready for messages, background tasks still run",
+        "ru": "Зелёный с вращающимся значком и числом: принимает сообщения, фоновые задачи ещё выполняются",
+    },
+    "help.9dfa9c133f": {
+        "en": "More agents wrap to another row; none are hidden",
+        "ru": "Если агенты не помещаются, их статусы переносятся на следующую строку; никто не скрыт",
+    },
+    "help.6f3283e0e3": {
+        "en": "Start a new agent: choose its kind, its folder, its name",
+        "ru": "Запустить нового агента: программа, папка, имя",
+    },
+    "help.d40ae8935e": {
+        "en": "See the team and where each agent is with its assignment; in a new room, start a ready team",
+        "ru": "Состав и состояние назначения каждого агента; в новой комнате — запустить готовую команду",
+    },
+    "help.e8644cfcd3": {
+        "en": "Disconnect a participant; the agent keeps running in its window",
+        "ru": "Отключить участника; агент продолжает работать в своём окне",
+    },
+    "help.04405a24f7": {
+        "en": "Stop / resume room-wide messages to an agent; messages to it by name still arrive",
+        "ru": "Остановить / возобновить общие сообщения агенту; сообщения по имени доходят",
+    },
+    "help.b474bc9da6": {
+        "en": "An agent is back from its usage limit: the room delivers to it again",
+        "ru": "Возобновить доставку агенту после окончания лимита",
+    },
+    "help.abb8b22aa6": {
+        "en": "Rename yourself or an agent: choose whom, type the new name",
+        "ru": "Переименовать себя или агента: выбрать кого, ввести новое имя",
+    },
+    "help.33f4ba4960": {
+        "en": "See an agent's screen, read-only; Esc — back to chat",
+        "ru": "Экран агента, только чтение; Esc — назад в чат",
+    },
+    "help.344cb72375": {
+        "en": "Respond in an agent terminal over the chat; Ctrl+] returns",
+        "ru": "Ответить в терминале агента поверх чата; Ctrl+] — назад",
+    },
+    "help.26a7880074": {
+        "en": "Open an agent's window in a new terminal tab, to answer it",
+        "ru": "Открыть окно агента в новой вкладке терминала, чтобы ответить ему",
+    },
+    "help.09e3feee8b": {
+        "en": "Restart an agent the room started; its conversation continues (new rules too)",
+        "ru": "Перезапустить агента комнаты; разговор продолжится (и с новыми правилами)",
+    },
+    "help.91954ad89f": {
+        "en": "What is for you: agents waiting for you, then unread messages to you and answers to yours",
+        "ru": "Агенты, которым нужно ваше действие, затем непрочитанные сообщения и ответы вам",
+    },
+    "help.8520174043": {
+        "en": "Talk with one agent in a panel beside the chat: Ctrl+O there and back, Tab tabs in it, Ctrl+] close",
+        "ru": "Разговор с одним агентом в панели рядом с чатом: Ctrl+O туда и обратно, Tab — вкладки, Ctrl+] — закрыть",
+    },
+    "help.95f5ecec5f": {
+        "en": "Pause the room: agents get no messages until /resume",
+        "ru": "Пауза: агенты не получают сообщений до /продолжить",
+    },
+    "help.bf237a3c84": {
+        "en": "Clear the history for everyone; old messages move to an archive",
+        "ru": "Очистить историю для всех; старые сообщения уходят в архив",
+    },
+    "help.b1c83d1813": {
+        "en": "Stop the room: its windows and the agents it started close; history stays",
+        "ru": "Остановить комнату: закрываются её окна и запущенные ею агенты; история остаётся",
+    },
+    "help.6a4472ea0e": {
+        "en": "Close this chat panel (asks first); agents keep running",
+        "ru": "Закрыть этот чат после подтверждения; агенты продолжат работу",
+    },
+    "help.2639bda3b4": {"en": "The room's language: Russian or English", "ru": "Язык комнаты: русский или английский"},
+    "help.679993f49d": {"en": "Red status", "ru": "Красный статус"},
+    "help.b55b1117dd": {"en": "Status colours", "ru": "Цвета статуса"},
+    "help.6400bc3301": {"en": "Status marks", "ru": "Значки статуса"},
+    "help.667bf0636e": {"en": "Status layout", "ru": "Строка статусов"},
+    "help.c9337cd13e": {"en": "@name text", "ru": "@имя текст"},
+    "help.5642921e1d": {"en": "Add an agent", "ru": "Добавить агента"},
+    "help.5f1009f1ff": {
+        "en": "Choose an agent type, project folder, and name.",
+        "ru": "Выберите программу, папку проекта и имя.",
+    },
+    "help.5eef887242": {
+        "en": "The room checks the connection before showing the agent as connected.",
+        "ru": "Комната проверит связь и только потом покажет агента подключённым.",
+    },
+    "help.fe44aa3b1e": {"en": "See what an agent is doing", "ru": "Посмотреть, что делает агент"},
+    "help.723ae40430": {"en": "Choose an agent to see its live screen.", "ru": "Выберите агента, чтобы увидеть его экран."},
+    "help.213df32fcd": {"en": "This is read-only. Press Esc to return to the chat.", "ru": "Только чтение. Esc — назад в чат."},
+    "help.0097af42ee": {"en": "View an agent", "ru": "Посмотреть агента"},
+    "help.aa1e92b5c5": {"en": "Open an agent's window in a new tab", "ru": "Открыть окно агента в новой вкладке"},
+    "help.b579907bf4": {
+        "en": "Choose an agent: its command goes into your clipboard.",
+        "ru": "Выберите агента: команда попадёт в буфер обмена.",
+    },
+    "help.b0dae6b200": {
+        "en": "Open a new terminal tab (+), paste with Cmd+V and press Enter.",
+        "ru": "Откройте новую вкладку терминала (+), вставьте Cmd+V и нажмите Enter.",
+    },
+    "help.f7207047c3": {"en": "Open an agent terminal", "ru": "Открыть терминал агента"},
+    "help.bb39d21b7d": {"en": "Answer an agent over the chat", "ru": "Ответить агенту поверх чата"},
+    "help.b859a4c7a8": {
+        "en": "Choose an agent to open its terminal over this chat.",
+        "ru": "Выберите агента, чтобы открыть его терминал поверх чата.",
+    },
+    "help.6e893f15df": {
+        "en": "Respond in that window. Press Ctrl+] to return to the chat.",
+        "ru": "Ответьте в этом окне. Ctrl+] — назад в чат.",
+    },
+    "help.ee11988fb4": {"en": "Answer an agent", "ru": "Ответить агенту"},
+    "help.69d1258962": {"en": "Pause or resume the room", "ru": "Приостановить или возобновить доставку сообщений"},
+    "help.c55cb683e8": {
+        "en": "Pause holds delivery to agents and their outgoing messages.",
+        "ru": "Пауза задерживает доставку агентам и их исходящие сообщения.",
+    },
+    "help.4a4dbc7ca9": {
+        "en": "A turn already running may finish. Resume releases waiting messages.",
+        "ru": "Уже начатая работа может завершиться. После возобновления доставки ожидающие сообщения будут отправлены.",
+    },
+    "help.e48c7298c4": {"en": "Clear conversation history", "ru": "Очистить историю разговора"},
+    "help.d343ad2c96": {
+        "en": "Messages move to the room's local archive. Confirm before clearing.",
+        "ru": "Сообщения уходят в местный архив комнаты. Перед очисткой — подтверждение.",
+    },
+    "help.c1783d24d8": {
+        "en": "This does not erase an agent's own session history.",
+        "ru": "Собственную историю сессии агента это не стирает.",
+    },
+    "help.53b5158bc7": {"en": "Clear history", "ru": "Очистить историю"},
+    "help.15c3fa417b": {"en": "Stop the room", "ru": "Остановить комнату"},
+    "help.40373b140a": {
+        "en": "Stop asks which room windows will close and preserves history.",
+        "ru": "Перед остановкой вы увидите, какие окна закроются. История сохранится.",
+    },
+    "help.a468e04ed2": {"en": "Stop room", "ru": "Остановить комнату"},
+    "help.b823bb9b42": {"en": "All keys", "ru": "Все клавиши"},
+    "help.f620876eb7": {
+        "en": "The full guide: recipients, multiline input, clearing a draft, history, status indicators,",
+        "ru": "Полная справка: получатели, многострочный ввод, стирание черновика, история, значки статуса",
+    },
+    "help.35c9b64cc8": {"en": "and all commands.", "ru": "и все команды."},
+    "help.931e90b732": {"en": "Room guide · {me}", "ru": "Справка комнаты · {me}"},
+    "help.1254a7fd3e": {"en": "Pause the room", "ru": "Приостановить доставку"},
+    "help.60dd26ce4d": {"en": "Resume the room", "ru": "Возобновить доставку"},
+    "help.7b52603bb2": {"en": "What would you like to do?", "ru": "Что вы хотите сделать?"},
+    "help.eb72290348": {
+        "en": "You can open the guide any time: type /help.",
+        "ru": "Справку можно открыть в любой момент: /помощь.",
+    },
+    "help.88dfd48ffe": {"en": "/dm name \u00b7 /dm close", "ru": "/личное имя · /личное закрыть"},
+    # /open: the command in the clipboard, or not.
+    "open.copied": {
+        "en": "The command is already in your clipboard — you don't need to copy anything.\n  1. Open a new terminal tab (+).\n  2. Paste with Cmd+V and press Enter: {label}'s window opens there.\n  3. Close that tab when done: {label} keeps running, the room stays here.\nIf pasting doesn't work, copy this command yourself:\n\n{line}  {command}\n",
+        "ru": "Команда уже в буфере обмена — копировать ничего не нужно.\n  1. Откройте новую вкладку терминала (+).\n  2. Вставьте Cmd+V и нажмите Enter: там откроется окно агента {label}.\n  3. Закончив, закройте вкладку: {label} продолжит работу, комната останется здесь.\nЕсли вставка не сработала, скопируйте команду сами:\n\n{line}  {command}\n",
+    },
+    "open.copy_failed": {
+        "en": "Could not copy automatically — copy this command yourself:\n\n{line}  {command}\n\n  1. Open a new terminal tab (+).\n  2. Paste the command and press Enter: {label}'s window opens there.\n  3. Close that tab when done: {label} keeps running, the room stays here.\n",
+        "ru": "Скопировать автоматически не удалось — скопируйте команду вручную:\n\n{line}  {command}\n\n  1. Откройте новую вкладку терминала (+).\n  2. Вставьте команду и нажмите Enter: там откроется окно агента {label}.\n  3. Закончив, закройте вкладку: {label} продолжит работу, комната останется здесь.\n",
+    },
+    # Scenario titles and hints.
+    "scenario.development.title": {"en": "Development", "ru": "Разработка"},
+    "scenario.development.hint": {
+        "en": "Split the work, check the changes, get code",
+        "ru": "Разделить работу, проверить изменения, получить код",
+    },
+    "scenario.research.title": {"en": "Research", "ru": "Исследование"},
+    "scenario.research.hint": {
+        "en": "Gather facts, check them, get a conclusion with sources",
+        "ru": "Собрать сведения, проверить факты, получить вывод с источниками",
+    },
+    "scenario.text.title": {"en": "Text", "ru": "Текст"},
+    "scenario.text.hint": {"en": "Write a text and have it checked", "ru": "Подготовить текст и проверить его"},
+    "scenario.decision.title": {"en": "Decision", "ru": "Решение"},
+    "scenario.decision.hint": {
+        "en": "Compare the options, see the arguments and where they disagree",
+        "ru": "Сравнить варианты и увидеть доводы и разногласия",
+    },
+    "scenario.long.title": {"en": "Long work", "ru": "Долгая работа"},
+    "scenario.long.hint": {
+        "en": "Run a project and keep its state between your visits",
+        "ru": "Вести проект и сохранять его состояние между посещениями",
+    },
+    "scenario.assistant.title": {"en": "One assistant", "ru": "Один помощник"},
+    "scenario.assistant.hint": {"en": "Work with one agent directly", "ru": "Работать напрямую с одним агентом"},
+    # Roles, memory, whom one reports to — as shown.
+    "role.lead": {"en": "lead", "ru": "ведущий"},
+    "role.worker": {"en": "worker", "ru": "исполнитель"},
+    "role.reviewer": {"en": "reviewer", "ru": "проверяющий"},
+    "role.none": {"en": "no role", "ru": "без роли"},
+    "model.default": {"en": "default model", "ru": "модель по умолчанию"},
+    "memory.keep": {"en": "keep", "ru": "не трогать автоматически"},
+    "memory.compact": {"en": "compact past {k}k", "ru": "сжимать после {k} тыс."},
+    "memory.clear": {"en": "clear past {k}k", "ru": "очищать после {k} тыс."},
+    "reports.to": {"en": "reports to {whom}", "ru": "отвечает: {whom}"},
+    "whom.person": {"en": "the person", "ru": "вам"},
+    # The assignment an agent gets.
+    "brief.head": {"en": "Your assignment in this room", "ru": "Ваше назначение в этой комнате"},
+    "brief.version": {"en": " (version {v})", "ru": " (версия {v})"},
+    "brief.role": {"en": "- Role: {role} — {what}.", "ru": "- Роль: {role} — {what}."},
+    "brief.role.none": {"en": "- Role: none set.", "ru": "- Роль: не задана."},
+    "brief.topic": {"en": "- Topic: {topic}.", "ru": "- Тема: {topic}."},
+    "brief.report": {"en": "- Report to: {whom}.", "ru": "- Кому отвечаете: {whom}."},
+    "brief.lead": {
+        "en": "- Lead: {lead} — gathers the result and the questions for the person.",
+        "ru": "- Ведущий: {lead} — собирает итог и вопросы к пользователю.",
+    },
+    "brief.you_lead": {
+        "en": "- You are the room's lead: the person hears from you; ask them what only they can decide.",
+        "ru": "- Вы — ведущий комнаты: собирайте итог для пользователя и обращайтесь к нему с вопросами, которые может решить только он.",
+    },
+    "brief.goal": {"en": "- Goal: {goal} You answer for reaching it.", "ru": "- Цель: {goal} Вы отвечаете за её достижение."},
+    "brief.team": {
+        "en": "- Your team: {team}. Give each its part, have the result checked, gather it — do not do their parts yourself.",
+        "ru": "- Ваша команда: {team}. Распределите работу, организуйте проверку и соберите итог. Не выполняйте чужие части работы сами.",
+    },
+    "brief.result": {
+        "en": "- Result file: {output}, in the project folder. Keep the result there, not in messages.",
+        "ru": "- Итоговый файл: {output}, в папке проекта. Сохраняйте результат в этом файле, а не в сообщениях.",
+    },
+    "brief.without.some": {
+        "en": "- Without the person you may: {what}. Anything else external — ask first.",
+        "ru": "- Без пользователя можно: {what}. Перед другими действиями вне комнаты спросите разрешение.",
+    },
+    "brief.without.none": {
+        "en": "- Without the person: nothing external — ask before publishing, writing outside the room or spending.",
+        "ru": "- Перед публикацией, отправкой сообщений вне комнаты или расходованием денег спросите разрешение пользователя.",
+    },
+    "brief.language": {"en": "- Answer in English.", "ru": "- Отвечайте по-русски."},
+    "brief.not_task": {
+        "en": "This is your assignment, not a task: wait for one from {whom}.",
+        "ru": "Это назначение, а не задача. Кто даст задачу: {whom}.",
+    },
+    "brief.foot": {
+        "en": "These are the room's settings; they change no permissions of your tools. After /compact or /clear they come again.",
+        "ru": "Это настройки комнаты; права ваших инструментов они не меняют. После /compact или /clear они придут снова.",
+    },
+    "whom.person.from": {"en": "the person", "ru": "пользователь"},
+    "whom.person.to": {"en": "the person", "ru": "человеку"},
+    "agent.word": {"en": "agent", "ru": "агент"},
+    "role.lead.what": {
+        "en": "you split the work, gather the result and the questions for the person",
+        "ru": "вы распределяете работу, собираете итог и вопросы к пользователю",
+    },
+    "role.worker.what": {
+        "en": "you do your part of the work and hand it to whom you report to",
+        "ru": "вы делаете свою часть работы и сдаёте её тому, кому отвечаете",
+    },
+    "role.reviewer.what": {
+        "en": "you look for mistakes in the result and say what to fix; you do not redo the work",
+        "ru": "вы ищете ошибки в результате и говорите, что исправить; работу заново не делаете",
+    },
+    "without.merge": {"en": "merge into the main branch", "ru": "вливать в основную ветку"},
+    "without.publish": {"en": "publish", "ru": "публиковать"},
+    "without.send": {"en": "write to anyone outside the room", "ru": "писать кому-либо вне комнаты"},
+    "without.spend": {"en": "spend money", "ru": "тратить деньги"},
+}
+
+# The chat's commands: each by its English name and its Russian one, both always understood. The first is the
+# one the room works with; the second is shown in a Russian room's menu and help.
+COMMANDS: list[tuple[str, str]] = [
+    ("/add", "/добавить"),
+    ("/remove", "/отключить"),
+    ("/mute", "/заглушить"),
+    ("/unmute", "/разглушить"),
+    ("/unlimit", "/снятьлимит"),
+    ("/name", "/имя"),
+    ("/view", "/экран"),
+    ("/answer", "/ответить"),
+    ("/open", "/открыть"),
+    ("/pause", "/пауза"),
+    ("/resume", "/продолжить"),
+    ("/clear", "/очистить"),
+    ("/help", "/помощь"),
+    ("/mine", "/мне"),
+    ("/dm", "/личное"),
+    ("/restart", "/перезапустить"),
+    ("/team", "/команда"),
+    ("/stop", "/остановить"),
+    ("/exit", "/выход"),
+    ("/quit", "/выйти"),
+    ("/language", "/язык"),
+]
+SUBCOMMANDS: dict[str, dict[str, str]] = {"/dm": {"закрыть": "close"}, "/team": {"сохранить": "save"}}
+_TO_EN = {unicodedata.normalize("NFC", ru).casefold(): en for en, ru in COMMANDS} | {en: en for en, _ in COMMANDS}
+
+
+def plural(lang: str, n: int) -> str:
+    """The form of a word for a number: one / few / many in Russian (21 агент, 22 агента, 25 агентов, 11–14 —
+    агентов), one / other in English."""
+    if lang != "ru":
+        return "one" if n == 1 else "other"
+    if n % 10 == 1 and n % 100 != 11:
+        return "one"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "few"
+    return "many"
+
+
+def lang_of(value: object) -> str:
+    return value if isinstance(value, str) and value in LANGS else "en"
+
+
+def words_in(key: str, lang: str = "en", **params: Any) -> str:
+    """The text for a key in a language, its parameters put in whole. A count named `n` takes its form."""
+    entry = CATALOG[key][lang_of(lang)]
+    if isinstance(entry, dict):
+        entry = entry[plural(lang_of(lang), int(params.get("n", 0)))]
+    return str(entry).format(**params) if params else str(entry)
+
+
+def command(line: str) -> str:
+    """A line typed in the chat with its command in English, whichever name was typed: the command's token only,
+    by Unicode NFC and without case — the rest (names, text) as it is. Its subcommand too («/личное закрыть»).
+    Not a command — the line as it came."""
+    if not line.startswith("/") or line.startswith("//"):
+        return line
+    token, sep, rest = line.partition(" ")
+    en = _TO_EN.get(unicodedata.normalize("NFC", token).casefold())
+    if en is None:
+        return line
+    if rest:
+        sub, sep2, tail = rest.partition(" ")
+        sub_en = SUBCOMMANDS.get(en, {}).get(unicodedata.normalize("NFC", sub).casefold())
+        if sub_en:
+            rest = sub_en + sep2 + tail
+    return en + sep + rest
+
+
+def shown_command(en: str, lang: str) -> str:
+    """A command as a room in this language shows it: Russian in a Russian room, English otherwise."""
+    return next((ru for e, ru in COMMANDS if e == en), en) if lang_of(lang) == "ru" else en
+
+
+def help_words(en: str, lang: str, **params: Any) -> str:
+    """A line of the guide in the room's language, by its English words (catalog key help.<hash>)."""
+    return words_in("help." + hashlib.sha1(en.encode()).hexdigest()[:10], lang, **params)
+
+
+def shown_commands(text: str, lang: str) -> str:
+    """Each command named in a short label («/add · /remove») as a room in this language shows it."""
+    return " ".join(shown_command(w, lang) if w.startswith("/") else w for w in text.split(" "))
+
 import os
 import shutil
 import sys
@@ -940,6 +1454,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NoReturn, TypeVar, cast
+
 
 
 
@@ -1113,6 +1628,40 @@ WITHOUT_PERSON = {
     "spend": "spend money",
 }
 OUTPUT_LIMIT = 200
+
+
+def language_path() -> Path:
+    """The person's own default language for new rooms and what is said outside a room — beside the first-visit
+    mark, outside any project; not a setting of Claude or Codex."""
+    return paths().welcomed_path.parent / "language"
+
+
+def user_language() -> str:
+    """The saved default; none — the system's (a Russian locale), else English."""
+    path = language_path()
+    with contextlib.suppress(OSError, ValueError):
+        saved = "" if path.is_symlink() else path.read_text(encoding="utf-8").strip()  # a link is not read
+        if saved in LANGS:
+            return saved
+    locale = os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or ""
+    return "ru" if locale.lower().startswith("ru") else "en"
+
+
+def language_chosen() -> bool:
+    return language_path().is_file()
+
+
+def set_user_language(lang: str) -> None:
+    path = language_path()
+    private_dir(path.parent, strict=False)
+    if path.is_symlink():
+        path.unlink()  # ours to write, never through a link
+    path.write_text(lang_of(lang) + "\n", encoding="utf-8")
+
+
+def room_language(config: dict[str, Any]) -> str:
+    """The room's own language; a room made before it had one speaks English, as it did."""
+    return lang_of(config.get("language"))
 
 
 def seat_of(p: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
@@ -1392,41 +1941,55 @@ def scenario_problems(scenario: dict[str, Any], kinds: list[str]) -> list[str]:
     return out
 
 
-def memory_words(rule: object) -> str:
+def memory_words(rule: object, lang: str = "en") -> str:
     if not trim_valid(rule):
-        return "keep"
+        return words_in("memory.keep", lang)
     r = cast("dict[str, Any]", rule)
-    return f"{r['do']} past {r['at'] // 1000}k"
+    return words_in(f"memory.{r['do']}", lang, k=r["at"] // 1000)
 
 
-def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any]) -> str:
-    """One row of a team: name · role · topic · model · memory · reports to — what applies, by the layers."""
+def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any], lang: str = "") -> str:
+    """One row of a team: name · role · topic · model · memory · reports to — what applies, by the layers, in the
+    room's language."""
+    lang = lang or room_language(config)
     role, topic, model = (effective(kind, p, config, k) for k in ("role", "topic", "use_model"))
     trim = effective(kind, p, config, "context_trim") if kind in TRIM_KINDS else None
+    to = reports_to(kind, p, config)
     return " · ".join(
         [
             str(p.get("label") or p.get("id") or ""),
-            role or "no role",
+            words_in(f"role.{role}" if role else "role.none", lang),
             topic or "—",
-            model or "default model",
-            memory_words(trim) if kind in TRIM_KINDS else "keep",
-            f"reports to {whom(reports_to(kind, p, config), config)}",
+            model or words_in("model.default", lang),
+            memory_words(trim, lang),
+            words_in(
+                "reports.to", lang, whom=words_in("whom.person", lang) if to == "person" else label_of(config, to)
+            ),
         ]
     )
 
 
-def scenario_preview(name: str) -> list[str]:
+def scenario_title(name: str, lang: str) -> str:
+    return words_in(f"scenario.{name}.title", lang)
+
+
+def scenario_hint(name: str, lang: str) -> str:
+    return words_in(f"scenario.{name}.hint", lang)
+
+
+def scenario_preview(name: str, lang: str = "en") -> list[str]:
     """What a scenario would start, before anything starts: its team as rows, the result file, the bounds."""
     scenario = SCENARIOS[name]
     seats = [
         {"id": seat["seat"], "label": seat["label"], "kind": seat["kind"], "seat": seat["seat"]} for seat in scenario["seats"]
     ]
     config: dict[str, Any] = {"participants": seats, "team": scenario}
-    rows = [seat_line(p["kind"], p, config) for p in seats]
+    rows = [seat_line(p["kind"], p, config, lang) for p in seats]
     return [
-        f"{scenario['title']} — {scenario['hint']}. This is a starting team: change it with /team once it runs.",
+        words_in("team.preview.head", lang, title=scenario_title(name, lang), hint=scenario_hint(name, lang)),
         *(f"  {row}" for row in rows),
-        f"  Result: {scenario['output'] or 'in the chat'}. Without you: nothing external.",
+        "  "
+        + words_in("team.preview.result", lang, output=scenario["output"] or words_in("team.result.chat", lang)),
     ]
 
 
@@ -1456,15 +2019,23 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
         return ""
     lead, to = lead_of(config), reports_to(kind, p, config)
     allowed = without_person(config)
-    lines = [f"{BRIEF_HEAD}{f' (version {version})' if version else ''}:"]
-    lines.append(f"- Role: {role} — {ROLES[role]}." if role else "- Role: none set.")
+    lang = room_language(config)
+
+    def t(key: str, **kw: Any) -> str:  # this assignment's language, once
+        return words_in(key, lang, **kw)
+
+    def named(who: str, case: str) -> str:
+        return t(case) if who == "person" else label_of(config, who)
+
+    lines = [t("brief.head") + (t("brief.version", v=version) if version else "") + ":"]
+    lines.append(t("brief.role", role=t(f"role.{role}"), what=t(f"role.{role}.what")) if role else t("brief.role.none"))
     if topic:
-        lines.append(f"- Topic: {topic}.")
-    lines.append(f"- Report to: {whom(to, config)}.")
+        lines.append(t("brief.topic", topic=topic))
+    lines.append(t("brief.report", whom=named(to, "whom.person.to")))
     if lead and lead != pid:
-        lines.append(f"- Lead: {label_of(config, lead)} — gathers the result and the questions for the person.")
+        lines.append(t("brief.lead", lead=label_of(config, lead)))
     elif lead == pid:
-        lines.append("- You are the room's lead: the person hears from you; ask them what only they can decide.")
+        lines.append(t("brief.you_lead"))
         # Live, a lead with three workers and a reviewer did a whole research alone: its team, by name.
         people = people_ids(config)
         team = [
@@ -1473,29 +2044,27 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
             if q.get("id") not in (pid, *people) and reports_to(q.get("kind", ""), q, config) == pid
         ]
         if team:
-            parts = "; ".join(
-                f"{label_of(config, q['id'])} — {effective(q.get('kind', ''), q, config, 'role') or 'agent'}"
-                + (f", {t}" if (t := effective(q.get("kind", ""), q, config, "topic")) else "")
-                for q in team
-            )
-            lines.append(
-                f"- Your team: {parts}. Give each its part, have the result checked, gather it — do not do their parts yourself."
-            )
+            parts: list[str] = []
+            for q in team:
+                r = effective(q.get("kind", ""), q, config, "role")
+                topic_ = effective(q.get("kind", ""), q, config, "topic")
+                parts.append(
+                    f"{label_of(config, q['id'])} — {t(f'role.{r}') if r else t('agent.word')}"
+                    + (f", {topic_}" if topic_ else "")
+                )
+            lines.append(t("brief.team", team="; ".join(parts)))
         if goal := goal_of(config):
-            lines.append(f"- Goal: {goal} You answer for reaching it.")
+            lines.append(t("brief.goal", goal=goal))
     if out := output_of(config):
-        lines.append(f"- Result file: {out}, in the project folder. Keep the result there, not in messages.")
+        lines.append(t("brief.result", output=out))
     if allowed:
-        lines.append(
-            f"- Without the person you may: {'; '.join(WITHOUT_PERSON[a] for a in allowed)}. Anything else external — ask first."
-        )
+        lines.append(t("brief.without.some", what="; ".join(t(f"without.{a}") for a in allowed)))
     else:
-        lines.append("- Without the person: nothing external — ask before publishing, writing outside the room or spending.")
+        lines.append(t("brief.without.none"))
+    lines.append(t("brief.language"))
     # Live, a reviewer told its topic and no task began reviewing the folder on its own.
-    lines.append(f"This is your assignment, not a task: wait for one from {whom(to, config)}.")
-    lines.append(
-        "These are the room's settings; they change no permissions of your tools. After /compact or /clear they come again."
-    )
+    lines.append(t("brief.not_task", whom=named(to, "whom.person.from")))
+    lines.append(t("brief.foot"))
     return "\n".join(lines)
 
 
@@ -1946,6 +2515,14 @@ def write_room(sample: dict[str, Any], ask: bool) -> None:
     private_dir(rp.state_dir)
     # The project's .gitignore is left alone: the room's files live outside the
     # project, and a new room wrote «.collab/» into the person's repository for nothing.
+
+
+@room_locked
+def set_room_language(lang: str) -> None:
+    """The room's own language: its menus, help and the room's words to its agents — briefs go again with it."""
+    data = read_config_raw()
+    data["language"] = lang_of(lang)
+    write_config(data)
 
 
 @room_locked
@@ -6200,6 +6777,7 @@ from typing import Any, cast
 
 
 
+
 def room_cmd(command: str, rest: str, cli: str = "", pid: str = "") -> str:
     """A ready-to-run command for an agent: the room named by --room right after the command, so
     the line starts with «python3 …/collab <command>» and matches a narrow permission rule. `cli` —
@@ -6735,18 +7313,18 @@ def assignment_state(pid: str, config: dict[str, Any], messages: list[dict[str, 
     is not a promise to keep it), answered with say --re — it said something about it, the person reads it."""
     p = next((q for q in config["participants"] if q["id"] == pid), {})
     if p.get("joined") == "pending":
-        return "Starting"
+        return words_in("state.starting", room_language(config))
     if not brief(pid, config):
         return ""
     sent = [m for m in messages if m.get("from") == ROOM and m.get("brief") is True and m.get("to") == [pid]]
     if not sent:
-        return "Getting its assignment"
+        return words_in("state.getting", room_language(config))
     last = sent[-1]["id"]
     if any(m.get("from") == pid and m.get("re") == last for m in messages):
-        return "Replied to its assignment — read it"
+        return words_in("state.replied", room_language(config))
     if last in read_set(room().paths.noreply_dir, pid):
-        return "Assignment acknowledged"
-    return "Getting its assignment"
+        return words_in("state.acknowledged", room_language(config))
+    return words_in("state.getting", room_language(config))
 
 
 def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[str]:
@@ -6754,18 +7332,22 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
     agent — what applies to it and where it is with its assignment."""
     team = team_of(config)
     name = team.get("scenario")
-    title = SCENARIOS[name]["title"] if isinstance(name, str) and name in SCENARIOS else "No scenario"
+    lang = room_language(config)
+    title = (
+        scenario_title(name, lang)
+        if isinstance(name, str) and name in SCENARIOS
+        else words_in("team.view.none", lang)
+    )
     allowed = without_person(config)
-    lines = [
-        f"Team: {title} · result: {output_of(config) or 'in the chat'} · without you: "
-        + ("; ".join(WITHOUT_PERSON[a] for a in allowed) if allowed else "nothing external")
-    ]
+    without = "; ".join(words_in(f"without.{a}", lang) for a in allowed) or words_in("team.view.nothing", lang)
+    output = output_of(config) or words_in("team.result.chat", lang)
+    lines = [words_in("team.view.head", lang, title=title, output=output, without=without)]
     for p in agents_of(config):
         state = assignment_state(p["id"], config, messages)
         lines.append(
             f"  {visible(seat_line(agent_kind(p), p, config))}" + (f" — {state}" if state else "")
         )
-    return lines if len(lines) > 1 else [*lines, "  No agents yet: /team picks a ready team, /add adds one agent."]
+    return lines if len(lines) > 1 else [*lines, "  " + words_in("team.view.empty", lang)]
 
 
 @room_locked
@@ -7379,6 +7961,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+
 
 
 
@@ -8146,9 +8729,12 @@ def start_scenario(name: str, folder: str) -> tuple[list[str], list[str]]:
 def team_started(config: dict[str, Any], started: list[str], failed: list[str]) -> str:
     """One line for a team started: how many of how many, who leads — and each that did not start, with why.
     Not «all started» when some did not."""
-    lead = lead_of(config)
-    head = f"Team started: {len(started)} of {len(started) + len(failed)} agents." + (
-        f" Lead — {label_of(config, lead)}." if lead else " No lead started: /add one, or start the team again."
+    lead, lang = lead_of(config), room_language(config)
+    total = words_in("n.agents", lang, n=len(started) + len(failed))
+    head = words_in("team.started", lang, started=len(started), total=total) + (
+        words_in("team.started.lead", lang, lead=label_of(config, lead))
+        if lead
+        else words_in("team.started.nolead", lang)
     )
     return "\n".join([head, *(f"  ! {visible(why)}" for why in failed)])
 
@@ -8290,6 +8876,7 @@ from typing import Any
 
 
 
+
 def default_team() -> dict[str, Any]:
     """The owner's seat plus every known agent that is installed on this machine."""
     rp = room().paths
@@ -8318,11 +8905,23 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"Created the room ({who}) in {rp.base}; the project folder is unchanged. Run `collab start`.")
 
 
+def choose_language() -> None:
+    """At the first interactive run, before anything else: one screen in both languages, the system's one under the
+    cursor; Enter takes it. Saved as the person's default for new rooms. Not asked again, nor without a terminal."""
+    if language_chosen() or not sys.stdin.isatty():
+        return
+    first = user_language()
+    rows: list[tuple[str, Any]] = [(LANG_NAMES[x], x) for x in sorted(LANGS, key=lambda x: x != first)]
+    choice = pick([words_in("lang.choose"), ""], rows, ["", "↑/↓ · Enter"])
+    set_user_language(choice if choice in LANGS else first)
+
+
 def cmd_home(args: argparse.Namespace) -> None:
     """`collab` with nothing else («make starting a room simple»). In a folder with
     a room — open it. Elsewhere — choose: a room you worked in, or a new room in a recent
     project; no paths to type, no environment to clear."""
     rp = room().paths
+    choose_language()
     if rp.config_path.is_file():
         cmd_start(args)
         return
@@ -8996,8 +9595,10 @@ def cmd_start(args: argparse.Namespace) -> None:
         # It used to seat and start every installed agent («maybe I won't have
         # Codex there at all») and ask names for «codex» and «claude», not for real agents.
         # Agents come in through /add: which one, which folder, what name.
+        choose_language()
         team = default_team()
         team["participants"] = team["participants"][:1]
+        team["language"] = user_language()  # the person's default; a room made before speaks English
         write_room(team, sys.stdin.isatty())
         replace_state(offer_team_path(), now() + "\n")  # «What will we do?» at its first chat
         print(f"Room created for {team['participants'][0]['label']}. Pick a ready team or add agents in the chat.")
@@ -9462,6 +10063,7 @@ import shutil
 
 
 
+
 # /help as a task menu («the user must learn all this easily»). (key, title, steps, action label, command that starts it)
 HELP_TASKS = [
     (
@@ -9531,7 +10133,7 @@ HELP_TASKS = [
 ]
 
 
-def HELP(me: str, full: bool = False, ids: list[str] | None = None) -> str:
+def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = "en") -> str:
     """Shown when the seat opens and on /help: a framed card, keys in one column (the room must explain itself on start — and look tidy doing it)."""
     # On start — only what is needed right away; /help shows everything.
     rows_ = [
@@ -9584,10 +10186,20 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None) -> str:
             ("/clear", "Clear the history for everyone; old messages move to an archive"),
             ("/stop", "Stop the room: its windows and the agents it started close; history stays"),
             ("Ctrl+C · /exit", "Close this chat panel (asks first); agents keep running"),
+            ("/language", "The room's language: Russian or English"),
         ]
-    key_w = max(len(k) for k, _ in rows_)
+    # In the room's language: each command by the name it shows, each line from the catalog; keys stay as they are.
+    labels = ("Red status", "Status colours", "Status marks", "Status layout", "@name text", "/dm name · /dm close")
+    rows_ = [
+        (
+            help_words(k, lang) if k in labels else shown_commands(k, lang),
+            help_words(v, lang),
+        )
+        for k, v in rows_
+    ]
+    key_w = max(text_cols(k) for k, _ in rows_)
     body = [f"{k.ljust(key_w)}   {v}" for k, v in rows_]
-    title = f" Room guide · {me} "
+    title = " " + help_words("Room guide · {me}", lang, me=me) + " "
     inner = max(max(text_cols(b) for b in body) + 4, text_cols(title) + 4)  # columns: a CJK name
     if inner + 2 > shutil.get_terminal_size((100, 24)).columns:
         return "\n".join(
@@ -9897,6 +10509,7 @@ from typing import Any, Callable, cast
 
 
 
+
 @dataclass(frozen=True)
 class ChatCommandContext:
     """The chat's existing objects and callbacks; late-created input objects are read on demand."""
@@ -9946,23 +10559,23 @@ class ChatCommandContext:
 
 
 def open_scenarios(ctx: ChatCommandContext) -> None:
-    open_scenarios_into(ctx.wizard)
+    open_scenarios_into(ctx.wizard, room_language(load_config()))
 
 
-def open_scenarios_into(wizard: dict[str, Any]) -> None:
+def open_scenarios_into(wizard: dict[str, Any], lang: str = "en") -> None:
     """«What will we do?»: the ready teams, and no team at all. Nothing starts before «Launch the team»."""
     wizard.update(
         step="scenario_pick",
         from_cmd="/team",
-        prompt="What will we do?",
+        prompt=words_in("team.what", lang),
         # First, and taken by Enter: a room as before — nothing automatic.
-        options=[("No template — nothing automatic, add agents with /add", "none")]
-        + [(f"{sc['title']} — {sc['hint']}", name) for name, sc in SCENARIOS.items()],
+        options=[(words_in("team.none", lang), "none")]
+        + [(f"{scenario_title(name, lang)} — {scenario_hint(name, lang)}", name) for name in SCENARIOS],
     )
 
 
-def agents_words(n: int) -> str:
-    return f"{n} agent" if n == 1 else f"{n} agents"
+def agents_words(n: int, lang: str = "en") -> str:
+    return words_in("n.agents", lang, n=n)
 
 
 def offer_team(config: dict[str, Any]) -> bool:
@@ -10279,13 +10892,16 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         return
     if line == "/help":
         ctx.wizard.clear()
-        paused = load_config().get("paused")
+        cfg = load_config()
+        paused, lang = cfg.get("paused"), room_language(cfg)
         options = []
         for key, title, _, _, _ in ctx.help_tasks:
             if key == "pause":
                 title = "Resume the room" if paused else "Pause the room"
-            options.append((title, key))
-        ctx.wizard.update(step="help_pick", from_cmd="/help", prompt="What would you like to do?", options=options)
+            options.append((help_words(title, lang), key))
+        ctx.wizard.update(
+            step="help_pick", from_cmd="/help", prompt=help_words("What would you like to do?", lang), options=options
+        )
         return
     if line in ("/restart", "/add") and ctx.stale_chat():
         # Old code in memory would start the agent with yesterday's rule — a new Codex then asked
@@ -10430,6 +11046,43 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         )
         say_("Stop the room? " + describe_stop(closing, staying))
         return
+    if line == "/language":
+        # Its own question in both: a person who cannot read the room's language still finds theirs.
+        ctx.wizard.clear()
+        ctx.wizard.update(
+            step="language_pick",
+            from_cmd="/language",
+            prompt=words_in("lang.choose"),
+            options=[(LANG_NAMES[x], x) for x in LANGS],
+        )
+        return
+    if ctx.wizard.get("step") == "language_pick":
+        if line not in LANGS:
+            return
+        target = line
+        ctx.wizard.update(
+            step="language_confirm",
+            target=target,
+            prompt=words_in("lang.change.question", target, language=LANG_NAMES[target]),
+            options=[
+                (words_in("lang.change.apply", target), "go"),
+                (words_in("lang.change.apply", target) + " · " + words_in("lang.change.also_new", target), "also"),
+                (words_in("lang.change.cancel", target), "back"),
+            ],
+        )
+        return
+    if ctx.wizard.get("step") == "language_confirm":
+        target = ctx.wizard["target"]
+        ctx.wizard.clear()
+        if line not in ("go", "also"):
+            say_(words_in("lang.unchanged", room_language(ctx.config)))
+            return
+        set_room_language(target)
+        if line == "also":
+            set_user_language(target)
+        ctx.refresh_people()  # the room's file changed: the chat reads it again, its menu and help follow
+        say_(words_in("lang.changed", target))
+        return
     if line == "/team":
         ctx.wizard.clear()
         cfg = load_config()
@@ -10476,10 +11129,11 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             say_(text)
         ctx.refresh_people()
         return
+    lang = room_language(ctx.config)
     if ctx.wizard.get("step") == "scenario_pick":
         if line == "none":
             ctx.wizard.clear()
-            say_("No template: nothing automatic — /add adds an agent, /team picks a ready team later.")
+            say_(words_in("team.none.said", lang))
             return
         if line not in SCENARIOS:
             return
@@ -10487,13 +11141,18 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.update(
             step="scenario_go",
             scenario=line,
-            prompt="Not available: " + "; ".join(missing) if missing else "Launch this team?",
-            options=[("Back", "back")]
+            prompt=words_in("team.unavailable", lang, what="; ".join(missing))
             if missing
-            else [(f"Launch the team — {agents_words(len(SCENARIOS[line]['seats']))}", "go"), ("Back", "back")],
+            else words_in("team.launch.question", lang),
+            options=[(words_in("team.back", lang), "back")]
+            if missing
+            else [
+                (words_in("team.launch", lang, agents=agents_words(len(SCENARIOS[line]["seats"]), lang)), "go"),
+                (words_in("team.back", lang), "back"),
+            ],
         )
         # Room under the rows for the choice: the menu is drawn over the feed's bottom lines.
-        say_("\n".join(scenario_preview(line)) + "\n" * 4)
+        say_("\n".join(scenario_preview(line, lang)) + "\n" * 4)
         return
     if ctx.wizard.get("step") == "scenario_go":
         if line == "back":
@@ -10504,9 +11163,9 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         name = ctx.wizard["scenario"]
         ctx.wizard.clear()
         if team_of(load_config()).get("scenario"):
-            say_("This room has a team already: /team shows it.")
+            say_(words_in("team.has_one", lang))
             return
-        say_(f"Starting the {SCENARIOS[name]['title']} team…")
+        say_(words_in("team.starting", lang, title=scenario_title(name, lang)))
         started, failed = start_scenario(name, str(rp.root))
         ctx.feed(paint(team_started(load_config(), started, failed), "38;5;252"))
         ctx.refresh_people()
@@ -10709,13 +11368,17 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         if task is None:
             return
         key, title, steps, action, command = task
+        lang = room_language(load_config())
         if key == "keys":
-            ctx.feed("\n" + ctx.help_text(ctx.me, full=True, ids=ctx.known))
+            ctx.feed("\n" + ctx.help_text(ctx.me, full=True, ids=ctx.known, lang=lang))
             return  # the menu stays open: Esc closes it
         if key == "pause":
             paused = load_config().get("paused")
             action, command = ("Resume the room", "/resume") if paused else ("Pause the room", "/pause")
-        ctx.wizard.update(step="help_task", options=[(action, "go"), ("Back", "back")], prompt=title, command=command)
+        title, action = help_words(title, lang), help_words(action, lang)
+        steps = [help_words(x, lang) for x in steps]
+        back = words_in("team.back", lang)
+        ctx.wizard.update(step="help_task", options=[(action, "go"), (back, "back")], prompt=title, command=command)
         # Room under the steps for the choice: the menu is drawn over the feed's bottom lines.
         say_(title + "\n" + "\n".join(f"  {i}. {x}" for i, x in enumerate(steps, 1)) + "\n" * 4)
         return
@@ -10776,22 +11439,9 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         command, label = open_command(line), label_of(cfg, line)
         # Say plainly that the command is already in the clipboard — and show it,
         # in case that line goes unread.
-        if ctx.clipboard(command):
-            say_(
-                "The command is already in your clipboard — you don't need to copy anything.\n"
-                f"  1. Open a new terminal tab (+).\n"
-                f"  2. Paste with Cmd+V and press Enter: {label}'s window opens there.\n"
-                f"  3. Close that tab when done: {label} keeps running, the room stays here.\n"
-                f"If pasting doesn't work, copy this command yourself:\n\n{ctx.whole_line}  {command}\n"
-            )
-        else:
-            say_(
-                "Could not copy automatically — copy this command yourself:\n\n"
-                f"{ctx.whole_line}  {command}\n\n"
-                f"  1. Open a new terminal tab (+).\n"
-                f"  2. Paste the command and press Enter: {label}'s window opens there.\n"
-                f"  3. Close that tab when done: {label} keeps running, the room stays here.\n"
-            )
+        lang = room_language(cfg)
+        key = "open.copied" if ctx.clipboard(command) else "open.copy_failed"
+        say_(words_in(key, lang, label=label, line=ctx.whole_line, command=command))
         return
     if step_ == "clear_confirm":
         ctx.wizard.clear()
@@ -10953,9 +11603,11 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.refresh_people()
         return
 
+import unicodedata
 import difflib
 import time
 from pathlib import Path
+
 
 
 
@@ -11070,7 +11722,8 @@ def chat_submit(ctx: ChatCommandContext, line: str) -> None:
 
 
 def chat_handle(ctx: ChatCommandContext, line: str) -> None:
-    line = line.strip()
+    # A command by either of its names — /добавить or /add — goes on as one: its English name.
+    line = command(line.strip())
     if not line and not ctx.wizard:
         return
     if (
@@ -11079,6 +11732,7 @@ def chat_handle(ctx: ChatCommandContext, line: str) -> None:
         in (
             "/add",
             "/team",
+            "/language",
             "/remove",
             "/stop",
             "/clear",
@@ -11243,9 +11897,16 @@ def chat_menu_items(ctx: ChatCommandContext) -> list[tuple[str, str, str]]:
         return [(label, "pick:" + v, "") for label, v in ctx.wizard["options"]]
     if ctx.ui.menu_closed:
         return []
+    lang = room_language(ctx.config)
     if value.startswith("/") and " " not in value:
-        return [(c, "cmd:" + c, d) for c, d in ctx.commands() if c.startswith(value.lower())]
-    cmd, _, typed = value.partition(" ")
+        # By either name: «/доб» finds /add in any room; each shown in the room's language.
+        typed_ = unicodedata.normalize("NFC", value).casefold()
+        return [
+            (shown_command(c, lang), "cmd:" + c, words_in(f"cmd.{c[1:]}", lang))
+            for c, _ in ctx.commands()
+            if c.startswith(typed_) or shown_command(c, "ru").startswith(typed_)
+        ]
+    cmd, _, typed = command(value).partition(" ")
     if cmd in ("/mute", "/unmute", "/unlimit", "/remove", "/name", "/answer") and " " not in typed:
         return [
             (label_of(ctx.config, x), f"arg:{cmd}:{x}", "")
@@ -11984,6 +12645,7 @@ from typing import Any
 
 
 
+
 def cmd_chat(args: argparse.Namespace) -> None:
     """A person's seat: the room scrolls above, a fixed bottom area holds states, a rule and the input.
 
@@ -12355,7 +13017,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         wizard=lambda: wizard,
     )
     if tty and not welcome:
-        feed(HELP(me, ids=known))
+        feed(HELP(me, ids=known, lang=room_language(config)))
     # The latest messages last, right above the input: under the guide they scrolled out of a
     # small window, and with the mouse off the reopened room looked empty.
     everything = read_messages()
@@ -12398,7 +13060,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         )
     if tty and not welcome and args.as_ in people_ids(config) and offer_team(config):
         # A new room: «What will we do?» first — a ready team, or none (Esc, or «No ready team»).
-        open_scenarios_into(wizard)
+        open_scenarios_into(wizard, room_language(config))
     if tty and args.as_ in people_ids(config) and name_asked(args.as_):
         # Named after the computer's account («Andreynaumov»): asked before anything else, the welcome after.
         mine = label_of(config, args.as_)
@@ -12534,28 +13196,15 @@ def cmd_chat(args: argparse.Namespace) -> None:
     ui.suggested = False  # the draft is a suggested name: typing replaces it, ← → edit it
     ui.came_back = False  # Esc just stepped back from a command's menu to «/»
     after_lock: list[Any] = []  # what runs once a key is handled, without the chat's lock (the popup)
+    # The menu's order; each shown in the room's language when the menu is drawn (chat_cmds.chat_menu_items).
     COMMANDS = [
-        ("/add", "start a new agent"),
-        ("/remove", "disconnect a participant"),
-        ("/mute", "room-wide messages stop; by name still arrive"),
-        ("/unmute", "deliver to an agent again"),
-        ("/unlimit", "an agent is back from its usage limit: deliver to it again"),
-        ("/name", "rename yourself or an agent"),
-        ("/view", "see an agent's screen (read-only)"),
-        ("/answer", "respond in an agent terminal over the chat"),
-        ("/open", "open an agent's window in a new tab"),
-        ("/pause", "pause the room: agents get no messages"),
-        ("/resume", "resume the room: waiting messages go out"),
-        ("/clear", "clear the history (moved to an archive)"),
-        ("/help", "what would you like to do? — tasks and the guide"),
-        ("/mine", "what is for you: unread messages, agents waiting for you"),
-        ("/dm", "talk privately with an agent in a panel beside the chat"),
-        ("/restart", "restart an agent, its conversation continues"),
-        ("/team", "the team: see it, or start a ready one"),
-        ("/stop", "stop the room: close its windows and agents"),
-        ("/exit", "close this chat panel"),
-    ]
-    slash_commands = tuple(c for c, _ in COMMANDS)
+        (c, words_in(f"cmd.{c[1:]}", "en"))
+        for c in (
+            "/add", "/remove", "/mute", "/unmute", "/unlimit", "/name", "/view", "/answer", "/open", "/pause",
+            "/resume", "/clear", "/help", "/mine", "/dm", "/restart", "/team", "/language", "/stop", "/exit",
+        )
+    ]  # fmt: skip
+    slash_commands = tuple(c for c, _ in COMMANDS) + tuple(shown_command(c, "ru") for c, _ in COMMANDS)
 
     def people_for(cmd: str) -> list[str]:
         return chat_people_for(command_context, cmd)

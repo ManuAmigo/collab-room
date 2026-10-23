@@ -2,6 +2,17 @@
 
 The protocol does not care who a participant is: a person, Claude Code, Codex, another agent, or a reviewer. It works with stable `id`s from `.collab.json`; the number of participants is unlimited.
 
+## Language
+
+The room speaks English or Russian. At the first interactive run, before anything else, one screen in both languages
+asks which — the system's one under the cursor; it is saved as the person's default for new rooms (a file beside the
+first-visit mark, outside any project). A room keeps its own `"language"` in `.collab.json`; a room made before speaks
+English until it is changed. `/language` (or `/язык`) changes the room's: Apply, or Apply for new rooms too. Its menus,
+help, ready teams and the room's words to its agents follow; each agent gets its assignment again, told to answer in
+the room's language. Every chat command has a Russian name too — `/добавить`, `/команда`, `/помощь`, `/язык` … —
+and both work in any room; a Russian room's menu shows the Russian ones. Names, ids, paths, models, what people and
+agents write, and the commands agents run are never translated.
+
 ## Starting and choosing a room
 
 After a one-time installation, the person runs `collab` in a regular terminal.

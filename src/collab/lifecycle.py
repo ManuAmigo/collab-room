@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.term as m_term
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
@@ -50,11 +51,23 @@ def cmd_init(args: argparse.Namespace) -> None:
     print(f"Created the room ({who}) in {rp.base}; the project folder is unchanged. Run `collab start`.")
 
 
+def choose_language() -> None:
+    """At the first interactive run, before anything else: one screen in both languages, the system's one under the
+    cursor; Enter takes it. Saved as the person's default for new rooms. Not asked again, nor without a terminal."""
+    if m_store.language_chosen() or not sys.stdin.isatty():
+        return
+    first = m_store.user_language()
+    rows: list[tuple[str, Any]] = [(m_i18n.LANG_NAMES[x], x) for x in sorted(m_i18n.LANGS, key=lambda x: x != first)]
+    choice = m_term.pick([m_i18n.words_in("lang.choose"), ""], rows, ["", "↑/↓ · Enter"])
+    m_store.set_user_language(choice if choice in m_i18n.LANGS else first)
+
+
 def cmd_home(args: argparse.Namespace) -> None:
     """`collab` with nothing else («make starting a room simple»). In a folder with
     a room — open it. Elsewhere — choose: a room you worked in, or a new room in a recent
     project; no paths to type, no environment to clear."""
     rp = m_store.room().paths
+    choose_language()
     if rp.config_path.is_file():
         cmd_start(args)
         return
@@ -728,8 +741,10 @@ def cmd_start(args: argparse.Namespace) -> None:
         # It used to seat and start every installed agent («maybe I won't have
         # Codex there at all») and ask names for «codex» and «claude», not for real agents.
         # Agents come in through /add: which one, which folder, what name.
+        choose_language()
         team = default_team()
         team["participants"] = team["participants"][:1]
+        team["language"] = m_store.user_language()  # the person's default; a room made before speaks English
         m_store.write_room(team, sys.stdin.isatty())
         m_store.replace_state(m_store.offer_team_path(), m_store.now() + "\n")  # «What will we do?» at its first chat
         print(f"Room created for {team['participants'][0]['label']}. Pick a ready team or add agents in the chat.")

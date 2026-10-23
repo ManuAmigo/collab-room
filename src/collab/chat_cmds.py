@@ -1,8 +1,10 @@
 from __future__ import annotations
+import unicodedata
 import difflib
 import time
 from pathlib import Path
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.screen as m_screen
 import collab.log as m_log
@@ -116,7 +118,8 @@ def chat_submit(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
 
 
 def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
-    line = line.strip()
+    # A command by either of its names — /добавить or /add — goes on as one: its English name.
+    line = m_i18n.command(line.strip())
     if not line and not ctx.wizard:
         return
     if (
@@ -125,6 +128,7 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
         in (
             "/add",
             "/team",
+            "/language",
             "/remove",
             "/stop",
             "/clear",
@@ -289,9 +293,16 @@ def chat_menu_items(ctx: m_chat_wizard.ChatCommandContext) -> list[tuple[str, st
         return [(label, "pick:" + v, "") for label, v in ctx.wizard["options"]]
     if ctx.ui.menu_closed:
         return []
+    lang = m_store.room_language(ctx.config)
     if value.startswith("/") and " " not in value:
-        return [(c, "cmd:" + c, d) for c, d in ctx.commands() if c.startswith(value.lower())]
-    cmd, _, typed = value.partition(" ")
+        # By either name: «/доб» finds /add in any room; each shown in the room's language.
+        typed_ = unicodedata.normalize("NFC", value).casefold()
+        return [
+            (m_i18n.shown_command(c, lang), "cmd:" + c, m_i18n.words_in(f"cmd.{c[1:]}", lang))
+            for c, _ in ctx.commands()
+            if c.startswith(typed_) or m_i18n.shown_command(c, "ru").startswith(typed_)
+        ]
+    cmd, _, typed = m_i18n.command(value).partition(" ")
     if cmd in ("/mute", "/unmute", "/unlimit", "/remove", "/name", "/answer") and " " not in typed:
         return [
             (m_store.label_of(ctx.config, x), f"arg:{cmd}:{x}", "")

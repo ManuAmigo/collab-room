@@ -37,6 +37,7 @@ ALIAS_PREFIX = "m_"
 LAYERS = [
     "boot",
     "text",
+    "i18n",
     "term",
     "store",
     "tmuxio",

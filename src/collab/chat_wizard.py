@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, cast
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
@@ -64,23 +65,23 @@ class ChatCommandContext:
 
 
 def open_scenarios(ctx: ChatCommandContext) -> None:
-    open_scenarios_into(ctx.wizard)
+    open_scenarios_into(ctx.wizard, m_store.room_language(m_store.load_config()))
 
 
-def open_scenarios_into(wizard: dict[str, Any]) -> None:
+def open_scenarios_into(wizard: dict[str, Any], lang: str = "en") -> None:
     """«What will we do?»: the ready teams, and no team at all. Nothing starts before «Launch the team»."""
     wizard.update(
         step="scenario_pick",
         from_cmd="/team",
-        prompt="What will we do?",
+        prompt=m_i18n.words_in("team.what", lang),
         # First, and taken by Enter: a room as before — nothing automatic.
-        options=[("No template — nothing automatic, add agents with /add", "none")]
-        + [(f"{sc['title']} — {sc['hint']}", name) for name, sc in m_store.SCENARIOS.items()],
+        options=[(m_i18n.words_in("team.none", lang), "none")]
+        + [(f"{m_store.scenario_title(name, lang)} — {m_store.scenario_hint(name, lang)}", name) for name in m_store.SCENARIOS],
     )
 
 
-def agents_words(n: int) -> str:
-    return f"{n} agent" if n == 1 else f"{n} agents"
+def agents_words(n: int, lang: str = "en") -> str:
+    return m_i18n.words_in("n.agents", lang, n=n)
 
 
 def offer_team(config: dict[str, Any]) -> bool:
@@ -397,13 +398,16 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         return
     if line == "/help":
         ctx.wizard.clear()
-        paused = m_store.load_config().get("paused")
+        cfg = m_store.load_config()
+        paused, lang = cfg.get("paused"), m_store.room_language(cfg)
         options = []
         for key, title, _, _, _ in ctx.help_tasks:
             if key == "pause":
                 title = "Resume the room" if paused else "Pause the room"
-            options.append((title, key))
-        ctx.wizard.update(step="help_pick", from_cmd="/help", prompt="What would you like to do?", options=options)
+            options.append((m_i18n.help_words(title, lang), key))
+        ctx.wizard.update(
+            step="help_pick", from_cmd="/help", prompt=m_i18n.help_words("What would you like to do?", lang), options=options
+        )
         return
     if line in ("/restart", "/add") and ctx.stale_chat():
         # Old code in memory would start the agent with yesterday's rule — a new Codex then asked
@@ -548,6 +552,43 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         )
         say_("Stop the room? " + m_lifecycle.describe_stop(closing, staying))
         return
+    if line == "/language":
+        # Its own question in both: a person who cannot read the room's language still finds theirs.
+        ctx.wizard.clear()
+        ctx.wizard.update(
+            step="language_pick",
+            from_cmd="/language",
+            prompt=m_i18n.words_in("lang.choose"),
+            options=[(m_i18n.LANG_NAMES[x], x) for x in m_i18n.LANGS],
+        )
+        return
+    if ctx.wizard.get("step") == "language_pick":
+        if line not in m_i18n.LANGS:
+            return
+        target = line
+        ctx.wizard.update(
+            step="language_confirm",
+            target=target,
+            prompt=m_i18n.words_in("lang.change.question", target, language=m_i18n.LANG_NAMES[target]),
+            options=[
+                (m_i18n.words_in("lang.change.apply", target), "go"),
+                (m_i18n.words_in("lang.change.apply", target) + " · " + m_i18n.words_in("lang.change.also_new", target), "also"),
+                (m_i18n.words_in("lang.change.cancel", target), "back"),
+            ],
+        )
+        return
+    if ctx.wizard.get("step") == "language_confirm":
+        target = ctx.wizard["target"]
+        ctx.wizard.clear()
+        if line not in ("go", "also"):
+            say_(m_i18n.words_in("lang.unchanged", m_store.room_language(ctx.config)))
+            return
+        m_store.set_room_language(target)
+        if line == "also":
+            m_store.set_user_language(target)
+        ctx.refresh_people()  # the room's file changed: the chat reads it again, its menu and help follow
+        say_(m_i18n.words_in("lang.changed", target))
+        return
     if line == "/team":
         ctx.wizard.clear()
         cfg = m_store.load_config()
@@ -594,10 +635,11 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             say_(text)
         ctx.refresh_people()
         return
+    lang = m_store.room_language(ctx.config)
     if ctx.wizard.get("step") == "scenario_pick":
         if line == "none":
             ctx.wizard.clear()
-            say_("No template: nothing automatic — /add adds an agent, /team picks a ready team later.")
+            say_(m_i18n.words_in("team.none.said", lang))
             return
         if line not in m_store.SCENARIOS:
             return
@@ -605,13 +647,18 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.update(
             step="scenario_go",
             scenario=line,
-            prompt="Not available: " + "; ".join(missing) if missing else "Launch this team?",
-            options=[("Back", "back")]
+            prompt=m_i18n.words_in("team.unavailable", lang, what="; ".join(missing))
             if missing
-            else [(f"Launch the team — {agents_words(len(m_store.SCENARIOS[line]['seats']))}", "go"), ("Back", "back")],
+            else m_i18n.words_in("team.launch.question", lang),
+            options=[(m_i18n.words_in("team.back", lang), "back")]
+            if missing
+            else [
+                (m_i18n.words_in("team.launch", lang, agents=agents_words(len(m_store.SCENARIOS[line]["seats"]), lang)), "go"),
+                (m_i18n.words_in("team.back", lang), "back"),
+            ],
         )
         # Room under the rows for the choice: the menu is drawn over the feed's bottom lines.
-        say_("\n".join(m_store.scenario_preview(line)) + "\n" * 4)
+        say_("\n".join(m_store.scenario_preview(line, lang)) + "\n" * 4)
         return
     if ctx.wizard.get("step") == "scenario_go":
         if line == "back":
@@ -622,9 +669,9 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         name = ctx.wizard["scenario"]
         ctx.wizard.clear()
         if m_store.team_of(m_store.load_config()).get("scenario"):
-            say_("This room has a team already: /team shows it.")
+            say_(m_i18n.words_in("team.has_one", lang))
             return
-        say_(f"Starting the {m_store.SCENARIOS[name]['title']} team…")
+        say_(m_i18n.words_in("team.starting", lang, title=m_store.scenario_title(name, lang)))
         started, failed = m_agents.start_scenario(name, str(rp.root))
         ctx.feed(m_text.paint(m_agents.team_started(m_store.load_config(), started, failed), "38;5;252"))
         ctx.refresh_people()
@@ -827,13 +874,17 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         if task is None:
             return
         key, title, steps, action, command = task
+        lang = m_store.room_language(m_store.load_config())
         if key == "keys":
-            ctx.feed("\n" + ctx.help_text(ctx.me, full=True, ids=ctx.known))
+            ctx.feed("\n" + ctx.help_text(ctx.me, full=True, ids=ctx.known, lang=lang))
             return  # the menu stays open: Esc closes it
         if key == "pause":
             paused = m_store.load_config().get("paused")
             action, command = ("Resume the room", "/resume") if paused else ("Pause the room", "/pause")
-        ctx.wizard.update(step="help_task", options=[(action, "go"), ("Back", "back")], prompt=title, command=command)
+        title, action = m_i18n.help_words(title, lang), m_i18n.help_words(action, lang)
+        steps = [m_i18n.help_words(x, lang) for x in steps]
+        back = m_i18n.words_in("team.back", lang)
+        ctx.wizard.update(step="help_task", options=[(action, "go"), (back, "back")], prompt=title, command=command)
         # Room under the steps for the choice: the menu is drawn over the feed's bottom lines.
         say_(title + "\n" + "\n".join(f"  {i}. {x}" for i, x in enumerate(steps, 1)) + "\n" * 4)
         return
@@ -894,22 +945,9 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         command, label = m_agents.open_command(line), m_store.label_of(cfg, line)
         # Say plainly that the command is already in the clipboard — and show it,
         # in case that line goes unread.
-        if ctx.clipboard(command):
-            say_(
-                "The command is already in your clipboard — you don't need to copy anything.\n"
-                f"  1. Open a new terminal tab (+).\n"
-                f"  2. Paste with Cmd+V and press Enter: {label}'s window opens there.\n"
-                f"  3. Close that tab when done: {label} keeps running, the room stays here.\n"
-                f"If pasting doesn't work, copy this command yourself:\n\n{ctx.whole_line}  {command}\n"
-            )
-        else:
-            say_(
-                "Could not copy automatically — copy this command yourself:\n\n"
-                f"{ctx.whole_line}  {command}\n\n"
-                f"  1. Open a new terminal tab (+).\n"
-                f"  2. Paste the command and press Enter: {label}'s window opens there.\n"
-                f"  3. Close that tab when done: {label} keeps running, the room stays here.\n"
-            )
+        lang = m_store.room_language(cfg)
+        key = "open.copied" if ctx.clipboard(command) else "open.copy_failed"
+        say_(m_i18n.words_in(key, lang, label=label, line=ctx.whole_line, command=command))
         return
     if step_ == "clear_confirm":
         ctx.wizard.clear()

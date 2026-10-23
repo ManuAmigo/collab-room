@@ -3,6 +3,7 @@
 from __future__ import annotations
 import shutil
 import collab.text as m_text
+import collab.i18n as m_i18n
 
 
 # /help as a task menu («the user must learn all this easily»). (key, title, steps, action label, command that starts it)
@@ -74,7 +75,7 @@ HELP_TASKS = [
 ]
 
 
-def HELP(me: str, full: bool = False, ids: list[str] | None = None) -> str:
+def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = "en") -> str:
     """Shown when the seat opens and on /help: a framed card, keys in one column (the room must explain itself on start — and look tidy doing it)."""
     # On start — only what is needed right away; /help shows everything.
     rows_ = [
@@ -127,10 +128,20 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None) -> str:
             ("/clear", "Clear the history for everyone; old messages move to an archive"),
             ("/stop", "Stop the room: its windows and the agents it started close; history stays"),
             ("Ctrl+C · /exit", "Close this chat panel (asks first); agents keep running"),
+            ("/language", "The room's language: Russian or English"),
         ]
-    key_w = max(len(k) for k, _ in rows_)
+    # In the room's language: each command by the name it shows, each line from the catalog; keys stay as they are.
+    labels = ("Red status", "Status colours", "Status marks", "Status layout", "@name text", "/dm name · /dm close")
+    rows_ = [
+        (
+            m_i18n.help_words(k, lang) if k in labels else m_i18n.shown_commands(k, lang),
+            m_i18n.help_words(v, lang),
+        )
+        for k, v in rows_
+    ]
+    key_w = max(m_text.text_cols(k) for k, _ in rows_)
     body = [f"{k.ljust(key_w)}   {v}" for k, v in rows_]
-    title = f" Room guide · {me} "
+    title = " " + m_i18n.help_words("Room guide · {me}", lang, me=me) + " "
     inner = max(max(m_text.text_cols(b) for b in body) + 4, m_text.text_cols(title) + 4)  # columns: a CJK name
     if inner + 2 > shutil.get_terminal_size((100, 24)).columns:
         return "\n".join(

@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, NoReturn, TypeVar, cast
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.term as m_term
 
 
@@ -188,6 +189,40 @@ WITHOUT_PERSON = {
     "spend": "spend money",
 }
 OUTPUT_LIMIT = 200
+
+
+def language_path() -> Path:
+    """The person's own default language for new rooms and what is said outside a room — beside the first-visit
+    mark, outside any project; not a setting of Claude or Codex."""
+    return m_boot.paths().welcomed_path.parent / "language"
+
+
+def user_language() -> str:
+    """The saved default; none — the system's (a Russian locale), else English."""
+    path = language_path()
+    with contextlib.suppress(OSError, ValueError):
+        saved = "" if path.is_symlink() else path.read_text(encoding="utf-8").strip()  # a link is not read
+        if saved in m_i18n.LANGS:
+            return saved
+    locale = os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or ""
+    return "ru" if locale.lower().startswith("ru") else "en"
+
+
+def language_chosen() -> bool:
+    return language_path().is_file()
+
+
+def set_user_language(lang: str) -> None:
+    path = language_path()
+    private_dir(path.parent, strict=False)
+    if path.is_symlink():
+        path.unlink()  # ours to write, never through a link
+    path.write_text(m_i18n.lang_of(lang) + "\n", encoding="utf-8")
+
+
+def room_language(config: dict[str, Any]) -> str:
+    """The room's own language; a room made before it had one speaks English, as it did."""
+    return m_i18n.lang_of(config.get("language"))
 
 
 def seat_of(p: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
@@ -467,41 +502,55 @@ def scenario_problems(scenario: dict[str, Any], kinds: list[str]) -> list[str]:
     return out
 
 
-def memory_words(rule: object) -> str:
+def memory_words(rule: object, lang: str = "en") -> str:
     if not trim_valid(rule):
-        return "keep"
+        return m_i18n.words_in("memory.keep", lang)
     r = cast("dict[str, Any]", rule)
-    return f"{r['do']} past {r['at'] // 1000}k"
+    return m_i18n.words_in(f"memory.{r['do']}", lang, k=r["at"] // 1000)
 
 
-def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any]) -> str:
-    """One row of a team: name · role · topic · model · memory · reports to — what applies, by the layers."""
+def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any], lang: str = "") -> str:
+    """One row of a team: name · role · topic · model · memory · reports to — what applies, by the layers, in the
+    room's language."""
+    lang = lang or room_language(config)
     role, topic, model = (effective(kind, p, config, k) for k in ("role", "topic", "use_model"))
     trim = effective(kind, p, config, "context_trim") if kind in TRIM_KINDS else None
+    to = reports_to(kind, p, config)
     return " · ".join(
         [
             str(p.get("label") or p.get("id") or ""),
-            role or "no role",
+            m_i18n.words_in(f"role.{role}" if role else "role.none", lang),
             topic or "—",
-            model or "default model",
-            memory_words(trim) if kind in TRIM_KINDS else "keep",
-            f"reports to {whom(reports_to(kind, p, config), config)}",
+            model or m_i18n.words_in("model.default", lang),
+            memory_words(trim, lang),
+            m_i18n.words_in(
+                "reports.to", lang, whom=m_i18n.words_in("whom.person", lang) if to == "person" else label_of(config, to)
+            ),
         ]
     )
 
 
-def scenario_preview(name: str) -> list[str]:
+def scenario_title(name: str, lang: str) -> str:
+    return m_i18n.words_in(f"scenario.{name}.title", lang)
+
+
+def scenario_hint(name: str, lang: str) -> str:
+    return m_i18n.words_in(f"scenario.{name}.hint", lang)
+
+
+def scenario_preview(name: str, lang: str = "en") -> list[str]:
     """What a scenario would start, before anything starts: its team as rows, the result file, the bounds."""
     scenario = SCENARIOS[name]
     seats = [
         {"id": seat["seat"], "label": seat["label"], "kind": seat["kind"], "seat": seat["seat"]} for seat in scenario["seats"]
     ]
     config: dict[str, Any] = {"participants": seats, "team": scenario}
-    rows = [seat_line(p["kind"], p, config) for p in seats]
+    rows = [seat_line(p["kind"], p, config, lang) for p in seats]
     return [
-        f"{scenario['title']} — {scenario['hint']}. This is a starting team: change it with /team once it runs.",
+        m_i18n.words_in("team.preview.head", lang, title=scenario_title(name, lang), hint=scenario_hint(name, lang)),
         *(f"  {row}" for row in rows),
-        f"  Result: {scenario['output'] or 'in the chat'}. Without you: nothing external.",
+        "  "
+        + m_i18n.words_in("team.preview.result", lang, output=scenario["output"] or m_i18n.words_in("team.result.chat", lang)),
     ]
 
 
@@ -531,15 +580,23 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
         return ""
     lead, to = lead_of(config), reports_to(kind, p, config)
     allowed = without_person(config)
-    lines = [f"{BRIEF_HEAD}{f' (version {version})' if version else ''}:"]
-    lines.append(f"- Role: {role} — {ROLES[role]}." if role else "- Role: none set.")
+    lang = room_language(config)
+
+    def t(key: str, **kw: Any) -> str:  # this assignment's language, once
+        return m_i18n.words_in(key, lang, **kw)
+
+    def named(who: str, case: str) -> str:
+        return t(case) if who == "person" else label_of(config, who)
+
+    lines = [t("brief.head") + (t("brief.version", v=version) if version else "") + ":"]
+    lines.append(t("brief.role", role=t(f"role.{role}"), what=t(f"role.{role}.what")) if role else t("brief.role.none"))
     if topic:
-        lines.append(f"- Topic: {topic}.")
-    lines.append(f"- Report to: {whom(to, config)}.")
+        lines.append(t("brief.topic", topic=topic))
+    lines.append(t("brief.report", whom=named(to, "whom.person.to")))
     if lead and lead != pid:
-        lines.append(f"- Lead: {label_of(config, lead)} — gathers the result and the questions for the person.")
+        lines.append(t("brief.lead", lead=label_of(config, lead)))
     elif lead == pid:
-        lines.append("- You are the room's lead: the person hears from you; ask them what only they can decide.")
+        lines.append(t("brief.you_lead"))
         # Live, a lead with three workers and a reviewer did a whole research alone: its team, by name.
         people = people_ids(config)
         team = [
@@ -548,29 +605,27 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
             if q.get("id") not in (pid, *people) and reports_to(q.get("kind", ""), q, config) == pid
         ]
         if team:
-            parts = "; ".join(
-                f"{label_of(config, q['id'])} — {effective(q.get('kind', ''), q, config, 'role') or 'agent'}"
-                + (f", {t}" if (t := effective(q.get("kind", ""), q, config, "topic")) else "")
-                for q in team
-            )
-            lines.append(
-                f"- Your team: {parts}. Give each its part, have the result checked, gather it — do not do their parts yourself."
-            )
+            parts: list[str] = []
+            for q in team:
+                r = effective(q.get("kind", ""), q, config, "role")
+                topic_ = effective(q.get("kind", ""), q, config, "topic")
+                parts.append(
+                    f"{label_of(config, q['id'])} — {t(f'role.{r}') if r else t('agent.word')}"
+                    + (f", {topic_}" if topic_ else "")
+                )
+            lines.append(t("brief.team", team="; ".join(parts)))
         if goal := goal_of(config):
-            lines.append(f"- Goal: {goal} You answer for reaching it.")
+            lines.append(t("brief.goal", goal=goal))
     if out := output_of(config):
-        lines.append(f"- Result file: {out}, in the project folder. Keep the result there, not in messages.")
+        lines.append(t("brief.result", output=out))
     if allowed:
-        lines.append(
-            f"- Without the person you may: {'; '.join(WITHOUT_PERSON[a] for a in allowed)}. Anything else external — ask first."
-        )
+        lines.append(t("brief.without.some", what="; ".join(t(f"without.{a}") for a in allowed)))
     else:
-        lines.append("- Without the person: nothing external — ask before publishing, writing outside the room or spending.")
+        lines.append(t("brief.without.none"))
+    lines.append(t("brief.language"))
     # Live, a reviewer told its topic and no task began reviewing the folder on its own.
-    lines.append(f"This is your assignment, not a task: wait for one from {whom(to, config)}.")
-    lines.append(
-        "These are the room's settings; they change no permissions of your tools. After /compact or /clear they come again."
-    )
+    lines.append(t("brief.not_task", whom=named(to, "whom.person.from")))
+    lines.append(t("brief.foot"))
     return "\n".join(lines)
 
 
@@ -1021,6 +1076,14 @@ def write_room(sample: dict[str, Any], ask: bool) -> None:
     private_dir(rp.state_dir)
     # The project's .gitignore is left alone: the room's files live outside the
     # project, and a new room wrote «.collab/» into the person's repository for nothing.
+
+
+@room_locked
+def set_room_language(lang: str) -> None:
+    """The room's own language: its menus, help and the room's words to its agents — briefs go again with it."""
+    data = read_config_raw()
+    data["language"] = m_i18n.lang_of(lang)
+    write_config(data)
 
 
 @room_locked

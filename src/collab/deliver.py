@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, cast
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
@@ -560,18 +561,18 @@ def assignment_state(pid: str, config: dict[str, Any], messages: list[dict[str, 
     is not a promise to keep it), answered with say --re — it said something about it, the person reads it."""
     p = next((q for q in config["participants"] if q["id"] == pid), {})
     if p.get("joined") == "pending":
-        return "Starting"
+        return m_i18n.words_in("state.starting", m_store.room_language(config))
     if not m_store.brief(pid, config):
         return ""
     sent = [m for m in messages if m.get("from") == m_text.ROOM and m.get("brief") is True and m.get("to") == [pid]]
     if not sent:
-        return "Getting its assignment"
+        return m_i18n.words_in("state.getting", m_store.room_language(config))
     last = sent[-1]["id"]
     if any(m.get("from") == pid and m.get("re") == last for m in messages):
-        return "Replied to its assignment — read it"
+        return m_i18n.words_in("state.replied", m_store.room_language(config))
     if last in m_log.read_set(m_store.room().paths.noreply_dir, pid):
-        return "Assignment acknowledged"
-    return "Getting its assignment"
+        return m_i18n.words_in("state.acknowledged", m_store.room_language(config))
+    return m_i18n.words_in("state.getting", m_store.room_language(config))
 
 
 def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[str]:
@@ -579,18 +580,22 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
     agent — what applies to it and where it is with its assignment."""
     team = m_store.team_of(config)
     name = team.get("scenario")
-    title = m_store.SCENARIOS[name]["title"] if isinstance(name, str) and name in m_store.SCENARIOS else "No scenario"
+    lang = m_store.room_language(config)
+    title = (
+        m_store.scenario_title(name, lang)
+        if isinstance(name, str) and name in m_store.SCENARIOS
+        else m_i18n.words_in("team.view.none", lang)
+    )
     allowed = m_store.without_person(config)
-    lines = [
-        f"Team: {title} · result: {m_store.output_of(config) or 'in the chat'} · without you: "
-        + ("; ".join(m_store.WITHOUT_PERSON[a] for a in allowed) if allowed else "nothing external")
-    ]
+    without = "; ".join(m_i18n.words_in(f"without.{a}", lang) for a in allowed) or m_i18n.words_in("team.view.nothing", lang)
+    output = m_store.output_of(config) or m_i18n.words_in("team.result.chat", lang)
+    lines = [m_i18n.words_in("team.view.head", lang, title=title, output=output, without=without)]
     for p in agents_of(config):
         state = assignment_state(p["id"], config, messages)
         lines.append(
             f"  {m_text.visible(m_store.seat_line(m_screen.agent_kind(p), p, config))}" + (f" — {state}" if state else "")
         )
-    return lines if len(lines) > 1 else [*lines, "  No agents yet: /team picks a ready team, /add adds one agent."]
+    return lines if len(lines) > 1 else [*lines, "  " + m_i18n.words_in("team.view.empty", lang)]
 
 
 @m_store.room_locked
