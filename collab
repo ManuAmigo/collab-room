@@ -110,7 +110,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -1105,6 +1105,9 @@ def load_config() -> dict[str, Any]:
     limit = data.get("talk_limit", 0)
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
         bad("talk_limit must be a whole number, 0 or more (0: the room never pauses for agents' talk)")
+    gather = data.get("gather_seconds", 0)
+    if not isinstance(gather, int) or isinstance(gather, bool) or gather < 0:
+        bad("gather_seconds must be a whole number, 0 or more (0: agents' messages are typed at once)")
     participants = data.get("participants")
     if not isinstance(participants, list) or not participants:
         bad("config must contain a non-empty participants list")
@@ -1486,6 +1489,9 @@ def current_chat_command(cmd: list[str]) -> list[str]:
 
 def write_room(sample: dict[str, Any], ask: bool) -> None:
     rp = room().paths
+    if ask:
+        for p in sample["participants"]:
+            p.pop("name_from_account", None)  # shown with the question and kept or changed: chosen
     if ask and len(sample["participants"]) == 1:
         p = sample["participants"][0]
         try:
@@ -1530,12 +1536,25 @@ def record_room_root() -> None:
 
 
 @room_locked
+def name_asked(pid: str) -> bool:
+    """True once for a person whose name came from the computer's account, never chosen: the chat asks
+    it then. The mark goes at once — asked one time, kept or not."""
+    data = read_config_raw()
+    p = next((q for q in data["participants"] if q["id"] == pid), None)
+    if p is None or not p.pop("name_from_account", None):
+        return False
+    write_config(data)
+    return True
+
+
+@room_locked
 def rename(pid: str, label: str) -> None:
     """Change a participant's name in .collab.json, keeping everything else as it is."""
     data = read_config_raw()
     for p in data["participants"]:
         if p["id"] == pid:
             p["label"] = label
+            p.pop("name_from_account", None)
     write_config(data)
 
 
@@ -2548,7 +2567,7 @@ from typing import Any, Callable, Sequence, cast
 
 
 
-STATES = {"joining", "working", "idle", "needs_owner", "draft", "unknown", "lost", "limited"}
+STATES = {"joining", "working", "idle", "needs_owner", "draft", "unknown", "lost", "limited", "scrolled"}
 
 # How each known agent looks on screen (verified on Codex 0.163 and Claude Code 2.1).
 PRESETS: dict[str, dict[str, Any]] = {
@@ -2753,6 +2772,7 @@ class Shot:
     returncode: int
     stdout: str  # the screen (with colour codes when the rules take dim text for hints)
     guard: str  # «pid\tprogram\tgroup\troot» of the same window
+    scrolled: bool = False  # in copy mode (the wheel, Ctrl+b [): what is typed goes to its keys, not the agent
 
     @property
     def plain(self) -> str:
@@ -2768,12 +2788,24 @@ def look(p: dict[str, Any], pane: str) -> Shot:
     mark = secrets.token_hex(8)
     hints = ["-e"] if p.get("dim_is_hint") else []
     shown = tmux(
-        "capture-pane", "-p", *hints, "-t", pane, ";", "display-message", "-p", "-t", pane, f"{mark}\t{GUARD_FORMAT}", check=False
+        "capture-pane",
+        "-p",
+        *hints,
+        "-t",
+        pane,
+        ";",
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        f"{mark}\t#{{pane_in_mode}}\t{GUARD_FORMAT}",
+        check=False,
     )
     screen, found, guard = (shown.stdout or "").rpartition(mark + "\t")
     if shown.returncode != 0 or not found:
         return Shot(1, "", "")
-    return Shot(0, screen, guard)
+    in_mode, _, guard = guard.partition("\t")
+    return Shot(0, screen, guard, in_mode == "1")
 
 
 def pane_guard(p: dict[str, Any], pane: str, idle: bool = True, root: Path | None = None, shot: Shot | None = None) -> str:
@@ -3094,6 +3126,7 @@ BAR_WORDS = {
     "unknown": "Unknown",
     "lost": "Disconnected",
     "limited": "Out of limit",
+    "scrolled": "Scrolled — q to exit",
 }
 STATE_WORDS = {
     "joining": "is connecting",
@@ -3104,6 +3137,7 @@ STATE_WORDS = {
     "unknown": "status unknown",
     "lost": "disconnected",
     "limited": "is out of its usage limit",
+    "scrolled": "is scrolled back — press q in its window to resume message delivery",
 }
 
 
@@ -4515,6 +4549,8 @@ def install_command_step(args: argparse.Namespace, bin_dir: Path, link: Path, re
 # copy updates itself: a --dev install runs the clone's own file, and its clone is the developer's.
 UPDATE_FETCH_WAIT = 20  # seconds; `collab start` never waits for it — the check runs beside the room
 UPDATE_ROOM_WAIT = 60  # seconds for the room this start opens to be up before its deliverer is restarted
+# What an update beside a start leaves to the person: only the deliverer moves to the new copy.
+UPDATED_IN_ROOM = " The room's delivery moves to it; your chat and running agents keep the old code until you reopen the chat (/exit, then collab) and /restart each agent."
 
 
 def release_of(tag: str) -> tuple[int, ...] | None:
@@ -4738,6 +4774,8 @@ def auto_update(starter: int) -> None:
     if not tell:
         return
     config = config_now()
+    if outcome == "updated":
+        line += UPDATED_IN_ROOM
     append_message(ROOM, people_ids(config), line)
     link = read_private(inst.installed_file)
     session = config.get("session", "collab-room")
@@ -5342,6 +5380,28 @@ def confirm_joins(config: dict[str, Any], messages: list[dict[str, Any]]) -> Non
 TALK_LIMIT = 10
 
 
+def gather_seconds(config: dict[str, Any]) -> int:
+    """How long agents' messages to an idle agent wait for more before one typing takes them all. Each
+    typing wakes the agent, and a wake re-reads its whole context: three agents answering each other
+    woke one another for every message. A person's word never waits. The room's own is `gather_seconds`
+    in .collab.json (0 — at once)."""
+    return config.get("gather_seconds", int(os.environ.get("COLLAB_GATHER_SECONDS", "20")))
+
+
+def gathering(pending: list[dict[str, Any]], config: dict[str, Any]) -> bool:
+    """True while what would wake the agent is only agents' messages and the oldest of them is younger
+    than the room's window."""
+    window = gather_seconds(config)
+    waking = [m for m in pending if not is_quiet(m, config)]
+    if not window or not waking or any(m["from"] in (ROOM, *people_ids(config)) for m in waking):
+        return False
+    try:
+        oldest = min(dt.datetime.fromisoformat(m["at"]) for m in waking)
+        return (dt.datetime.now(dt.timezone.utc) - oldest).total_seconds() < window
+    except (KeyError, TypeError, ValueError):
+        return False  # a time it cannot read (a record written by hand) holds nothing back
+
+
 def talk_path() -> Path:
     return room().paths.state_dir / "talk.json"
 
@@ -5681,6 +5741,9 @@ def deliver_one(p: dict[str, Any], pane: str, config: dict[str, Any], messages: 
         tasks += screen_subagents(pane, rules["subagent"], shot)
     if tasks and state == "idle":
         why_shown, watch = f"background {tasks}", "working"
+    if shot.scrolled and state != "lost":
+        # Nothing is typed into a scrolled window (deliver_to): the person is told why, and how out.
+        shown, why_shown = "scrolled", ""
     if p.get("joined") in ("pending", "invited") and state not in ("needs_owner", "lost", "draft"):
         # Until it answers the connection check it is «подключается», not «свободен»;
         # a question in its window or a lost window still show as they are.
@@ -5934,6 +5997,8 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any])
             pending = [m for m in pending if well_formed(m)]
             if not pending:
                 return ""
+        if gathering(pending, config):
+            return ""  # agents' messages wait a little for each other: one wake for them all
         rules = (
             screen_rules(p) if p.get("started_by_room") else {**PRESETS.get(agent_kind(p), {}), **p}
         )
@@ -6911,6 +6976,7 @@ def default_team() -> dict[str, Any]:
         {
             "id": "owner",
             "label": os.environ.get("USER", "Owner").capitalize(),
+            "name_from_account": True,  # nobody chose it: the chat asks at its first opening
             "command": ["python3", SELF, "chat", "--as", "owner"],
             "delivery": "pull",
         }
@@ -7113,6 +7179,26 @@ def restore_owner_pane(session: str, config: dict[str, Any]) -> None:
     if out.returncode == 0:
         data.setdefault("panes", {})[owner["id"]] = out.stdout.strip()
         replace_state(rp.panes_path, json.dumps(data, indent=2) + "\n")
+
+
+def not_running(config: dict[str, Any]) -> None:
+    """A running room is only returned to: an agent written into its settings since (by hand) has no
+    window, and the start said nothing about it. Said in the terminal and to the room's people."""
+    data = read_panes() or {}
+    for p in config["participants"]:
+        if "target" in p or not p.get("pane", True) or is_chat_command(p.get("command")):
+            continue
+        if p["id"] in people_ids(config):
+            continue
+        pane = data.get("panes", {}).get(p["id"])
+        if pane and tmux("list-panes", "-t", pane, check=False).returncode == 0:
+            continue
+        line = visible(
+            f"{label_of(config, p['id'])} is in the room's settings but not running: the room was running "
+            "already, and start only returned to it — collab stop, then collab start starts it (history stays)."
+        )
+        print(line)
+        append_message(ROOM, people_ids(config), line)
 
 
 @room_locked
@@ -7635,6 +7721,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             start_deliverer(session)
         room_options(session)
         restore_owner_pane(session, config)
+        not_running(config)
         # The person lands on the chat: restarting the deliverer made its window the current one,
         # and every terminal of the room showed an empty screen.
         tmux("select-window", "-t", f"={session}:=room", check=False)
@@ -8776,6 +8863,22 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         )
         say_("Add an agent. " + ctx.wizard["prompt"])
         return
+    if ctx.wizard.get("step") == "own_name":
+        problem = line and (
+            name_problem(line)
+            or ("that is already someone else's name here" if label_taken(ctx.config, ctx.args.as_, line) else "")
+        )
+        if problem:
+            say_(f"! {problem}. Try another name, or Enter to keep yours.")
+            return
+        then = ctx.wizard.get("then") or {}
+        ctx.wizard.clear()
+        if line:
+            ctx.handle(f"/name {ctx.args.as_} {line}")
+        else:
+            say_(f"You stay {label_of(ctx.config, ctx.args.as_)}. /name changes it any time.")
+        ctx.wizard.update(then)  # the welcome, when this is the first visit — after the name is set
+        return
     if line == "" and ctx.wizard.get("step") != "folder":  # in «folder» an empty Enter asks again
         ctx.wizard.clear()
         say_("Canceled.")
@@ -9213,6 +9316,12 @@ def chat_wizard_back(ctx: ChatCommandContext) -> None:
     origin = ctx.wizard.get("from_cmd")
     if ctx.wizard.get("step") == "exit_confirm" and "draft" in ctx.wizard:
         ctx.stay_open()  # Ctrl+C, then Esc: everything as it was
+        return
+    if ctx.wizard.get("step") == "own_name":
+        then = ctx.wizard.get("then") or {}
+        ctx.wizard.clear()
+        ctx.wizard.update(then)  # Esc keeps the name; the welcome still comes
+        ctx.feed(paint("/name changes your name any time.", "38;5;252"))
         return
     if ctx.wizard.get("step") == "welcome":
         mark_welcomed()  # Esc is «Skip for now»: the welcome does not come back
@@ -10595,6 +10704,16 @@ def cmd_chat(args: argparse.Namespace) -> None:
         wizard.update(
             step="welcome", prompt="Welcome to your room", options=[("Show me around", "tour"), ("Skip for now", "skip")]
         )
+    if tty and args.as_ in people_ids(config) and name_asked(args.as_):
+        # Named after the computer's account («Andreynaumov»): asked before anything else, the welcome after.
+        mine = label_of(config, args.as_)
+        wizard.update(
+            step="own_name",
+            then=dict(wizard),
+            options=None,
+            prompt=f"The room calls you {mine} — your account's name. Your name (Enter keeps {mine}):",
+        )
+        feed("\n" + wizard["prompt"])
     ui.cfg_mtime = rp.config_path.stat().st_mtime if rp.config_path.exists() else 0.0
 
     def refresh_people() -> bool:
@@ -11255,6 +11374,7 @@ from typing import Any
 
 
 
+
 # One empty line under the input, so it does not sit on the very bottom edge:
 # step down to make the line, then back up to type above it.
 LIFT = "\n\033[1A"
@@ -11289,6 +11409,37 @@ def cmd_remove(args: argparse.Namespace) -> None:
     except ValueError as exc:
         fail(str(exc))
     print(f"{label} disconnected from the room.")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    """`collab add`: what /add in the chat does, from a command line — a room set up to the end by a
+    script or another agent. The room must be running: the agent gets a window of its session."""
+    config = load_config()
+    session = config.get("session", "collab-room")
+    if tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
+        fail("the room is not running — collab start first, then collab add")
+    try:
+        folder = Path(args.folder or str(room().paths.root)).expanduser()
+    except RuntimeError:  # «~someone» with no such user
+        fail(f"Folder not found: {args.folder}")
+    problem = folder_problem(folder)
+    if problem:
+        fail(problem)
+    base = PRESETS[args.kind]["label"]
+    label = args.name or next(
+        n for n in [base] + [f"{base} {i}" for i in range(2, 100)] if not label_taken(config, "", n)
+    )
+    problem = name_problem(label) or (
+        "that is already someone else's name here" if label_taken(config, "", label) else ""
+    )
+    if problem:
+        fail(problem)
+    pid = launch_new_agent(config, args.kind, str(folder.resolve()), label)
+    # Not typed in a chat: the people learn who came in, and where it works.
+    line = visible(f"{label} ({base}) was added by collab add, in {tilde(str(folder.resolve()))}.")
+    append_message(ROOM, people_ids(load_config()), line)
+    how = "its window tells its session" if args.kind == "claude" else "it answers the connection check"
+    print(f"Starting {label} in room window {pid}. It joins when {how} (collab status).")
 
 
 def cmd_name(args: argparse.Namespace) -> None:
@@ -11751,6 +11902,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("unlimit", help="clear an agent's usage limit by hand: its messages are delivered again")
     s.add_argument("id")
     s.set_defaults(func=cmd_unlimit)
+
+    s = sub.add_parser("add", help="start an agent in the running room — what /add does in the chat")
+    s.add_argument("kind", choices=sorted(PRESETS))
+    s.add_argument("--folder", help="the project folder it works in (default: the room's)")
+    s.add_argument("--name", help="its name in the room (default: Claude, Codex… — the next one free)")
+    s.set_defaults(func=cmd_add)
 
     s = sub.add_parser("name", help="give a participant a name shown in the room")
     s.add_argument("id")

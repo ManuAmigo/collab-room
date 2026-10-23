@@ -31,6 +31,12 @@ def chat_wizard_back(ctx: m_chat_wizard.ChatCommandContext) -> None:
     if ctx.wizard.get("step") == "exit_confirm" and "draft" in ctx.wizard:
         ctx.stay_open()  # Ctrl+C, then Esc: everything as it was
         return
+    if ctx.wizard.get("step") == "own_name":
+        then = ctx.wizard.get("then") or {}
+        ctx.wizard.clear()
+        ctx.wizard.update(then)  # Esc keeps the name; the welcome still comes
+        ctx.feed(m_text.paint("/name changes your name any time.", "38;5;252"))
+        return
     if ctx.wizard.get("step") == "welcome":
         m_agents.mark_welcomed()  # Esc is «Skip for now»: the welcome does not come back
         ctx.wizard.clear()

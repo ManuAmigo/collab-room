@@ -64,5 +64,6 @@ def isolated(root) -> dict:
         "COLLAB_SAFE_DIR": str(root / "_safe"),
         "COLLAB_STATE_HOME": str(root / "_room_homes"),  # where rooms keep their files
         "COLLAB_TEMP_PREFIXES": "/nonexistent-temp-prefix/",  # the test's rooms count as real rooms
+        "COLLAB_GATHER_SECONDS": "0",  # agents' messages typed at once; a test of the window sets its own
         "COLLAB_CLIPBOARD": f"sh -c 'cat > {root / '_clipboard'}'",
     }

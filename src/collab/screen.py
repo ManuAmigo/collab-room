@@ -15,7 +15,7 @@ import collab.text as m_text
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 
-STATES = {"joining", "working", "idle", "needs_owner", "draft", "unknown", "lost", "limited"}
+STATES = {"joining", "working", "idle", "needs_owner", "draft", "unknown", "lost", "limited", "scrolled"}
 
 # How each known agent looks on screen (verified on Codex 0.163 and Claude Code 2.1).
 PRESETS: dict[str, dict[str, Any]] = {
@@ -220,6 +220,7 @@ class Shot:
     returncode: int
     stdout: str  # the screen (with colour codes when the rules take dim text for hints)
     guard: str  # «pid\tprogram\tgroup\troot» of the same window
+    scrolled: bool = False  # in copy mode (the wheel, Ctrl+b [): what is typed goes to its keys, not the agent
 
     @property
     def plain(self) -> str:
@@ -235,12 +236,24 @@ def look(p: dict[str, Any], pane: str) -> Shot:
     mark = secrets.token_hex(8)
     hints = ["-e"] if p.get("dim_is_hint") else []
     shown = m_tmuxio.tmux(
-        "capture-pane", "-p", *hints, "-t", pane, ";", "display-message", "-p", "-t", pane, f"{mark}\t{GUARD_FORMAT}", check=False
+        "capture-pane",
+        "-p",
+        *hints,
+        "-t",
+        pane,
+        ";",
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        f"{mark}\t#{{pane_in_mode}}\t{GUARD_FORMAT}",
+        check=False,
     )
     screen, found, guard = (shown.stdout or "").rpartition(mark + "\t")
     if shown.returncode != 0 or not found:
         return Shot(1, "", "")
-    return Shot(0, screen, guard)
+    in_mode, _, guard = guard.partition("\t")
+    return Shot(0, screen, guard, in_mode == "1")
 
 
 def pane_guard(p: dict[str, Any], pane: str, idle: bool = True, root: Path | None = None, shot: Shot | None = None) -> str:
@@ -561,6 +574,7 @@ BAR_WORDS = {
     "unknown": "Unknown",
     "lost": "Disconnected",
     "limited": "Out of limit",
+    "scrolled": "Scrolled — q to exit",
 }
 STATE_WORDS = {
     "joining": "is connecting",
@@ -571,6 +585,7 @@ STATE_WORDS = {
     "unknown": "status unknown",
     "lost": "disconnected",
     "limited": "is out of its usage limit",
+    "scrolled": "is scrolled back — press q in its window to resume message delivery",
 }
 
 

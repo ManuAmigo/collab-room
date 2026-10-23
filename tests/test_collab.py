@@ -1882,6 +1882,36 @@ class RoomTest(Base):
         with self.assertRaises(SystemExit):  # and the name, too, by the file now
             mod.launch_new_agent(stale, "claude", str(self.root), "Joined Meanwhile")
 
+    def test_collab_add_starts_an_agent_without_the_chat(self):
+        # An agent could be added only by /add in the chat: a room could not be set up by a script.
+        self.write_config([{"id": "owner", "label": "Андрей"}])
+        opened: list[str] = []
+        mod = self._launch_mod("collab_add_cli", opened)
+        self.enterContext(seam(mod, "installer.codex_room_rule", lambda pid, folder, label="": ""))
+        work = self.root / "work"
+        work.mkdir()
+        with mock.patch.object(sys, "argv", ["collab", "add", "codex", "--folder", str(work), "--name", "Коди"]):
+            mod.main()
+        with mock.patch.object(sys, "argv", ["collab", "add", "claude"]):
+            mod.main()
+        cfg = {p["id"]: p for p in json.loads(self.cfg.read_text())["participants"]}
+        codex = next(p for p in cfg.values() if p.get("label") == "Коди")
+        self.assertEqual((codex["kind"], codex["folder"], codex["started_by_room"]), ("codex", str(work.resolve()), True))
+        claude = next(p for p in cfg.values() if p.get("kind") == "claude")
+        self.assertEqual((claude["label"], claude["folder"]), ("Claude", str(self.root.resolve())))
+        told = [m["text"] for m in self.messages() if m["to"] == ["owner"]]
+        self.assertTrue(any("Коди (Codex) was added by collab add" in x for x in told), told)
+        with mock.patch.object(sys, "argv", ["collab", "add", "codex", "--name", "Коди"]), self.assertRaises(SystemExit):
+            mod.main()  # the same name twice: refused, as in /add
+        self.assertEqual(len(json.loads(self.cfg.read_text())["participants"]), 3)
+
+    def test_collab_add_needs_the_room_running(self):
+        self.write_config([{"id": "owner", "label": "Андрей"}], session=f"collab-test-none-{uuid.uuid4().hex[:6]}")
+        r = self.run_collab("add", "codex")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("the room is not running", r.stderr)
+        self.assertEqual(len(json.loads(self.cfg.read_text())["participants"]), 1)
+
     def test_a_claude_the_room_starts_is_not_asked_the_connection_check(self):
         # The check woke a Claude only to answer «connected»: its window's process tells its session itself,
         # and that is how the room continues it. A Codex is still asked — its conversation is found by the check.
@@ -6359,6 +6389,46 @@ class DeliveryTest(Base):
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         return record["id"]
 
+    def test_agents_messages_to_an_idle_agent_wait_for_each_other_and_a_persons_does_not(self):
+        # Each message an idle agent got from another agent was a wake of its own, and a wake re-reads its
+        # whole context: three agents answering each other woke one another for every message.
+        agent = self.root / "agent.sh"
+        self.write_config(
+            [
+                {"id": "owner"},
+                {"id": "agent", "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$"},
+                {"id": "other", "delivery": "pull"},
+                {"id": "third", "delivery": "pull"},
+            ],
+            session=self.session,
+        )
+        self.cfg.write_text(json.dumps({**json.loads(self.cfg.read_text()), "gather_seconds": 30}), encoding="utf-8")
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["agent"]
+        self.assertTrue(self.wait_for(pane, "READY"))
+        ago = lambda s: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=s)).isoformat(timespec="seconds")
+        self.note("other", ["agent"], "first from other", at=ago(20))
+        self.note("third", ["agent"], "then from third")
+        self.assertNotIn("→ agent", self.run_collab("deliver", "--once").stdout, "inside the window: nobody is woken")
+        self.assertNotIn("got:", self.screen(pane))
+        # The window has passed for the oldest: both go in one typing, one wake.
+        lines = (self.state / "messages.jsonl").read_text(encoding="utf-8").splitlines()
+        first = json.loads(lines[-2]) | {"at": ago(31)}
+        (self.state / "messages.jsonl").write_text(
+            "\n".join([*lines[:-2], json.dumps(first), lines[-1]]) + "\n", encoding="utf-8"
+        )
+        self.assertEqual(self.run_collab("deliver", "--once").stdout.count("→ agent"), 1)
+        self.assertTrue(self.until(lambda: "got:[room → agent] 2 new messages" in self.screen(pane)), self.screen(pane))
+        time.sleep(0.3)  # READY again
+        # The person's word never waits — nor does an agent's that came with it.
+        self.note("other", ["agent"], "an agent again")
+        self.owner_says("from the person")
+        self.assertEqual(self.run_collab("deliver", "--once").stdout.count("→ agent"), 1, "typed at once")
+        self.assertTrue(self.until(lambda: "from the person" in self.screen(pane)), self.screen(pane))
+        for wrong in (-1, "30", True, 2.5):
+            self.cfg.write_text(json.dumps({**json.loads(self.cfg.read_text()), "gather_seconds": wrong}), encoding="utf-8")
+            self.assertNotEqual(self.run_collab("inbox", "--for", "agent").returncode, 0, repr(wrong))
+
     def test_quiet_notes_wake_no_agent_and_go_with_its_next_message(self):
         # Routine notes («… waits», «the machine is free») were typed into
         # every idle agent, each a wake that re-reads its whole context. A note marked quiet (its record's
@@ -6933,9 +7003,12 @@ class DeliveryTest(Base):
         self.run_collab("deliver", "--once")
         delivered = self.state / "delivered" / "agent.json"
         self.assertNotIn(self.messages()[-1]["id"], delivered.read_text() if delivered.exists() else "")
+        # And the person is told why it waits, and the way out — it said «Ready» and nothing came.
+        self.assertIn("agent is scrolled back — press q in its window", self.run_collab("status").stdout)
         subprocess.run(["tmux", "send-keys", "-t", pane, "-X", "cancel"])
         self.run_collab("deliver", "--once")
         self.assertTrue(self.wait_for(pane, "got:[owner → agent] while scrolled"), self.screen(pane))
+        self.assertNotIn("scrolled back", self.run_collab("status").stdout)
 
     def test_delivers_into_idle_pane_and_not_twice(self):
         started = self.run_collab("start")
@@ -10374,6 +10447,22 @@ class DeliveryTest(Base):
         self.assertIn("@collab_title", opt("pane-border-format"), "the chat's window has our border")
         self.assertEqual(opt("pane-border-status"), "top")
 
+    def test_start_on_a_running_room_says_who_in_its_settings_is_not_running(self):
+        # An agent written into the settings of a running room: start returned to the room, started no
+        # one and said nothing.
+        owner = {"id": "owner", "label": "Андрей", "command": ["python3", str(COLLAB), "chat", "--as", "owner"]}
+        worker = {"id": "worker", "label": "Воркер", "command": ["sleep", "300"]}
+        self.write_config([owner, worker], session=self.session)
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        helper = {"id": "helper", "label": "Хелпер", "command": ["sleep", "300"]}
+        self.write_config([owner, worker, helper], session=self.session)
+        r = self.run_collab("start")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Хелпер is in the room's settings but not running", r.stdout)
+        self.assertNotIn("Воркер", r.stdout, "an agent the room runs is not named")
+        said = self.run_collab("inbox", "--for", "owner", "--all").stdout
+        self.assertIn("Хелпер is in the room's settings but not running", said, "the person's chat hears it too")
+
     def test_the_chats_feed_starts_only_with_all_it_reads(self):
         # The feed's thread started before `popup`, `wizard`… were set — a NameError on its
         # first tick ended it for good, the input still sending; without a terminal every time.
@@ -12903,6 +12992,31 @@ class DeliveryTest(Base):
         pane, keys = self._chat_room()
         time.sleep(0.5)
         self.assertNotIn("Welcome to your room", self.screen(pane), "a returning person is not welcomed again")
+
+    def test_a_name_taken_from_the_account_is_asked_at_the_first_chat(self):
+        # `init --no-ask` named the person after the computer's account («Andreynaumov») and nobody asked.
+        (self.root / "welcomed").unlink()
+        with mock.patch.dict(os.environ, {"USER": "tester"}):
+            self.assertEqual(self.run_collab("init", "--no-ask", "--force").returncode, 0)
+        owner = next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "owner")
+        self.assertEqual(owner["label"], "Tester")
+        owner["command"] = ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"]
+        self.cfg.write_text(json.dumps({"version": 2, "session": self.session, "participants": [owner]}), encoding="utf-8")
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_for(pane, "The room calls you Tester"), self.screen(pane))
+        subprocess.run(["tmux", "send-keys", "-t", pane, "-l", "Андрей"], check=True)
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+        label = lambda: next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "owner")["label"]
+        self.assertTrue(self.until(lambda: label() == "Андрей"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "Welcome to your room  ↑↓"), "the first visit's welcome comes after")
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Escape"], check=True)
+        subprocess.run(["tmux", "kill-session", "-t", f"={self.session}"], capture_output=True)
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(pane))
+        time.sleep(0.5)
+        self.assertNotIn("The room calls you", self.screen(pane), "asked once")
 
     def test_show_me_around_opens_the_task_menu(self):
         (self.root / "welcomed").unlink()

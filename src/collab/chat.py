@@ -441,6 +441,16 @@ def cmd_chat(args: argparse.Namespace) -> None:
         wizard.update(
             step="welcome", prompt="Welcome to your room", options=[("Show me around", "tour"), ("Skip for now", "skip")]
         )
+    if tty and args.as_ in m_store.people_ids(config) and m_store.name_asked(args.as_):
+        # Named after the computer's account («Andreynaumov»): asked before anything else, the welcome after.
+        mine = m_store.label_of(config, args.as_)
+        wizard.update(
+            step="own_name",
+            then=dict(wizard),
+            options=None,
+            prompt=f"The room calls you {mine} — your account's name. Your name (Enter keeps {mine}):",
+        )
+        feed("\n" + wizard["prompt"])
     ui.cfg_mtime = rp.config_path.stat().st_mtime if rp.config_path.exists() else 0.0
 
     def refresh_people() -> bool:

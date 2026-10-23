@@ -305,6 +305,22 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         )
         say_("Add an agent. " + ctx.wizard["prompt"])
         return
+    if ctx.wizard.get("step") == "own_name":
+        problem = line and (
+            m_text.name_problem(line)
+            or ("that is already someone else's name here" if m_store.label_taken(ctx.config, ctx.args.as_, line) else "")
+        )
+        if problem:
+            say_(f"! {problem}. Try another name, or Enter to keep yours.")
+            return
+        then = ctx.wizard.get("then") or {}
+        ctx.wizard.clear()
+        if line:
+            ctx.handle(f"/name {ctx.args.as_} {line}")
+        else:
+            say_(f"You stay {m_store.label_of(ctx.config, ctx.args.as_)}. /name changes it any time.")
+        ctx.wizard.update(then)  # the welcome, when this is the first visit — after the name is set
+        return
     if line == "" and ctx.wizard.get("step") != "folder":  # in «folder» an empty Enter asks again
         ctx.wizard.clear()
         say_("Canceled.")

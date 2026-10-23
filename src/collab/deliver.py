@@ -107,6 +107,28 @@ def confirm_joins(config: dict[str, Any], messages: list[dict[str, Any]]) -> Non
 TALK_LIMIT = 10
 
 
+def gather_seconds(config: dict[str, Any]) -> int:
+    """How long agents' messages to an idle agent wait for more before one typing takes them all. Each
+    typing wakes the agent, and a wake re-reads its whole context: three agents answering each other
+    woke one another for every message. A person's word never waits. The room's own is `gather_seconds`
+    in .collab.json (0 — at once)."""
+    return config.get("gather_seconds", int(os.environ.get("COLLAB_GATHER_SECONDS", "20")))
+
+
+def gathering(pending: list[dict[str, Any]], config: dict[str, Any]) -> bool:
+    """True while what would wake the agent is only agents' messages and the oldest of them is younger
+    than the room's window."""
+    window = gather_seconds(config)
+    waking = [m for m in pending if not is_quiet(m, config)]
+    if not window or not waking or any(m["from"] in (m_text.ROOM, *m_store.people_ids(config)) for m in waking):
+        return False
+    try:
+        oldest = min(dt.datetime.fromisoformat(m["at"]) for m in waking)
+        return (dt.datetime.now(dt.timezone.utc) - oldest).total_seconds() < window
+    except (KeyError, TypeError, ValueError):
+        return False  # a time it cannot read (a record written by hand) holds nothing back
+
+
 def talk_path() -> Path:
     return m_store.room().paths.state_dir / "talk.json"
 
@@ -446,6 +468,9 @@ def deliver_one(p: dict[str, Any], pane: str, config: dict[str, Any], messages: 
         tasks += m_screen.screen_subagents(pane, rules["subagent"], shot)
     if tasks and state == "idle":
         why_shown, watch = f"background {tasks}", "working"
+    if shot.scrolled and state != "lost":
+        # Nothing is typed into a scrolled window (deliver_to): the person is told why, and how out.
+        shown, why_shown = "scrolled", ""
     if p.get("joined") in ("pending", "invited") and state not in ("needs_owner", "lost", "draft"):
         # Until it answers the connection check it is «подключается», not «свободен»;
         # a question in its window or a lost window still show as they are.
@@ -699,6 +724,8 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any])
             pending = [m for m in pending if m_store.well_formed(m)]
             if not pending:
                 return ""
+        if gathering(pending, config):
+            return ""  # agents' messages wait a little for each other: one wake for them all
         rules = (
             m_screen.screen_rules(p) if p.get("started_by_room") else {**m_screen.PRESETS.get(m_screen.agent_kind(p), {}), **p}
         )

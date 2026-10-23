@@ -113,6 +113,8 @@ command points to a copy, not to your clone. Details, manual setup and the Codex
    **Connecting** until it is connected: a Claude when its window tells its session, a Codex when it
    answers a connection check (a Claude is asked too if it tells nothing within a minute).
 5. Repeat `/add` for **Codex**.
+   From a script or another terminal, while the room runs: `collab add codex --folder PATH --name NAME`
+   does the same (`collab add claude` likewise); the chat says who was added and where.
 6. The first run of an agent often stops at a sign-in, theme or "trust this folder" question. Its
    status turns red: **Needs your input**. Type `/answer`, choose the agent and answer in its
    terminal; **Ctrl+]** returns to the chat. If `/answer` is unavailable, `/open` copies a command

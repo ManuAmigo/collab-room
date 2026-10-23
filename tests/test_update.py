@@ -257,6 +257,9 @@ class UpdateTest(unittest.TestCase):
         self.start(project)
         self.assertTrue(self.until(lambda: self.told(project)), "the room is told")
         self.assertIn(f"collab updated from {OLD} to {NEW}.", self.told(project)[0])
+        said = self.told(project)[0]
+        self.assertIn("reopen the chat", said, "the person learns their chat keeps the old code")
+        self.assertIn("/restart each agent", said, "and that running agents do too")
         new_copy = os.path.realpath(self.bin / "collab")
         self.assertNotEqual(new_copy, old_copy)
         self.assertTrue(self.until(lambda: new_copy in self.deliverer()), self.deliverer())

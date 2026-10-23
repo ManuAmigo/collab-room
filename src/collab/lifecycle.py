@@ -29,6 +29,7 @@ def default_team() -> dict[str, Any]:
         {
             "id": "owner",
             "label": os.environ.get("USER", "Owner").capitalize(),
+            "name_from_account": True,  # nobody chose it: the chat asks at its first opening
             "command": ["python3", m_boot.SELF, "chat", "--as", "owner"],
             "delivery": "pull",
         }
@@ -231,6 +232,26 @@ def restore_owner_pane(session: str, config: dict[str, Any]) -> None:
     if out.returncode == 0:
         data.setdefault("panes", {})[owner["id"]] = out.stdout.strip()
         m_store.replace_state(rp.panes_path, json.dumps(data, indent=2) + "\n")
+
+
+def not_running(config: dict[str, Any]) -> None:
+    """A running room is only returned to: an agent written into its settings since (by hand) has no
+    window, and the start said nothing about it. Said in the terminal and to the room's people."""
+    data = m_store.read_panes() or {}
+    for p in config["participants"]:
+        if "target" in p or not p.get("pane", True) or m_store.is_chat_command(p.get("command")):
+            continue
+        if p["id"] in m_store.people_ids(config):
+            continue
+        pane = data.get("panes", {}).get(p["id"])
+        if pane and m_tmuxio.tmux("list-panes", "-t", pane, check=False).returncode == 0:
+            continue
+        line = m_text.visible(
+            f"{m_store.label_of(config, p['id'])} is in the room's settings but not running: the room was running "
+            "already, and start only returned to it — collab stop, then collab start starts it (history stays)."
+        )
+        print(line)
+        m_log.append_message(m_text.ROOM, m_store.people_ids(config), line)
 
 
 @m_store.room_locked
@@ -753,6 +774,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             start_deliverer(session)
         room_options(session)
         restore_owner_pane(session, config)
+        not_running(config)
         # The person lands on the chat: restarting the deliverer made its window the current one,
         # and every terminal of the room showed an empty screen.
         m_tmuxio.tmux("select-window", "-t", f"={session}:=room", check=False)

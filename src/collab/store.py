@@ -180,6 +180,9 @@ def load_config() -> dict[str, Any]:
     limit = data.get("talk_limit", 0)
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
         bad("talk_limit must be a whole number, 0 or more (0: the room never pauses for agents' talk)")
+    gather = data.get("gather_seconds", 0)
+    if not isinstance(gather, int) or isinstance(gather, bool) or gather < 0:
+        bad("gather_seconds must be a whole number, 0 or more (0: agents' messages are typed at once)")
     participants = data.get("participants")
     if not isinstance(participants, list) or not participants:
         bad("config must contain a non-empty participants list")
@@ -561,6 +564,9 @@ def current_chat_command(cmd: list[str]) -> list[str]:
 
 def write_room(sample: dict[str, Any], ask: bool) -> None:
     rp = room().paths
+    if ask:
+        for p in sample["participants"]:
+            p.pop("name_from_account", None)  # shown with the question and kept or changed: chosen
     if ask and len(sample["participants"]) == 1:
         p = sample["participants"][0]
         try:
@@ -605,12 +611,25 @@ def record_room_root() -> None:
 
 
 @room_locked
+def name_asked(pid: str) -> bool:
+    """True once for a person whose name came from the computer's account, never chosen: the chat asks
+    it then. The mark goes at once — asked one time, kept or not."""
+    data = read_config_raw()
+    p = next((q for q in data["participants"] if q["id"] == pid), None)
+    if p is None or not p.pop("name_from_account", None):
+        return False
+    write_config(data)
+    return True
+
+
+@room_locked
 def rename(pid: str, label: str) -> None:
     """Change a participant's name in .collab.json, keeping everything else as it is."""
     data = read_config_raw()
     for p in data["participants"]:
         if p["id"] == pid:
             p["label"] = label
+            p.pop("name_from_account", None)
     write_config(data)
 
 

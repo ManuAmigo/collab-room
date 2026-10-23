@@ -14,6 +14,7 @@ import collab.text as m_text
 import collab.store as m_store
 import collab.log as m_log
 import collab.tasks as m_tasks
+import collab.tmuxio as m_tmuxio
 import collab.screen as m_screen
 import collab.installer as m_installer
 import collab.ledger as m_ledger
@@ -59,6 +60,37 @@ def cmd_remove(args: argparse.Namespace) -> None:
     except ValueError as exc:
         m_store.fail(str(exc))
     print(f"{label} disconnected from the room.")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    """`collab add`: what /add in the chat does, from a command line — a room set up to the end by a
+    script or another agent. The room must be running: the agent gets a window of its session."""
+    config = m_store.load_config()
+    session = config.get("session", "collab-room")
+    if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
+        m_store.fail("the room is not running — collab start first, then collab add")
+    try:
+        folder = Path(args.folder or str(m_store.room().paths.root)).expanduser()
+    except RuntimeError:  # «~someone» with no such user
+        m_store.fail(f"Folder not found: {args.folder}")
+    problem = m_agents.folder_problem(folder)
+    if problem:
+        m_store.fail(problem)
+    base = m_screen.PRESETS[args.kind]["label"]
+    label = args.name or next(
+        n for n in [base] + [f"{base} {i}" for i in range(2, 100)] if not m_store.label_taken(config, "", n)
+    )
+    problem = m_text.name_problem(label) or (
+        "that is already someone else's name here" if m_store.label_taken(config, "", label) else ""
+    )
+    if problem:
+        m_store.fail(problem)
+    pid = m_agents.launch_new_agent(config, args.kind, str(folder.resolve()), label)
+    # Not typed in a chat: the people learn who came in, and where it works.
+    line = m_text.visible(f"{label} ({base}) was added by collab add, in {m_text.tilde(str(folder.resolve()))}.")
+    m_log.append_message(m_text.ROOM, m_store.people_ids(m_store.load_config()), line)
+    how = "its window tells its session" if args.kind == "claude" else "it answers the connection check"
+    print(f"Starting {label} in room window {pid}. It joins when {how} (collab status).")
 
 
 def cmd_name(args: argparse.Namespace) -> None:
@@ -521,6 +553,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("unlimit", help="clear an agent's usage limit by hand: its messages are delivered again")
     s.add_argument("id")
     s.set_defaults(func=cmd_unlimit)
+
+    s = sub.add_parser("add", help="start an agent in the running room — what /add does in the chat")
+    s.add_argument("kind", choices=sorted(m_screen.PRESETS))
+    s.add_argument("--folder", help="the project folder it works in (default: the room's)")
+    s.add_argument("--name", help="its name in the room (default: Claude, Codex… — the next one free)")
+    s.set_defaults(func=cmd_add)
 
     s = sub.add_parser("name", help="give a participant a name shown in the room")
     s.add_argument("id")

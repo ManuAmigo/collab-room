@@ -812,6 +812,8 @@ def install_command_step(args: argparse.Namespace, bin_dir: Path, link: Path, re
 # copy updates itself: a --dev install runs the clone's own file, and its clone is the developer's.
 UPDATE_FETCH_WAIT = 20  # seconds; `collab start` never waits for it — the check runs beside the room
 UPDATE_ROOM_WAIT = 60  # seconds for the room this start opens to be up before its deliverer is restarted
+# What an update beside a start leaves to the person: only the deliverer moves to the new copy.
+UPDATED_IN_ROOM = " The room's delivery moves to it; your chat and running agents keep the old code until you reopen the chat (/exit, then collab) and /restart each agent."
 
 
 def release_of(tag: str) -> tuple[int, ...] | None:
@@ -1035,6 +1037,8 @@ def auto_update(starter: int) -> None:
     if not tell:
         return
     config = m_store.config_now()
+    if outcome == "updated":
+        line += UPDATED_IN_ROOM
     m_log.append_message(m_text.ROOM, m_store.people_ids(config), line)
     link = m_boot.read_private(inst.installed_file)
     session = config.get("session", "collab-room")
