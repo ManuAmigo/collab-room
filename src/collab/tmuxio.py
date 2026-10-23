@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 
 
@@ -106,20 +107,23 @@ def tmux(*argv: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         # No tmux at all: pause, resume and stop died with a traceback. Asked in
         # passing, it is «no room running»; needed, it is one line saying what to install.
         if check:
-            m_store.fail(f"tmux is required: {tmux_install_hint()}, and run `collab start` again")
+            m_store.fail(m_i18n.tr("tmux is required: {p0}, and run `collab start` again", p0=tmux_install_hint()))
         return subprocess.CompletedProcess([TMUX, *argv], 127, "", "tmux is not installed")
     except subprocess.TimeoutExpired:
         if check:
             m_store.fail(
-                f"tmux did not answer in {TMUX_TIMEOUT} s to `{argv[0]}`: check that it runs (`tmux ls`), "
-                "then run the command again"
+                m_i18n.tr(
+                    "tmux did not answer in {TMUX_TIMEOUT} s to `{p1}`: check that it runs (`tmux ls`), then run the command again",
+                    TMUX_TIMEOUT=TMUX_TIMEOUT,
+                    p1=argv[0],
+                )
             )
         return subprocess.CompletedProcess([TMUX, *argv], 124, "", f"tmux did not answer in {TMUX_TIMEOUT} s")
     # Needed and refused (no room for a window, a server gone): tmux's own reason, not a
     # CalledProcessError traceback of the whole command line.
     if check and r.returncode:
         reason = m_text.visible(r.stderr.strip()) or f"exit code {r.returncode}"
-        m_store.fail(f"tmux {argv[0]} failed: {reason}")
+        m_store.fail(m_i18n.tr("tmux {p0} failed: {reason}", p0=argv[0], reason=reason))
     return r
 
 
@@ -195,7 +199,7 @@ def tmux_text(text: str, clock: bool = False) -> str:
 def attach(session: str) -> None:
     """Put the person into the room: switch inside tmux, attach from a plain terminal."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()) or args_no_attach():
-        print(f"Attach: tmux attach -t {session}")
+        print(m_i18n.tr("Attach: tmux attach -t {session}", session=session))
         return
     if os.environ.get("TMUX"):
         os.execvp(TMUX, [TMUX, "switch-client", "-t", f"={session}"])

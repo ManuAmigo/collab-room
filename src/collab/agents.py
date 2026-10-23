@@ -103,7 +103,7 @@ def launch_new_agent(
     fresh = m_store.load_config()
     session = fresh.get("session", "collab-room")
     if m_store.label_taken(fresh, "", label):
-        raise SystemExit("that is already someone else's name here")
+        raise SystemExit(m_i18n.tr("that is already someone else's name here"))
     pid = m_text.slug(label, m_store.ids_of(fresh), kind)
     model = str(m_store.effective(kind, {"id": pid, **({"seat": seat} if seat else {}), **own}, fresh, "use_model") or "")
     cli = (
@@ -246,7 +246,7 @@ def remove_participant(pid: str) -> str:
             if pid in state:
                 state.pop(pid)
                 m_store.write_json(path, state)
-    m_log.append_message(m_text.ROOM, ["all"], f"{label} disconnected from the room.")
+    m_log.room_line(["all"], "{label} disconnected from the room.", label=label)
     return label
 
 
@@ -270,7 +270,7 @@ def clear_limit(pid: str) -> tuple[str, bool]:
     rec["over"] = time.time()
     limits[pid] = rec
     m_store.write_json(rp.limits_path, limits)
-    m_log.append_message(m_text.ROOM, m_store.people_ids(config), f"{label}'s usage limit was cleared by hand.")
+    m_log.room_line(m_store.people_ids(config), "{label}'s usage limit was cleared by hand.", label=label)
     return label, True
 
 
@@ -578,7 +578,9 @@ def cmd_open(args: argparse.Namespace) -> None:
         found = rooms_with_agent(args.id) + ([rp.root.resolve()] if room_agent_pane(rp.root, args.id) else [])
         rooms = list(dict.fromkeys(found))
     if not rooms:
-        m_store.fail(f"{args.id}: no window of this agent in a running room (an agent outside tmux cannot be opened)")
+        m_store.fail(
+            m_i18n.tr("{id}: no window of this agent in a running room (an agent outside tmux cannot be opened)", id=args.id)
+        )
     if len(rooms) > 1:
         m_store.fail(
             f"{args.id} is in several rooms; choose one:\n"
@@ -593,13 +595,13 @@ def cmd_open(args: argparse.Namespace) -> None:
     )
     if not pane or len(found) != 3:
         # Closed between finding it and now: said, not a traceback.
-        m_store.fail(f"{args.id}: its window is gone — nothing to open")
+        m_store.fail(m_i18n.tr("{id}: its window is gone — nothing to open", id=args.id))
     session, window, pane_id = found
     entry = next((q for q in m_store.read_json(m_boot.room_config(root)).get("participants", []) if q.get("id") == args.id), {})
     label = entry.get("label") or args.id
     view = f"collab-open-{args.id}-{uuid.uuid4().hex[:6]}"
     if not (sys.stdin.isatty() and sys.stdout.isatty()) or m_tmuxio.args_no_attach():
-        m_store.fail(f"run it in a terminal tab: collab open {args.id}")
+        m_store.fail(m_i18n.tr("run it in a terminal tab: collab open {id}", id=args.id))
     # One tmux command, in this order: the view is made, the tab attaches to it, and only then it is
     # told to end with its last client — a view not yet attached was ended at once.
     chain = make_view(view, window, session)
@@ -677,15 +679,15 @@ def browse_folder(start: Path) -> str | None:
         elif choice.startswith("in:"):
             cur = cur / choice[3:]
         elif choice.startswith("denied:"):
-            print(f"Cannot open this folder: {m_text.tilde(str(cur / choice[7:]))}. Choose another folder.")
+            print(m_i18n.tr("Cannot open this folder: {p0}. Choose another folder.", p0=m_text.tilde(str(cur / choice[7:]))))
         elif choice == "type":
             try:
-                typed = m_term.ask_line("Project folder: ").strip()
+                typed = m_term.ask_line(m_i18n.tr("Project folder: ")).strip()
             except EOFError:
                 return None
             if Path(typed).expanduser().is_dir():
                 return typed
-            print(f"Folder not found: {typed}")
+            print(m_i18n.tr("Folder not found: {typed}", typed=typed))
 
 
 def linked_worktree(folder: str) -> bool:
@@ -723,7 +725,7 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
         check=False,
     )
     if out.returncode != 0:
-        m_store.fail(f"{p['id']}: could not start it again: {out.stderr.strip()}")
+        m_store.fail(m_i18n.tr("{p0}: could not start it again: {p1}", p0=p["id"], p1=out.stderr.strip()))
     pane, _, pane_pid = out.stdout.strip().partition(" ")
     code = uuid.uuid4().hex[:4]
     data = m_store.read_config_raw()
@@ -749,17 +751,21 @@ def scenario_unavailable(scenario: dict[str, Any]) -> list[str]:
     ]
 
 
-def start_scenario(name: str, folder: str) -> tuple[list[str], list[str]]:
+def start_scenario(name: str, folder: str, seats: list[dict[str, Any]] | None = None) -> tuple[list[str], list[str]]:
     """A ready team: the scenario is copied into the room's file, then each seat's agent is started the way /add
-    starts one, with only its seat recorded — its settings go by the seat. (started ids, «name: why» of those
-    that did not start). One that failed does not stop the rest."""
+    starts one, with only its seat recorded — its settings go by the seat. `seats`: the team as the person changed it
+    before the launch; checked like the scenario's own. (started ids, «name: why» of those that did not start). One
+    that failed does not stop the rest."""
     scenario = m_store.SCENARIOS[name]
-    seats = json.loads(json.dumps(scenario["seats"]))
-    team = {"scenario": name, "seats": seats, "output": scenario["output"], "without_person": []}
+    team_seats: list[dict[str, Any]] = json.loads(json.dumps(seats if seats is not None else scenario["seats"]))
+    problems = m_store.scenario_problems({**scenario, "seats": team_seats}, list(m_screen.PRESETS))
+    if problems:
+        raise ValueError("; ".join(problems))
+    team = {"scenario": name, "seats": team_seats, "output": scenario["output"], "without_person": []}
     m_store.set_team(team)
     started: list[str] = []
     failed: list[str] = []
-    for seat in seats:
+    for seat in team_seats:
         config = m_store.load_config()
         label = next(
             n for n in [seat["label"]] + [f"{seat['label']} {i}" for i in range(2, 100)] if not m_store.label_taken(config, "", n)
@@ -834,14 +840,14 @@ def restart_agent(session: str, p: dict[str, Any], fresh: bool = False, sid: str
     remembers the new process of the window and checks the connection anew."""
     kind = m_screen.agent_kind(p)
     if not p.get("started_by_room") or kind not in ("claude", "codex"):
-        m_store.fail(f"{p['id']}: only an agent the room started can be restarted")
+        m_store.fail(m_i18n.tr("{p0}: only an agent the room started can be restarted", p0=p["id"]))
     # Only this agent's own conversation, by its exact id — never «the latest in the folder»: five
     # Claudes work in one folder. Not found, it is said; a new one only when asked for.
     # Looked for before the room's lock: up to 50 Codex logs of 20 MB were read holding it, and
     # delivery to every agent, say and ack all waited.
     sid = "" if fresh else (sid or m_screen.agent_session(p))
     if not sid and not fresh:
-        m_store.fail(f"{p['id']}: its conversation was not found")
+        m_store.fail(m_i18n.tr("{p0}: its conversation was not found", p0=p["id"]))
     return restart_in_window(session, p, kind, sid)
 
 
@@ -887,7 +893,7 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str) -> s
         )
         pane = out.stdout.strip()
     if out.returncode != 0:
-        m_store.fail(f"{p['id']}: could not restart it: {out.stderr.strip()}")
+        m_store.fail(m_i18n.tr("{p0}: could not restart it: {p1}", p0=p["id"], p1=out.stderr.strip()))
     pane_pid = m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_pid}", check=False).stdout.strip()
     code = uuid.uuid4().hex[:4]
     data = m_store.read_config_raw()

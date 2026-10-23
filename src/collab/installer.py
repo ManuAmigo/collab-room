@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.term as m_term
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
@@ -646,9 +647,9 @@ def install_python311() -> tuple[str, str] | None:
     if not ways:
         return None
     if not sys.stdin.isatty():
-        print("  To install Python 3.11+, run:")
+        print(m_i18n.tr("  To install Python 3.11+, run:"))
         print("    " + " && ".join(shlex.join(step) for step in ways[-1][1]))
-        print("  then: collab install")
+        print(m_i18n.tr("  then: collab install"))
         return None
     try:
         choice = m_term.pick(
@@ -665,7 +666,7 @@ def install_python311() -> tuple[str, str] | None:
         return None
     for step in choice:
         if subprocess.run(step).returncode != 0:
-            print(f"  ✗ {shlex.join(step)} did not finish — nothing else was run")
+            print(m_i18n.tr("  ✗ {p0} did not finish — nothing else was run", p0=shlex.join(step)))
             return None
     return find_python311()
 
@@ -684,13 +685,16 @@ def install_python_step(dry_run: bool) -> bool:
     found = find_python311(passed_over, refused)
     for real in passed_over:  # said, not silent: why the one there is not used
         print(
-            f"  · Python {m_text.tilde(real)}: passed over — it lies in the folder you are in or an agent's, where an agent may write"
+            m_i18n.tr(
+                "  · Python {p0}: passed over — it lies in the folder you are in or an agent's, where an agent may write",
+                p0=m_text.tilde(real),
+            )
         )
     for real, why in [] if found else refused:
-        print(f"  · Python {m_text.tilde(real)}: found, refused — {why}")
+        print(m_i18n.tr("  · Python {p0}: found, refused — {why}", p0=m_text.tilde(real), why=why))
     found = found or (None if dry_run else install_python311())
     if found and dry_run:
-        print(f"  · Python {found[1]}: {found[0]} → {inst.python_file}")
+        print(m_i18n.tr("  · Python {p0}: {p1} → {python_file}", p0=found[1], p1=found[0], python_file=inst.python_file))
     elif found:
         inst.python_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         # A new file of a name nobody can guess, never through a link, then renamed.
@@ -700,18 +704,28 @@ def install_python_step(dry_run: bool) -> bool:
             f.write(found[0] + "\n")
         os.replace(tmp, inst.python_file)
         if m_boot.recorded_python(as_written=True) == found[0]:
-            print(f"  ✓ Python {found[1]}: {'kept' if found[0] == before else 'recorded'} ({found[0]})")
+            print(
+                m_i18n.tr(
+                    "  ✓ Python {p0}: {p1} ({p2})", p0=found[1], p1="kept" if found[0] == before else "recorded", p2=found[0]
+                )
+            )
         else:
             print(
-                f"  ✗ Python {found[1]}: recorded, but {inst.python_file.parent} may be changed by others — fix its permissions (chmod 700)"
+                m_i18n.tr(
+                    "  ✗ Python {p0}: recorded, but {parent} may be changed by others — fix its permissions (chmod 700)",
+                    p0=found[1],
+                    parent=inst.python_file.parent,
+                )
             )
             ok = False
     else:
         brew = m_tmuxio.working_brew()
         mac = f"{brew} install python@3.12" if brew else "the installer from https://www.python.org/downloads/macos/"
         print(
-            f"  ✗ Python 3.11 or newer, installed outside your home folder — not found. Install one (macOS: {mac};\n"
-            "    Linux: your system's python3.11 package), then run collab install again."
+            m_i18n.tr(
+                "  ✗ Python 3.11 or newer, installed outside your home folder — not found. Install one (macOS: {mac};\n    Linux: your system's python3.11 package), then run collab install again.",
+                mac=mac,
+            )
         )
         ok = False
     # An older Python has no tomllib — Codex's writable_roots went unread
@@ -723,7 +737,7 @@ def install_python_step(dry_run: bool) -> bool:
         found[1] if found else "",
     )
     if sys.version_info < (3, 11) and not dry_run and handover[0] and os.environ.get("COLLAB_REEXEC") != handover[0]:
-        print(f"  → the rest runs on Python {handover[1]}", flush=True)
+        print(m_i18n.tr("  → the rest runs on Python {p0}", p0=handover[1]), flush=True)
         os.environ["COLLAB_REEXEC"] = handover[0]
         sys.stderr.flush()
         os.execv(handover[0], [handover[0], "-I", "-S", os.path.realpath(m_boot.SELF), *sys.argv[1:]])
@@ -761,12 +775,18 @@ def install_command_step(args: argparse.Namespace, bin_dir: Path, link: Path, re
     try:
         if args.dry_run:
             print(
-                f"  · collab command: {link} → {m_boot.SELF if args.dev else inst.safe_copies / 'command' / copy_name()[7:] / 'collab'} — {what}"
+                m_i18n.tr(
+                    "  · collab command: {link} → {p1} — {what}",
+                    link=link,
+                    p1=m_boot.SELF if args.dev else inst.safe_copies / "command" / copy_name()[7:] / "collab",
+                    what=what,
+                )
             )
         elif old_python:
             print(
-                "  ✗ collab command: needs Python 3.11 or newer to check where Codex may write — install one, "
-                "then run collab install again"
+                m_i18n.tr(
+                    "  ✗ collab command: needs Python 3.11 or newer to check where Codex may write — install one, then run collab install again"
+                )
             )
             ok = False
         else:
@@ -786,23 +806,32 @@ def install_command_step(args: argparse.Namespace, bin_dir: Path, link: Path, re
             os.replace(fresh, link)
             m_store.write_private(inst.installed_file, str(link))
             m_store.write_private(inst.source_file, str(repo))
-            print(f"  ✓ collab command: {link} — {what}")
+            print(m_i18n.tr("  ✓ collab command: {link} — {what}", link=link, what=what))
     except FileExistsError:
-        print(f"  ✗ {link} already exists and is not ours — left untouched (use another --bin-dir)")
+        print(m_i18n.tr("  ✗ {link} already exists and is not ours — left untouched (use another --bin-dir)", link=link))
         ok = False
     except LinkedCopies as error:
-        print(f"  ✗ collab command: {error.strerror}")
+        print(m_i18n.tr("  ✗ collab command: {strerror}", strerror=error.strerror))
         ok = False
         # The refusal kept quiet about the command already there — it still
         # ran the earlier copy, now within a Codex's reach. Ours and leading into the copies: taken away.
         if our_command_link(link) and inst.safe_copies.resolve() in Path(os.path.realpath(link)).parents:
             link.unlink()
             print(
-                f"  ! {m_text.tilde(str(link))} removed: it ran a copy a Codex may change — fix the above and run install again"
+                m_i18n.tr(
+                    "  ! {p0} removed: it ran a copy a Codex may change — fix the above and run install again",
+                    p0=m_text.tilde(str(link)),
+                )
             )
     except OSError as error:
         # A folder without write access (--bin-dir /usr/local/bin) ended in a traceback.
-        print(f"  ✗ collab command: cannot write to {bin_dir} ({error.strerror}) — pass a folder you can write to with --bin-dir")
+        print(
+            m_i18n.tr(
+                "  ✗ collab command: cannot write to {bin_dir} ({strerror}) — pass a folder you can write to with --bin-dir",
+                bin_dir=bin_dir,
+                strerror=error.strerror,
+            )
+        )
         ok = False
     return ok
 
@@ -1055,11 +1084,13 @@ def cmd_update(args: argparse.Namespace) -> None:
     inst = m_boot.paths()
     if args.off:
         m_store.write_private(inst.update_off, m_store.now())
-        print("The update at collab start is off. `collab update` still updates when you run it; --on turns it back on.")
+        print(
+            m_i18n.tr("The update at collab start is off. `collab update` still updates when you run it; --on turns it back on.")
+        )
         return
     if args.on:
         inst.update_off.unlink(missing_ok=True)
-        print("The update at collab start is on: each start looks for a newer collab and installs it.")
+        print(m_i18n.tr("The update at collab start is on: each start looks for a newer collab and installs it."))
         return
     if args.auto:
         auto_update(args.after)
@@ -1070,7 +1101,11 @@ def cmd_update(args: argparse.Namespace) -> None:
     outcome, line = run_update(source)
     print(line)
     if outcome == "updated":
-        print("Running rooms keep the old code: `collab start` in a room moves its delivery; /restart an agent, reopen a chat.")
+        print(
+            m_i18n.tr(
+                "Running rooms keep the old code: `collab start` in a room moves its delivery; /restart an agent, reopen a chat."
+            )
+        )
     elif outcome in ("blocked", "offline"):
         raise SystemExit(1)
 
@@ -1086,13 +1121,14 @@ def cmd_install(args: argparse.Namespace) -> None:
         # Withdrawing consent needs nothing else installed (it had no way back).
         if args.dry_run:
             # A dry run reported the withdrawal as done while consent stayed on disk.
-            print("· Codex room replies: would withdraw consent and remove the rules (dry run — nothing changed)")
+            print(m_i18n.tr("· Codex room replies: would withdraw consent and remove the rules (dry run — nothing changed)"))
             return
         inst.codex_consent.unlink(missing_ok=True)
         prune_agent_rules(keep_consent=False)
         print(
-            "✓ Codex room replies: off — consent withdrawn, rules removed. A Codex already running\n"
-            "  keeps its permission until it restarts."
+            m_i18n.tr(
+                "✓ Codex room replies: off — consent withdrawn, rules removed. A Codex already running\n  keeps its permission until it restarts."
+            )
         )
         return
     repo = Path(m_boot.SELF).parent
@@ -1102,12 +1138,17 @@ def cmd_install(args: argparse.Namespace) -> None:
         source = m_boot.read_private(inst.source_file)
         is_clone = bool(source) and (Path(source) / "collab").is_file() and (Path(source) / ".git").exists()
         where = shlex.quote(str(Path(source) / "collab")) if is_clone else "<your clone of collab-room>/collab"
-        m_store.fail(f"this is the installed copy of collab — update from your clone: git pull, then python3 {where} install")
+        m_store.fail(
+            m_i18n.tr(
+                "this is the installed copy of collab — update from your clone: git pull, then python3 {where} install",
+                where=where,
+            )
+        )
     ok = True
 
     def step(name: str, cmd: list[str], show_output: bool = False) -> bool:
         if args.dry_run:
-            print(f"  · {name}: {' '.join(shlex.quote(c) for c in cmd)}")
+            print(m_i18n.tr("  · {name}: {p1}", name=name, p1=" ".join(shlex.quote(c) for c in cmd)))
             return True
         r = subprocess.run(cmd, text=True, capture_output=True)
         print(
@@ -1118,14 +1159,14 @@ def cmd_install(args: argparse.Namespace) -> None:
             print("\n".join("    " + line for line in r.stdout.strip().splitlines()))
         return r.returncode == 0
 
-    print("collab-room: install")
+    print("collab-room: install")  # the product's name: a heading in any language
     # The key the person's chat signs its messages with (made at install).
     if args.dry_run:
-        print(f"  · Message signing key: {inst.owner_key}")
+        print(m_i18n.tr("  · Message signing key: {owner_key}", owner_key=inst.owner_key))
     else:
         had = bool(m_log.owner_key())
         m_log.owner_key(create=True)
-        print(f"  ✓ Message signing key: {'kept' if had else 'created'} ({inst.owner_key})")
+        print(m_i18n.tr("  ✓ Message signing key: {p0} ({owner_key})", p0="kept" if had else "created", owner_key=inst.owner_key))
     ok = install_python_step(args.dry_run) and ok
     found = shutil.which("tmux")
     print(f"  {'✓' if found else '✗'} tmux" + ("" if found else f" — {m_tmuxio.tmux_install_hint()}"))
@@ -1142,7 +1183,7 @@ def cmd_install(args: argparse.Namespace) -> None:
     link = bin_dir / "collab"
     if bin_dir.exists() and not bin_dir.is_dir():
         # A file given as --bin-dir ended the install with a traceback.
-        m_store.fail(f"{bin_dir} is a file, not a folder — pass a folder with --bin-dir")
+        m_store.fail(m_i18n.tr("{bin_dir} is a file, not a folder — pass a folder with --bin-dir", bin_dir=bin_dir))
 
     ok = install_command_step(args, bin_dir, link, repo) and ok
     start_cmd = "collab start" if bin_dir in on_path else f"{shlex.quote(str(link))} start"
@@ -1154,14 +1195,18 @@ def cmd_install(args: argparse.Namespace) -> None:
         profile = {"zsh": "~/.zprofile", "bash": "~/.bash_profile"}.get(shell, "your shell's profile")
         shown = "$HOME/" + str(bin_dir.relative_to(Path.home())) if Path.home() in bin_dir.parents else str(bin_dir)
         print(
-            f"  ! {m_text.tilde(str(bin_dir))} is not on PATH: use the full path for now; to type just `collab`, "
-            f'add this line to {profile} and open a new terminal: export PATH="{shown}:$PATH"'
+            m_i18n.tr(
+                '  ! {p0} is not on PATH: use the full path for now; to type just `collab`, add this line to {profile} and open a new terminal: export PATH="{shown}:$PATH"',
+                p0=m_text.tilde(str(bin_dir)),
+                profile=profile,
+                shown=shown,
+            )
         )
     if shutil.which("claude"):
         ok = step("Claude Code plugin source", ["claude", "plugin", "marketplace", "add", str(repo)]) and ok
         ok = step("Claude Code plugin", ["claude", "plugin", "install", "collab-room@collab-room"]) and ok
     else:
-        print("  – Claude Code not found — plugin skipped")
+        print(m_i18n.tr("  – Claude Code not found — plugin skipped"))
     if shutil.which("codex"):
         # The interpreter install runs on, not whichever python3 PATH names.
         ok = step("Codex skill", [sys.executable, str(repo / "scripts" / "install-codex-skill.py")]) and ok
@@ -1175,24 +1220,34 @@ def cmd_install(args: argparse.Namespace) -> None:
         allow = args.codex_room_commands or inst.codex_consent.exists()
         if not allow and not args.dry_run and sys.stdin.isatty():
             print(
-                "  Codex agents a room starts can answer in that room without asking each time: only\n"
-                "  collab say / ack / inbox, for that room and that agent's own name, through a read-only\n"
-                "  copy of collab that Codex cannot change. Your project's permissions stay as they are."
+                m_i18n.tr(
+                    "  Codex agents a room starts can answer in that room without asking each time: only\n  collab say / ack / inbox, for that room and that agent's own name, through a read-only\n  copy of collab that Codex cannot change. Your project's permissions stay as they are."
+                )
             )
             try:
-                allow = m_term.confirm("Let room-started Codex agents answer in their room?")
+                allow = m_term.confirm(m_i18n.tr("Let room-started Codex agents answer in their room?"))
             except (EOFError, KeyboardInterrupt):
                 print()
         if args.dry_run:
-            print(f"  · Codex room replies: {'on' if allow else 'asked'} ({inst.codex_consent})")
+            print(
+                m_i18n.tr(
+                    "  · Codex room replies: {p0} ({codex_consent})",
+                    p0="on" if allow else "asked",
+                    codex_consent=inst.codex_consent,
+                )
+            )
         elif allow:
             inst.codex_consent.parent.mkdir(parents=True, exist_ok=True)
             m_store.replace_file(inst.codex_consent, (m_store.now() + "\n").encode("utf-8"), 0o600)
-            print("  ✓ Codex room replies: on for Codex agents a room starts from now on")
+            print(m_i18n.tr("  ✓ Codex room replies: on for Codex agents a room starts from now on"))
         else:
-            print("  – Codex room replies: off — Codex asks before answering (to enable: collab install --codex-room-commands)")
+            print(
+                m_i18n.tr(
+                    "  – Codex room replies: off — Codex asks before answering (to enable: collab install --codex-room-commands)"
+                )
+            )
     else:
-        print("  – Codex not found — skill skipped")
+        print(m_i18n.tr("  – Codex not found — skill skipped"))
     print(f"Done. Next, in your project folder: {start_cmd}" if ok else "Some steps did not complete — see ✗ above.")
     if not ok:
         raise SystemExit(1)

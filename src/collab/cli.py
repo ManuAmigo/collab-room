@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.log as m_log
 import collab.tasks as m_tasks
@@ -39,9 +41,9 @@ def cmd_mute(args: argparse.Namespace) -> None:
     except ValueError as exc:
         m_store.fail(str(exc))
     if args.func_name == "unmute" and not was:
-        print(f"{label} was not muted.")  # «unmuted» was said for one never muted
+        print(m_i18n.tr("{label} was not muted.", label=label))  # «unmuted» was said for one never muted
         return
-    print(f"{label} {'muted' if args.func_name == 'mute' else 'unmuted'}.")
+    print(m_i18n.tr("{label} {p1}.", label=label, p1="muted" if args.func_name == "mute" else "unmuted"))
 
 
 def cmd_unlimit(args: argparse.Namespace) -> None:
@@ -59,7 +61,7 @@ def cmd_remove(args: argparse.Namespace) -> None:
         label = m_agents.remove_participant(args.id)
     except ValueError as exc:
         m_store.fail(str(exc))
-    print(f"{label} disconnected from the room.")
+    print(m_i18n.tr("{label} disconnected from the room.", label=label))
 
 
 def cmd_add(args: argparse.Namespace) -> None:
@@ -68,11 +70,11 @@ def cmd_add(args: argparse.Namespace) -> None:
     config = m_store.load_config()
     session = config.get("session", "collab-room")
     if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
-        m_store.fail("the room is not running — collab start first, then collab add")
+        m_store.fail(m_i18n.tr("the room is not running — collab start first, then collab add"))
     try:
         folder = Path(args.folder or str(m_store.room().paths.root)).expanduser()
     except RuntimeError:  # «~someone» with no such user
-        m_store.fail(f"Folder not found: {args.folder}")
+        m_store.fail(m_i18n.tr("Folder not found: {folder}", folder=args.folder))
     problem = m_agents.folder_problem(folder)
     if problem:
         m_store.fail(problem)
@@ -94,11 +96,16 @@ def cmd_add(args: argparse.Namespace) -> None:
         return
     pid = m_agents.launch_new_agent(config, args.kind, str(folder.resolve()), label, own)
     # Not typed in a chat: the people learn who came in, and where it works.
-    line = m_text.visible(f"{label} ({base}) was added by collab add, in {m_text.tilde(str(folder.resolve()))}.")
-    m_log.append_message(m_text.ROOM, m_store.people_ids(m_store.load_config()), line)
+    m_log.room_line(
+        m_store.people_ids(m_store.load_config()),
+        "{label} ({base}) was added by collab add, in {folder}.",
+        label=m_text.visible(label),
+        base=base,
+        folder=m_text.visible(m_text.tilde(str(folder.resolve()))),
+    )
     how = "its window tells its session" if args.kind == "claude" else "it answers the connection check"
-    print(f"Starting {label} in room window {pid}. It joins when {how} (collab status).")
-    print(f"Settings: {m_store.settings_words(args.kind, {'id': pid, **own}, m_store.load_config())}.")
+    print(m_i18n.tr("Starting {label} in room window {pid}. It joins when {how} (collab status).", label=label, pid=pid, how=how))
+    print(m_i18n.tr("Settings: {p0}.", p0=m_store.settings_words(args.kind, {"id": pid, **own}, m_store.load_config())))
 
 
 def settings_args(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
@@ -113,7 +120,7 @@ def settings_args(args: argparse.Namespace, config: dict[str, Any]) -> dict[str,
             continue
         problem = m_store.setting_problem(key, value, config)
         if problem:
-            m_store.fail(f"--{key.replace('use_', '').replace('_', '-')}: {problem}")
+            m_store.fail(m_i18n.tr("--{p0}: {problem}", p0=key.replace("use_", "").replace("_", "-"), problem=problem))
         own[key] = value
     return own
 
@@ -125,9 +132,9 @@ def trim_arg(kind: str, text: str) -> object:
     at, _, do = text.partition(":")
     rule = {"at": int(at), "do": do} if at.isdigit() else None
     if not m_store.trim_valid(rule):
-        m_store.fail("--context-trim takes TOKENS:compact, TOKENS:clear or off — say 150000:compact")
+        m_store.fail(m_i18n.tr("--context-trim takes TOKENS:compact, TOKENS:clear or off — say 150000:compact"))
     if kind not in m_store.TRIM_KINDS:
-        m_store.fail(f"--context-trim: a {m_screen.PRESETS[kind]['label']} takes only off for now")
+        m_store.fail(m_i18n.tr("--context-trim: a {p0} takes only off for now", p0=m_screen.PRESETS[kind]["label"]))
     return rule
 
 
@@ -140,13 +147,15 @@ def cmd_name(args: argparse.Namespace) -> None:
         m_store.fail(problem)
     other = m_store.label_taken(config, args.id, args.label)
     if other:
-        m_store.fail(f"«{args.label}» is already {other}'s name in this room — choose another")
+        m_store.fail(
+            m_i18n.tr("«{label}» is already {other}'s name in this room — choose another", label=args.label, other=other)
+        )
     if args.id in m_store.people_ids(config):
         # A person's name is changed only in their own chat (/name): from a command line any
         # agent could rename the person and then take the name.
-        m_store.fail(f"{args.id!r} is a person's seat — rename it with /name in their chat")
+        m_store.fail(m_i18n.tr("{id} is a person's seat — rename it with /name in their chat", id=repr(args.id)))
     m_store.rename(args.id, args.label)
-    print(f"{args.id}: {args.label}")
+    print(m_i18n.tr("{id}: {label}", id=args.id, label=args.label))
 
 
 def cmd_say(args: argparse.Namespace) -> None:
@@ -167,7 +176,7 @@ def cmd_inbox(args: argparse.Namespace) -> None:
         mine = [m for m in mine if m["id"] not in acked]
     mine = mine[-args.limit :]
     if not mine:
-        print(f"No unacknowledged messages for {args.participant}.")
+        print(m_i18n.tr("No unacknowledged messages for {participant}.", participant=args.participant))
         return
     print("\n\n".join(m_chat_base.fmt(m, config=config) for m in mine))
 
@@ -179,22 +188,24 @@ def cmd_ack(args: argparse.Namespace) -> None:
     config = m_store.load_config()
     m_store.participant(config, args.participant)
     if args.all == bool(args.ids):
-        m_store.fail("choose either --id <message-id> or --all")
+        m_store.fail(m_i18n.tr("choose either --id <message-id> or --all"))
     if args.no_reply and args.all:
-        m_store.fail("--no-reply closes named messages only: use --id")
+        m_store.fail(m_i18n.tr("--no-reply closes named messages only: use --id"))
     mine = {m["id"] for m in m_log.read_messages() if m_log.is_for(m, args.participant)}
     ids = mine if args.all else set(args.ids)
     missing = ids - mine
     if missing:
-        m_store.fail(f"not addressed to {args.participant}: {', '.join(sorted(missing))}")
+        m_store.fail(
+            m_i18n.tr("not addressed to {participant}: {p1}", participant=args.participant, p1=", ".join(sorted(missing)))
+        )
     m_log.write_set(rp.receipts_dir, args.participant, m_log.read_set(rp.receipts_dir, args.participant) | ids)
     if args.no_reply:
         # «Read» alone does not end the wait for an answer — otherwise «read it, answered only in
         # my own window» goes unnoticed again. This mark does: no answer is due.
         m_log.write_set(rp.noreply_dir, args.participant, m_log.read_set(rp.noreply_dir, args.participant) | ids)
-        print(f"Closed {len(ids)} message(s) for {args.participant} without a reply.")
+        print(m_i18n.tr("Closed {p0} message(s) for {participant} without a reply.", p0=len(ids), participant=args.participant))
         return
-    print(f"Acknowledged {len(ids)} message(s) for {args.participant}.")
+    print(m_i18n.tr("Acknowledged {p0} message(s) for {participant}.", p0=len(ids), participant=args.participant))
 
 
 def cmd_task(args: argparse.Namespace) -> None:
@@ -206,26 +217,33 @@ def cmd_task(args: argparse.Namespace) -> None:
         if args.participant:
             m_store.participant(config, args.participant)
         if not any(p in current for p in pids):
-            print("No current tasks.")
+            print(m_i18n.tr("No current tasks."))
         for pid in pids:
             rec = current.get(pid)
             if rec:
                 lane = f", lane {rec['lane']}" if rec.get("lane") else ""
                 print(
-                    f"{m_store.label_of(config, pid)}: {rec['task']} ({rec['kind']}{lane}) since {m_text.local_hm(rec['since'])}"
+                    m_i18n.tr(
+                        "{p0}: {p1} ({p2}{lane}) since {p4}",
+                        p0=m_store.label_of(config, pid),
+                        p1=rec["task"],
+                        p2=rec["kind"],
+                        lane=lane,
+                        p4=m_text.local_hm(rec["since"]),
+                    )
                 )
         return
     if not args.participant or not args.task:
-        m_store.fail(f"task {args.action} needs the task's id and --as <participant>")
+        m_store.fail(m_i18n.tr("task {action} needs the task's id and --as <participant>", action=args.action))
     m_store.participant(config, args.participant)
     who = m_store.label_of(config, args.participant)
     if args.action == "take":
         if not args.kind:
-            m_store.fail(f"--kind is one of: {', '.join(m_tasks.KINDS)}")
+            m_store.fail(m_i18n.tr("--kind is one of: {p0}", p0=", ".join(m_tasks.KINDS)))
         if args.by:
             m_store.participant(config, args.by)
         m_tasks.task_take(args.participant, args.task, args.kind, args.lane or "", args.by or "")
-        print(f"{who} is on {args.task} ({args.kind}).")
+        print(m_i18n.tr("{who} is on {task} ({kind}).", who=who, task=args.task, kind=args.kind))
         return
     was_current = m_tasks.task_done(args.participant, args.task, args.commit or "")
     print(f"{who} finished {args.task}." + ("" if was_current else " (It was not the current task: that one stays.)"))
@@ -247,7 +265,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
         acked = m_log.read_set(rp.receipts_dir, args.participant)
         seen = {m["id"] for m in m_log.read_messages() if m["id"] in acked or not m_log.is_for(m, args.participant)}
     if not args.quiet:
-        print(f"Watching {'the room' if everyone else args.participant}; Ctrl-C to stop.", flush=True)
+        print(m_i18n.tr("Watching {p0}; Ctrl-C to stop.", p0="the room" if everyone else args.participant), flush=True)
     try:
         while True:
             acked = set() if everyone else m_log.read_set(rp.receipts_dir, args.participant)
@@ -285,7 +303,7 @@ def cmd_show(args: argparse.Namespace) -> None:
             # With the room's config: without it a fake «from the person» showed no ⚠.
             print(m_chat_base.fmt(m, config=config))
             return
-    m_store.fail(f"no message {args.id}")
+    m_store.fail(m_i18n.tr("no message {id}", id=args.id))
 
 
 def hook_participant(config: dict[str, Any], pid: str, hook: dict[str, Any]) -> str | None:
@@ -328,13 +346,16 @@ def cmd_status(args: argparse.Namespace) -> None:
             return
         m_store.participant(config, args.as_)
         if args.state not in ("working", "idle", "needs_owner"):
-            m_store.fail("state must be working, idle or needs_owner")
+            m_store.fail(m_i18n.tr("state must be working, idle or needs_owner"))
         m_screen.write_status(args.as_, args.state, args.note or "", "self", args.model or "")
-        print(f"{args.as_}: {args.state}")
+        print(m_i18n.tr("{as_}: {state}", as_=args.as_, state=args.state))
         return
     st = m_screen.read_status()
     for pid in m_store.ids_of(config):
-        print(m_screen.describe(pid, st[pid], args.stale) if pid in st else f"· {pid}: No status yet")
+        lang = m_store.room_language(config)
+        print(
+            m_screen.describe(pid, st[pid], args.stale, lang) if pid in st else m_i18n.tr("· {pid}: No status yet", lang, pid=pid)
+        )
 
 
 def cmd_team(args: argparse.Namespace) -> None:
@@ -343,16 +364,16 @@ def cmd_team(args: argparse.Namespace) -> None:
     config = m_store.load_config()
     if args.action == "scenarios":
         for name, scenario in m_store.SCENARIOS.items():
-            print(f"{name}: {scenario['title']} — {scenario['hint']}")
+            print(m_i18n.tr("{name}: {p1} — {p2}", name=name, p1=scenario["title"], p2=scenario["hint"]))
         return
     if args.action == "start":
         if args.scenario not in m_store.SCENARIOS:
-            m_store.fail(f"collab team start takes one of: {', '.join(m_store.SCENARIOS)}")
+            m_store.fail(m_i18n.tr("collab team start takes one of: {p0}", p0=", ".join(m_store.SCENARIOS)))
         if m_store.team_of(config).get("scenario"):
-            m_store.fail("this room has a team already: collab team shows it")
+            m_store.fail(m_i18n.tr("this room has a team already: collab team shows it"))
         session = config.get("session", "collab-room")
         if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
-            m_store.fail("the room is not running — collab start first, then collab team start")
+            m_store.fail(m_i18n.tr("the room is not running — collab start first, then collab team start"))
         missing = m_agents.scenario_unavailable(m_store.SCENARIOS[args.scenario])
         if missing:
             m_store.fail("not started: " + "; ".join(missing))
@@ -366,11 +387,17 @@ def propose(sender: str, re_: str, prop: dict[str, Any], config: dict[str, Any])
     """A proposal into the room's log — it changes nothing itself: the person applies it with Enter in the chat."""
     problem = m_store.proposal_problem(config, prop, list(m_screen.PRESETS))
     if problem:
-        m_store.fail(f"not proposed: {problem}")
+        m_store.fail(m_i18n.tr("not proposed: {problem}", problem=problem))
     who = "A command line" if sender == m_text.ROOM else m_store.label_of(config, sender)
     text = f"{who} proposes: {m_store.proposal_words(config, prop)}."
     rec = m_log.append_message(sender, m_store.people_ids(config) or ["all"], text, re_, proposal=prop)
-    print(f"Proposed {rec['id']}: {m_store.proposal_words(config, prop)}. The person applies it with Enter in the chat.")
+    print(
+        m_i18n.tr(
+            "Proposed {p0}: {p1}. The person applies it with Enter in the chat.",
+            p0=rec["id"],
+            p1=m_store.proposal_words(config, prop),
+        )
+    )
 
 
 def proposal_value(key: str, text: str) -> object:
@@ -396,18 +423,18 @@ def cmd_propose(args: argparse.Namespace) -> None:
     Enter in the chat."""
     config = m_store.load_config()
     if args.sender not in m_store.ids_of(config):
-        m_store.fail(f"unknown sender {args.sender!r}")
+        m_store.fail(m_i18n.tr("unknown sender {sender}", sender=repr(args.sender)))
     if args.sender != m_store.lead_of(config):
-        m_store.fail("only the room's lead proposes changes of the team; others ask the lead")
+        m_store.fail(m_i18n.tr("only the room's lead proposes changes of the team; others ask the lead"))
     m_screen.check_name_is_mine(args.sender, config)
     if args.re and not any(m["id"] == args.re for m in m_log.read_messages()):
-        m_store.fail(f"no message {args.re} to answer")
+        m_store.fail(m_i18n.tr("no message {re} to answer", re=args.re))
     changes = []
     for item in args.set or []:
         target, eq, value = item.partition("=")
         who, dot, key = target.rpartition(".")
         if not eq or not dot:
-            m_store.fail(f"--set takes ID.KEY=VALUE (or room.KEY=VALUE): {item!r}")
+            m_store.fail(m_i18n.tr("--set takes ID.KEY=VALUE (or room.KEY=VALUE): {item}", item=repr(item)))
         key = {"model": "use_model", "memory": "context_trim"}.get(key) or key
         changes.append({"who": who, "key": key, "after": proposal_value(key, value)})
     adds = []
@@ -498,22 +525,37 @@ def cmd_report(args: argparse.Namespace) -> None:
         try:
             return subprocess.run(["git", "-C", repo, *a], text=True, capture_output=True, timeout=GIT_TIMEOUT)
         except FileNotFoundError:
-            m_store.fail("git is required for report: install it (macOS: xcode-select --install) and run report again")
+            m_store.fail(m_i18n.tr("git is required for report: install it (macOS: xcode-select --install) and run report again"))
         except subprocess.TimeoutExpired:
             m_store.fail(
-                f"git {a[0]} did not answer in {GIT_TIMEOUT} s in {m_text.tilde(repo)}; nothing was sent — "
-                "check that repository and run report again"
+                m_i18n.tr(
+                    "git {p0} did not answer in {GIT_TIMEOUT} s in {p2}; nothing was sent — check that repository and run report again",
+                    p0=a[0],
+                    GIT_TIMEOUT=GIT_TIMEOUT,
+                    p2=m_text.tilde(repo),
+                )
             )
 
     def git(*a: str) -> str:
         r = run_git(*a)
         if r.returncode:
-            m_store.fail(f"git {a[0]} failed in {m_text.tilde(repo)}: {m_text.visible(r.stderr.strip()) or 'no message'}")
+            m_store.fail(
+                m_i18n.tr(
+                    "git {p0} failed in {p1}: {p2}",
+                    p0=a[0],
+                    p1=m_text.tilde(repo),
+                    p2=m_text.visible(r.stderr.strip()) or "no message",
+                )
+            )
         return r.stdout.strip()
 
     # Outside a repository git said only «fatal: not a git repository» — no folder, no way out.
     if run_git("rev-parse", "--git-dir").returncode:
-        m_store.fail(f"{m_text.tilde(repo)} is not a git repository: give the checkout with --repo <folder>; nothing was sent")
+        m_store.fail(
+            m_i18n.tr(
+                "{p0} is not a git repository: give the checkout with --repo <folder>; nothing was sent", p0=m_text.tilde(repo)
+            )
+        )
     head = git("log", "-1", "--format=%h %s")
     files = git("show", "--stat", "--format=", "HEAD").splitlines()
     upstream = run_git("rev-parse", "--abbrev-ref", "@{u}")
@@ -862,7 +904,15 @@ def guard_room_state() -> None:
             continue
         # More than one name, not «not one»: a file caught in os.replace has none (see read_state_text).
         if stat.S_ISLNK(info.st_mode) or (stat.S_ISREG(info.st_mode) and info.st_nlink > 1):
-            m_store.fail(f"refusing: {path} is a link — the room's state must be its own files")
+            m_store.fail(m_i18n.tr("refusing: {path} is a link — the room's state must be its own files", path=path))
+
+
+def cli_language() -> str:
+    """What the command line speaks: its room's language in a room, else the person's default."""
+    with contextlib.suppress(Exception, SystemExit):
+        if m_store.room().paths.config_path.is_file():
+            return m_store.room_language(m_store.read_config_raw())
+    return m_store.user_language()
 
 
 def main() -> None:
@@ -875,23 +925,28 @@ def main() -> None:
     if repeated:
         # An allow rule matches «say --room R --from P» by its beginning: a second --room (or an
         # abbreviation, or --room=) later in the line would quietly win and send elsewhere.
-        m_store.fail(f"{repeated} is given more than once")
+        m_store.fail(m_i18n.tr("{repeated} is given more than once", repeated=repeated))
     args = build_parser().parse_args()
     if getattr(args, "room", None):
         differs = rule_shape_differs(sys.argv[1:], args)
         if differs:
-            m_store.fail(f"{differs}: the command line is ambiguous; give each of --room, --from/--for once, plainly")
+            m_store.fail(
+                m_i18n.tr(
+                    "{differs}: the command line is ambiguous; give each of --room, --from/--for once, plainly", differs=differs
+                )
+            )
         m_store.use_room(args.room)
     # The copy knows itself by its own file, not by the environment (a changed
     # COLLAB_SAFE_DIR switched the check off). And the check of links runs for every answer, copy
     # or not: for a plain room it costs nothing.
     if re.fullmatch(r"collab-[0-9a-f]{16}", Path(m_boot.SELF).name) and sys.argv[1:2] and sys.argv[1] not in IDENTITY_FLAG:
-        m_store.fail("this copy of collab only answers in a room: say, ack, inbox")
+        m_store.fail(m_i18n.tr("this copy of collab only answers in a room: say, ack, inbox"))
     if sys.argv[1:2] and sys.argv[1] in IDENTITY_FLAG:
         guard_room_state()
     if args.func is m_chat.cmd_chat:
         m_chat.run_chat(args)
         return
+    m_i18n.speak(cli_language())
     args.func(args)
 
 

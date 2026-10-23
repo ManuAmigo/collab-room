@@ -112,7 +112,7 @@ def warn(note: str) -> None:
 def fail(message: str) -> NoReturn:
     if chat_mode().on:
         raise OperationFailed(message)  # printed to stderr it would land on the chat's screen
-    print(f"collab: {message}", file=sys.stderr)
+    print(m_i18n.tr("collab: {message}", message=message), file=sys.stderr)
     raise SystemExit(2)
 
 
@@ -130,9 +130,9 @@ def read_config_raw() -> dict[str, Any]:
     try:
         data: object = json.loads(read_state_text(rp.config_path, "strict"))
     except (OSError, ValueError) as exc:
-        fail(f"cannot read {rp.config_path}: {exc}")
+        fail(m_i18n.tr("cannot read {config_path}: {exc}", config_path=rp.config_path, exc=exc))
     if not isinstance(data, dict):
-        fail(f"the room's settings must be a JSON object — in {m_text.tilde(str(rp.config_path))}; fix it there")
+        fail(m_i18n.tr("the room's settings must be a JSON object — in {p0}; fix it there", p0=m_text.tilde(str(rp.config_path))))
     return cast("dict[str, Any]", data)
 
 
@@ -152,7 +152,11 @@ def read_panes() -> dict[str, Any]:
         if not _PANES_SAID:
             _PANES_SAID.append(str(exc))
             with contextlib.suppress(OSError):
-                print(f"cannot read {rp.panes_path} ({exc}); read as empty", file=sys.stderr, flush=True)
+                print(
+                    m_i18n.tr("cannot read {panes_path} ({exc}); read as empty", panes_path=rp.panes_path, exc=exc),
+                    file=sys.stderr,
+                    flush=True,
+                )
         return {}
     if not isinstance(data, dict) or not isinstance(cast("dict[str, Any]", data).get("panes", {}), dict):
         return {}
@@ -290,6 +294,8 @@ def setting_problems(config: dict[str, Any]) -> list[str]:
 
 
 def trim_words(rule: dict[str, Any] | None) -> str:
+    if rule == HANDOFF_CLEAR:
+        return "/clear once it hands in its work"
     return f"/{rule['do']} past {rule['at'] // 1000}k tokens of context" if rule else "off"
 
 
@@ -385,9 +391,11 @@ def without_person(config: dict[str, Any]) -> list[str]:
 
 # The memory a seat is given: «compact» folds a long conversation into a summary, «clear» starts it anew once it has
 # grown, «keep» leaves it to the agent's program. The thresholds are a first guess, to be set by what the ledger shows.
+# «Clear» is after the agent handed in its work — its answer to the task it was given — not by a threshold.
+HANDOFF_CLEAR: dict[str, object] = {"do": "clear", "after": "handoff"}
 MEMORY: dict[str, object] = {
     "compact": {"at": 150000, "do": "compact"},
-    "clear": {"at": 100000, "do": "clear"},
+    "clear": HANDOFF_CLEAR,
     "keep": False,
 }
 
@@ -506,6 +514,8 @@ def memory_words(rule: object, lang: str = "en") -> str:
     if not trim_valid(rule):
         return m_i18n.words_in("memory.keep", lang)
     r = cast("dict[str, Any]", rule)
+    if r == HANDOFF_CLEAR:
+        return m_i18n.words_in("memory.clear.handoff", lang)
     return m_i18n.words_in(f"memory.{r['do']}", lang, k=r["at"] // 1000)
 
 
@@ -538,9 +548,10 @@ def scenario_hint(name: str, lang: str) -> str:
     return m_i18n.words_in(f"scenario.{name}.hint", lang)
 
 
-def scenario_preview(name: str, lang: str = "en") -> list[str]:
-    """What a scenario would start, before anything starts: its team as rows, the result file, the bounds."""
-    scenario = SCENARIOS[name]
+def scenario_preview(name: str, lang: str = "en", draft: list[dict[str, Any]] | None = None) -> list[str]:
+    """What a scenario would start, before anything starts: its team as rows — as the person changed it, if they did —
+    the result file, the bounds."""
+    scenario = {**SCENARIOS[name], **({"seats": draft} if draft is not None else {})}
     seats = [
         {"id": seat["seat"], "label": seat["label"], "kind": seat["kind"], "seat": seat["seat"]} for seat in scenario["seats"]
     ]
@@ -634,14 +645,17 @@ def trim_valid(rule: object) -> bool:
     or /clear (deliver.trim_due)."""
     if not isinstance(rule, dict):
         return False
-    at, do = cast("dict[str, object]", rule).get("at"), cast("dict[str, object]", rule).get("do")
+    r = cast("dict[str, object]", rule)
+    if r == HANDOFF_CLEAR:
+        return True  # /clear once the agent handed in its work, not by its context's size (deliver.trim_due)
+    at, do = r.get("at"), r.get("do")
     return isinstance(at, int) and not isinstance(at, bool) and at > 0 and do in ("compact", "clear")
 
 
 def load_config() -> dict[str, Any]:
     rp = room().paths
     if not rp.config_path.is_file():
-        fail(f"no {rp.config_path.name}; run `collab init` first")
+        fail(m_i18n.tr("no {name}; run `collab init` first", name=rp.config_path.name))
     # Read from the checked file itself: a link put in its place is not followed.
     data = read_config_raw()
 
@@ -649,7 +663,7 @@ def load_config() -> dict[str, Any]:
     # where sent the person looking for a .collab.json that is not there.
     def bad(message: str) -> NoReturn:
         rp = room().paths
-        fail(f"{message} — in {m_text.tilde(str(rp.config_path))}; fix it there")
+        fail(m_i18n.tr("{message} — in {p1}; fix it there", message=message, p1=m_text.tilde(str(rp.config_path))))
 
     if not isinstance(data, dict):  # pyright: ignore[reportUnnecessaryIsInstance] — a seam may hand anything
         bad("the room's settings must be a JSON object")
@@ -719,7 +733,9 @@ def participant(config: dict[str, Any], pid: str) -> dict[str, Any]:
     for p in config["participants"]:
         if p["id"] == pid:
             return p
-    fail(f"unknown participant {pid!r}; known: {', '.join(p['id'] for p in config['participants'])}")
+    fail(
+        m_i18n.tr("unknown participant {pid}; known: {p1}", pid=repr(pid), p1=", ".join(p["id"] for p in config["participants"]))
+    )
     raise AssertionError
 
 
@@ -742,7 +758,7 @@ def private_dir(path: Path, strict: bool = True) -> None:
     if path.is_symlink():
         if strict:
             # A link in place of the room's folder: chmod would follow it.
-            fail(f"refusing: {path} is a link — the room's state must be its own folder")
+            fail(m_i18n.tr("refusing: {path} is a link — the room's state must be its own folder", path=path))
     else:
         for level in reversed([p for p in (path, *path.parents) if not os.path.lexists(p)]):
             try:
@@ -807,7 +823,7 @@ def state_dir(path: Path, strict: bool = True, create: bool = True) -> tuple[int
         os.close(fd)
         if not strict:
             raise
-        fail(f"refusing to write {path}: {exc.strerror} (a link in the room's state?)")
+        fail(m_i18n.tr("refusing to write {path}: {strerror} (a link in the room's state?)", path=path, strerror=exc.strerror))
     return fd, parts[-1]
 
 
@@ -838,7 +854,7 @@ def room_locked(fn: _Fn) -> _Fn:
                 try:
                     fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
                 except OSError as exc:
-                    fail(f"refusing the room lock: {exc.strerror} (a link in the room's state?)")
+                    fail(m_i18n.tr("refusing the room lock: {strerror} (a link in the room's state?)", strerror=exc.strerror))
                 finally:
                     os.close(dir_fd)
                 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -872,7 +888,7 @@ def replace_state(path: Path, text: str) -> None:
             os.unlink(tmp, dir_fd=fd)
         except OSError:
             pass
-        fail(f"cannot write {path}: {exc.strerror}")
+        fail(m_i18n.tr("cannot write {path}: {strerror}", path=path, strerror=exc.strerror))
     finally:
         os.close(fd)
 
@@ -901,13 +917,13 @@ def state_file(path: Path, append: bool) -> int:
         flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_APPEND if append else 0)
         out = os.open(parts[-1], flags, 0o600, dir_fd=fd)
     except OSError as exc:
-        fail(f"refusing to write {path}: {exc.strerror} (a link in the room's state?)")
+        fail(m_i18n.tr("refusing to write {path}: {strerror} (a link in the room's state?)", path=path, strerror=exc.strerror))
     finally:
         os.close(fd)
     info = os.fstat(out)
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         os.close(out)
-        fail(f"refusing to write {path}: not a plain file of the room")
+        fail(m_i18n.tr("refusing to write {path}: not a plain file of the room", path=path))
     os.fchmod(out, 0o600)
     if not append:
         os.ftruncate(out, 0)  # only now: truncating at open would have emptied a linked file
@@ -983,9 +999,9 @@ PALETTE = ["1;37", "38;5;208", "38;5;71", "38;5;75", "38;5;177", "38;5;179", "38
 
 def _label_of(config: dict[str, Any], pid: str) -> str:
     if pid == "all":
-        return "Everyone"
+        return m_i18n.words_in("label.all", room_language(config))
     if pid == m_text.ROOM:
-        return "Room"
+        return m_i18n.words_in("label.room", room_language(config))
     for p in config["participants"]:
         if p["id"] == pid:
             return p.get("label") or pid
@@ -1056,16 +1072,16 @@ def write_room(sample: dict[str, Any], ask: bool) -> None:
     if ask and len(sample["participants"]) == 1:
         p = sample["participants"][0]
         try:
-            answer = m_term.ask_line(f"Your name [{p['label']}]: ").strip()
+            answer = m_term.ask_line(m_i18n.tr("Your name [{p0}]: ", p0=p["label"])).strip()
         except EOFError:
             answer = ""
         if answer:
             p["label"] = answer
     elif ask:
-        print("Name the participants (Enter keeps the current name).")
+        print(m_i18n.tr("Name the participants (Enter keeps the current name)."))
         for p in sample["participants"]:
             try:
-                answer = m_term.ask_line(f"  {p['id']} [{p['label']}]: ").strip()
+                answer = m_term.ask_line(m_i18n.tr("  {p0} [{p1}]: ", p0=p["id"], p1=p["label"])).strip()
             except EOFError:
                 answer = ""
             if answer:
@@ -1233,28 +1249,46 @@ def undo_changes(record_id: str, by: str) -> tuple[dict[str, Any], list[str]]:
     return apply_changes(back, by, undo_of=record_id)
 
 
-def change_words(data: dict[str, Any], rec: dict[str, Any]) -> str:
-    """«Ann — model sonnet → opus; the room — goal none → …»: what one record changed, for the person."""
+def change_words(data: dict[str, Any], rec: dict[str, Any], lang: str = "") -> str:
+    """«Ann — model sonnet → opus; the room — goal none → …»: what one record changed, for the person, in the room's
+    language: its fields, roles, memory and what is done without the person by their words; names and models as
+    they are."""
+    lang = lang or room_language(data)
 
-    def shown(v: object) -> str:
+    def w(key: str) -> str:
+        return m_i18n.words_in(key, lang)
+
+    def shown(key: str, v: object) -> str:
         if v is None:
-            return "the default"
+            return w("change.default")
+        if key == "without_person" and isinstance(v, list):
+            return ", ".join(
+                w(f"without.{x}") if f"without.{x}" in m_i18n.CATALOG else str(x) for x in cast("list[object]", v)
+            ) or w("change.nothing")
         if isinstance(v, list):
-            return ", ".join(str(x) for x in cast("list[object]", v)) or "nothing"
-        return memory_words(cast("object", v)) if isinstance(v, dict) or v is False else str(v)
+            return ", ".join(str(x) for x in cast("list[object]", v)) or w("change.nothing")
+        if key == "round" and v is False:
+            return w("change.off")
+        if isinstance(v, dict) or v is False:
+            return memory_words(cast("object", v), lang)
+        if key == "role" and isinstance(v, str) and v in ROLES:
+            return w(f"role.{v}")
+        return str(v)
 
     parts: list[str] = []
     for c in rec.get("changes", []):
-        who = "the room" if c.get("who") == "room" else label_of(data, str(c.get("who")))
-        key = {"use_model": "model", "context_trim": "memory", "reports_to": "reports to"}.get(
-            str(c.get("key")), str(c.get("key"))
-        )
-        named = c.get("key") in ("lead", "reports_to")  # an id: shown by its name
+        key = str(c.get("key"))
+        who = w("change.room") if c.get("who") == "room" else label_of(data, str(c.get("who")))
+        field = w(f"change.field.{key}") if f"change.field.{key}" in m_i18n.CATALOG else key
+        named = key in ("lead", "reports_to")  # an id: shown by its name
         before, after = (
-            m_text.clean_field(whom(str(v), data) if named and v is not None else shown(v), GOAL_LIMIT)
+            m_text.clean_field(
+                (w("whom.person") if v == "person" else label_of(data, str(v))) if named and v is not None else shown(key, v),
+                GOAL_LIMIT,
+            )
             for v in (c.get("before"), c.get("after"))
         )
-        parts.append(f"{who} — {key} {before} → {after}")
+        parts.append(f"{who} — {field} {before} → {after}")
     return m_text.visible("; ".join(parts))
 
 
@@ -1381,14 +1415,18 @@ def proposal_digest(prop: object) -> str:
 def proposal_card(m: dict[str, Any], data: dict[str, Any], request: str = "") -> dict[str, Any]:
     """The chat's question for one proposal: what it does, at whose word, Apply or Decline — one Enter. Bound to what
     was shown: an edit of the log after it is not applied."""
-    who = "A command line" if m.get("from") == m_text.ROOM else label_of(data, str(m.get("from")))
-    asked = f" (your request: «{m_text.clean_field(request, 120)}»)" if request else ""
+    who = m_i18n.tr("A command line") if m.get("from") == m_text.ROOM else label_of(data, str(m.get("from")))
+    asked = m_i18n.tr(" (your request: «{request}»)", request=m_text.clean_field(request, 120)) if request else ""
     return {
         "step": "proposal",
         "proposal": m["id"],
         "digest": proposal_digest(m.get("proposal")),
-        "prompt": f"{who} proposes{asked} — apply?",
-        "options": [("Apply", "go"), ("Decline", "decline"), ("Later — /team shows it", "later")],
+        "prompt": m_i18n.tr("{who} proposes{asked} — apply?", who=who, asked=asked),
+        "options": [
+            (m_i18n.tr("Apply"), "go"),
+            (m_i18n.tr("Decline"), "decline"),
+            (m_i18n.tr("Later — /team shows it"), "later"),
+        ],
     }
 
 
@@ -1451,7 +1489,13 @@ def shared_locked(fn: _Fn) -> _Fn:
                 try:
                     fd = os.open(str(inst.shared_lock), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
                 except OSError as exc:
-                    fail(f"refusing the lock {m_text.tilde(str(inst.shared_lock))}: {exc.strerror} (a link there?)")
+                    fail(
+                        m_i18n.tr(
+                            "refusing the lock {p0}: {strerror} (a link there?)",
+                            p0=m_text.tilde(str(inst.shared_lock)),
+                            strerror=exc.strerror,
+                        )
+                    )
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 _SHARED_LOCK["fd"] = fd
             _SHARED_LOCK["depth"] += 1

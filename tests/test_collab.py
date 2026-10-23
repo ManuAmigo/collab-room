@@ -1889,6 +1889,77 @@ class RoomTest(Base):
         self.assertEqual(mod.words_in("n.agents", "en", n=1), "1 agent")
         self.assertEqual(mod.words_in("team.what", "xx"), "What will we do?", "a language not known: English")
 
+    def test_every_line_the_room_says_through_tr_has_its_russian_one(self):
+        # Each m_i18n.tr("English {template}") in the program: its key in the catalog, both languages, the same
+        # parameters — a line added without its Russian one fails here.
+        mod = _Loader(f"collab_tr_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        import ast
+
+        names = lambda text: sorted(re.findall(r"\{(\w+)\}", text))
+        found = 0
+        for path in sorted((Path(__file__).resolve().parents[1] / "src" / "collab").glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                call = getattr(node.func, "attr", "") if isinstance(node, ast.Call) else ""
+                at = {"tr": 0, "room_line": 1}.get(call)
+                if at is not None and len(node.args) > at:
+                    first = node.args[at]
+                    self.assertIsInstance(first, ast.Constant, f"{path.name}:{node.lineno}: tr takes its English as a literal")
+                    entry = mod.CATALOG.get(mod.tr_key(first.value))
+                    self.assertIsNotNone(entry, f"{path.name}:{node.lineno}: no Russian for {first.value!r}")
+                    self.assertEqual(entry["en"], first.value, f"{path.name}:{node.lineno}")
+                    self.assertEqual(names(entry["ru"]), names(first.value), f"{path.name}:{node.lineno}: parameters")
+                    found += 1
+        self.assertGreater(found, 0, "no call read: this test would prove nothing")
+
+    def test_no_visible_text_goes_to_the_screen_past_the_catalog(self):
+        # Where the program says something — print, fail, a chat's say_, a question asked — its words come from the
+        # catalog (m_i18n.tr), never a bare English literal: a new one fails here. Exceptions by name: diagnostics and
+        # the deliverer's own log, which stay English. This complements the catalog's own test; a search of literals alone proves no full cover.
+        import ast
+
+        calls = ("print", "fail", "OperationFailed", "SystemExit", "ask_line", "confirm", "pick", "say_", "trouble")
+        allowed = {
+            "usage of  not counted: ",
+            "delivered  → ",
+            "collab-room: install",
+        }  # stderr diagnostics, the deliverer's own log
+        found = []
+        for path in sorted((Path(__file__).resolve().parents[1] / "src" / "collab").glob("*.py")):
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if not (isinstance(node, ast.Call) and node.args):
+                    continue
+                if getattr(node.func, "attr", getattr(node.func, "id", "")) not in calls:
+                    continue
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    text = first.value
+                elif isinstance(first, ast.JoinedStr):
+                    text = "".join(v.value for v in first.values if isinstance(v, ast.Constant))
+                else:
+                    continue
+                if any(c.isalpha() for c in text) and text not in allowed:
+                    found.append(f"{path.name}:{node.lineno}: {text[:60]!r}")
+        self.assertEqual(found, [], "said past the catalog")
+
+    def test_in_a_russian_room_a_changes_fields_and_an_agents_state_line_are_russian(self):
+        # All a person sees: the fields of «before → after», and an agent's state line in the feed — while the chat
+        # still reads the English one.
+        mod = _Loader(f"collab_ru3b_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        data = {"language": "ru", "participants": [{"id": "ann", "label": "Ann"}]}
+        rec = {"changes": [{"who": "ann", "key": "use_model", "before": None, "after": "sonnet"},
+                           {"who": "ann", "key": "role", "before": "worker", "after": "reviewer"},
+                           {"who": "room", "key": "round", "before": 30, "after": False}]}  # fmt: skip
+        self.assertEqual(mod.change_words(data, rec),
+                         "Ann — модель по умолчанию → sonnet; Ann — роль исполнитель → проверяющий; комната — обход 30 → выключен")  # fmt: skip
+        self.assertEqual(mod.change_words({**data, "language": "en"}, rec),
+                         "Ann — model the default → sonnet; Ann — role worker → reviewer; the room — round 30 → off")  # fmt: skip
+        st = {"state": "needs_owner", "detail": "", "source": "hook", "at": "2099-01-01T00:00:00+00:00"}
+        self.assertEqual(mod.describe("ann", st, 10, "ru"), "‼ ann ждёт вашего действия. Откройте окно агента, чтобы продолжить.")
+        self.assertEqual(mod.describe("ann", st, 10), "‼ ann needs your input. Open the agent's window to continue.")
+        old = {"state": "working", "source": "self", "at": "2000-01-01T00:00:00+00:00"}
+        self.assertIn("нет обновлений", mod.describe("ann", old, 10, "ru"))
+        self.assertIn("No update for", mod.describe("ann", old, 10), "the chat reads this one")
+
     def test_every_command_has_its_russian_name_and_either_name_does_the_same(self):
         mod = _Loader(f"collab_cmds_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
         for en, ru in mod.COMMANDS:
@@ -2242,11 +2313,39 @@ class RoomTest(Base):
         self.assertEqual(team["lead"], agents[0]["id"])
         self.assertIn("--model opus", commands[0])
         self.assertIn("--model sonnet", commands[1])
-        self.assertIn("Prices · worker · prices and terms · sonnet · clear past 100k · reports to Lead", out.getvalue())
+        self.assertIn(
+            "Prices · worker · prices and terms · sonnet · clear after handing in work · reports to Lead", out.getvalue()
+        )
         self.assertIn("Team started: 4 of 4 agents. Lead — Lead.", out.getvalue())
         with self.assertRaises(SystemExit):
             start()
         self.assertEqual(len(commands), 4, "a room with a team is not given a second one")
+
+    def test_a_team_changed_before_its_launch_starts_as_changed(self):
+        self.write_config([{"id": "owner", "label": "Андрей"}])
+        mod = _Loader(f"collab_draft_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        commands: list[str] = []
+
+        def tmux(*argv, **_):
+            if argv[0] == "new-window":
+                commands.append(argv[-1])
+                return SimpleNamespace(stdout=f"%{len(commands) + 10} 4{len(commands)}\n", returncode=0, stderr="")
+            return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        self.enterContext(mock.patch.object(shutil, "which", lambda name: f"/usr/local/bin/{name}"))
+        draft = json.loads(json.dumps(mod.SCENARIOS["text"]["seats"]))
+        draft[1]["use_model"] = "haiku"
+        draft.append({"seat": "added1", "kind": "claude", "label": "Checker", "role": "reviewer", "topic": "facts"})
+        started, failed = mod.start_scenario("text", str(self.root), draft)
+        self.assertEqual((len(started), failed), (3, []))
+        team = json.loads(self.cfg.read_text())["team"]
+        self.assertEqual([seat["seat"] for seat in team["seats"]], ["lead", "editor", "added1"])
+        self.assertIn("--model haiku", commands[1], "the model chosen before the launch")
+        bad = [*draft, {**draft[0], "seat": "second"}]  # two leads
+        with self.assertRaises(ValueError):
+            mod.start_scenario("text", str(self.root), bad)
 
     def test_collab_team_shows_where_each_agent_is_with_its_assignment(self):
         # Acknowledged: its latest brief closed with ack. Replied: it answered it — the person reads that.
@@ -7178,6 +7277,42 @@ class DeliveryTest(Base):
         with (self.state / "team-changes.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps({"id": "x1", "changes": [{"who": "room", "key": "\u001b[2J", "before": 1, "after": 2}]}) + "\n")
         self.assertNotIn("x1", [r["id"] for r in mod.read_changes()])
+
+    def test_an_agent_that_clears_after_handing_in_is_given_clear_once_its_answer_to_its_task_is_sent(self):
+        # «Clear» is after handing in the work — its answer (--re) to the task from whom it reports to — not by the
+        # size of its context; a note on the way is not handing in.
+        agent = self.root / "agent.sh"
+        seat = lambda pid, **more: {"id": pid, "label": pid.capitalize(), "kind": "claude", "command": [str(agent)],
+                                    "delivery": "tmux", "idle": r"^READY$", **more}  # fmt: skip
+        handoff = {"do": "clear", "after": "handoff"}
+        self.write_config(
+            [{"id": "owner"}, seat("lea", role="lead"), seat("wes", role="worker", context_trim=handoff)], session=self.session
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        panes = json.loads((self.state / "panes.json").read_text())["panes"]
+        for pid in ("lea", "wes"):
+            self.assertTrue(self.wait_for(panes[pid], "READY"))
+        typed = lambda: (
+            subprocess.run(
+                ["tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", panes["wes"]], capture_output=True, text=True
+            ).stdout
+        )
+        settle = lambda: self.until(lambda: typed().rstrip().endswith("READY"))
+        task = self.note("lea", ["wes"], "prices for Notion, please")
+        for _ in range(3):  # its brief and the task go in; no handing in yet
+            self.run_collab("deliver", "--once")
+            settle()
+        self.assertNotIn("got:/clear", typed(), "nothing handed in yet")
+        self.assertEqual(self.run_collab("say", "--from", "wes", "--to", "lea", "working on it").returncode, 0)
+        self.run_collab("deliver", "--once")
+        settle()
+        self.assertNotIn("got:/clear", typed(), "a note on the way is not handing in")
+        self.assertEqual(self.run_collab("say", "--from", "wes", "--to", "lea", "--re", task, "Notion Plus: $12").returncode, 0)
+        self.assertIn("clear wes", self.run_collab("deliver", "--once").stdout)
+        self.assertTrue(self.until(lambda: "got:/clear" in typed()), typed())
+        settle()
+        self.assertNotIn("clear", self.run_collab("deliver", "--once").stdout, "once per handing in")
+        self.assertIn("Wes: handed in its work — given /clear.", [m["text"] for m in self.messages()])
 
     def test_past_its_context_threshold_an_idle_agent_is_given_compact_or_clear_and_otherwise_nothing(self):
         # Every wake re-reads the whole context. Past the room's threshold, a free agent is given /compact
@@ -13916,7 +14051,7 @@ class DeliveryTest(Base):
         self.assertEqual(json.loads(self.cfg.read_text()).get("language"), "ru")
         pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
         keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
-        self.assertTrue(self.wait_for(pane, "The room calls you"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "Предлагаемое имя из вашей учётной записи"), self.screen(pane))
         keys("Enter")
         self.assertTrue(self.wait_for(pane, "Что будем делать?  ↑↓"), self.screen(pane))
         self.assertIn("› Без шаблона — добавьте агентов через /добавить", self.screen(pane))
@@ -13932,6 +14067,89 @@ class DeliveryTest(Base):
         self.assertTrue(self.until(lambda: json.loads(self.cfg.read_text()).get("language") == "en"), self.screen(pane))
         self.assertTrue(self.wait_for(pane, "The room speaks English now"), self.screen(pane))
         self.assertEqual((self.root / "language").read_text().strip(), "ru", "the default for new rooms is not changed by Apply")
+
+    def test_a_ready_team_is_changed_before_its_launch_and_nothing_starts_meanwhile(self):
+        # «Chose a template — can change it before the launch»: an agent's model, one removed, one added; the lead
+        # stays. Nothing is written or started until «Launch the team».
+        self.cfg.unlink(missing_ok=True)
+        self.assertEqual(self.run_collab("start", "--session", self.session).returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        keys = lambda *k: (subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True), time.sleep(0.15))
+        self.assertTrue(self.wait_for(pane, "The room calls you"), self.screen(pane))
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "What will we do?  ↑↓"), self.screen(pane))
+        keys("Down", "Down")
+        keys("Enter")  # Research
+        self.assertTrue(self.wait_for(pane, "› Launch the team — 4 agents"), self.screen(pane))
+        keys("Down")
+        keys("Enter")  # Change an agent…
+        self.assertTrue(self.wait_for(pane, "Which agent?"), self.screen(pane))
+        keys("Down")
+        keys("Enter")  # Prices
+        self.assertTrue(self.wait_for(pane, "Change Prices: which?"), self.screen(pane))
+        keys("Down", "Down")
+        keys("Enter")  # Model
+        self.assertTrue(self.wait_for(pane, "› haiku"), self.screen(pane))
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Prices · worker · prices and terms · haiku"), self.screen(pane))
+        keys("Down", "Down", "Down")
+        keys("Enter")  # Remove an agent…
+        self.assertTrue(self.wait_for(pane, "Which agent?"), self.screen(pane))
+        keys("Down", "Down")
+        keys("Enter")  # Reviews
+        self.assertTrue(self.wait_for(pane, "› Launch the team — 3 agents"), self.screen(pane))
+        self.assertNotIn("Reviews · worker", self.screen(pane))
+        keys("Down", "Down")
+        keys("Enter")  # Add an agent…
+        self.assertTrue(self.wait_for(pane, "Its role?"), self.screen(pane))
+        keys("Down")
+        keys("Enter")  # reviewer
+        self.assertTrue(self.wait_for(pane, "Its topic"), self.screen(pane))
+        keys("-l", "legal terms")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Reviewer · reviewer · legal terms · sonnet"), self.screen(pane))
+        self.assertIn("› Launch the team — 4 agents", self.screen(pane))
+        keys("Down", "Down", "Down")
+        keys("Enter")  # Remove an agent…
+        self.assertTrue(self.wait_for(pane, "Which agent?"), self.screen(pane))
+        keys("Enter")  # Lead
+        self.assertTrue(self.wait_for(pane, "The lead stays"), self.screen(pane))
+        cfg = json.loads(self.cfg.read_text())
+        self.assertEqual(
+            ([p["id"] for p in cfg["participants"]], cfg.get("team")), (["owner"], None), "nothing started meanwhile"
+        )
+
+    def test_a_russian_rooms_chat_steps_and_the_rooms_own_lines_are_in_russian(self):
+        # Its questions, its bottom line, its pause, and a line the room wrote in English, retold in Russian; what
+        # an agent wrote stays as it was.
+        cfg = {"version": 2, "session": self.session, "language": "ru", "participants": [
+            {"id": "owner", "label": "Андрей", "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"]},
+            {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x"}]}  # fmt: skip
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        keys = lambda *k: (subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True), time.sleep(0.4))
+        self.assertTrue(self.wait_chat(pane, "Андрей → Все"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "── ↑ История · / Команды · Tab Получатель"), self.screen(pane))
+        mod = _Loader(f"collab_ru2_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        mod.room_line(["owner"], "{name} connected.", name="Ann")
+        self.note("ann", ["owner"], "Hello, I am ready")
+        self.assertTrue(self.wait_for(pane, "Агент подключён: Ann."), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "Hello, I am ready"), "what an agent writes stays as it is")
+        self.assertEqual([m["text"] for m in self.messages() if m.get("said")], ["Ann connected."], "the log keeps English")
+        keys("-l", "/отключить")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Выберите агента для отключения"), self.screen(pane))
+        keys("Escape")
+        keys("Escape")
+        keys("-l", "/пауза")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Доставка приостановлена"), self.screen(pane))
+        keys("-l", "/продолжить")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Доставка возобновлена"), self.screen(pane))
 
     def test_first_visit_welcomes_once_and_sends_nothing(self):
         # «the user must learn all this easily».

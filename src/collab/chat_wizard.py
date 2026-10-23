@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,26 @@ class ChatCommandContext:
     wizard_back: Callable[..., Any]
 
 
+def show_draft(ctx: ChatCommandContext, say_: Callable[[str], None], lang: str) -> None:
+    """The team before its launch, as it is now — the scenario's or as the person changed it — and what can be done
+    with it: launch, change, add, remove. Nothing starts before «Launch the team»."""
+    name, draft = ctx.wizard["scenario"], ctx.wizard["draft"]
+    missing = m_agents.scenario_unavailable({"seats": draft})
+    back = (m_i18n.words_in("team.back", lang), "back")
+    edits = [(m_i18n.words_in(f"team.{x}", lang), x) for x in ("edit", "add", "remove")]
+    options = (
+        [back] if missing else [(m_i18n.words_in("team.launch", lang, agents=agents_words(len(draft), lang)), "go"), *edits, back]
+    )
+    question = (
+        m_i18n.words_in("team.unavailable", lang, what="; ".join(missing))
+        if missing
+        else m_i18n.words_in("team.launch.question", lang)
+    )
+    ctx.wizard.update(step="scenario_go", prompt=question, options=options)
+    # Room under the rows for the choice: the menu is drawn over the feed's bottom lines.
+    say_("\n".join(m_store.scenario_preview(name, lang, draft)) + "\n" * (len(options) + 2))
+
+
 def open_scenarios(ctx: ChatCommandContext) -> None:
     open_scenarios_into(ctx.wizard, m_store.room_language(m_store.load_config()))
 
@@ -76,7 +97,10 @@ def open_scenarios_into(wizard: dict[str, Any], lang: str = "en") -> None:
         prompt=m_i18n.words_in("team.what", lang),
         # First, and taken by Enter: a room as before — nothing automatic.
         options=[(m_i18n.words_in("team.none", lang), "none")]
-        + [(f"{m_store.scenario_title(name, lang)} — {m_store.scenario_hint(name, lang)}", name) for name in m_store.SCENARIOS],
+        + [
+            (m_i18n.tr("{p0} — {p1}", p0=m_store.scenario_title(name, lang), p1=m_store.scenario_hint(name, lang)), name)
+            for name in m_store.SCENARIOS
+        ],
     )
 
 
@@ -100,9 +124,26 @@ def room_is_empty(config: dict[str, Any]) -> bool:
     return all(p["id"] in people for p in config["participants"])
 
 
-AGENT_FIELDS = {"role": "Role", "topic": "Topic", "use_model": "Model", "context_trim": "Memory", "reports_to": "Reports to"}
-ROOM_FIELDS = {"lead": "Lead", "goal": "Goal", "round": "Lead's rounds", "output": "Result file", "without_person": "Without you"}
+AGENT_FIELDS = {
+    "role": lambda: m_i18n.tr("Role"),
+    "topic": lambda: m_i18n.tr("Topic"),
+    "use_model": lambda: m_i18n.tr("Model"),
+    "context_trim": lambda: m_i18n.tr("Memory"),
+    "reports_to": lambda: m_i18n.tr("Reports to"),
+}
+ROOM_FIELDS = {
+    "lead": lambda: m_i18n.tr("Lead"),
+    "goal": lambda: m_i18n.tr("Goal"),
+    "round": lambda: m_i18n.tr("Lead's rounds"),
+    "output": lambda: m_i18n.tr("Result file"),
+    "without_person": lambda: m_i18n.tr("Without you"),
+}
 MODELS = {"claude": ["opus", "sonnet", "haiku"], "codex": []}
+
+
+def field_title(key: str) -> str:
+    """A field's name, in the chat's language when it is shown."""
+    return (ROOM_FIELDS | AGENT_FIELDS)[key]()
 
 
 def open_team_menu(ctx: ChatCommandContext, cfg: dict[str, Any]) -> None:
@@ -112,10 +153,15 @@ def open_team_menu(ctx: ChatCommandContext, cfg: dict[str, Any]) -> None:
     ctx.wizard.update(
         step="team_menu",
         from_cmd="/team",
-        prompt="Change the team?",
-        options=[(f"Proposal: {m_store.proposal_words(cfg, m['proposal'])}", f"proposal:{m['id']}") for m in waiting]
-        + [(f"Change {m_text.visible(p.get('label') or p['id'])}…", f"agent:{p['id']}") for p in agents]
-        + [("The room: lead, goal, result file, what is done without you…", "room"), ("Changes — look back, undo…", "history")],
+        prompt=m_i18n.tr("Change the team?"),
+        options=[
+            (m_i18n.tr("Proposal: {p0}", p0=m_store.proposal_words(cfg, m["proposal"])), f"proposal:{m['id']}") for m in waiting
+        ]
+        + [(m_i18n.tr("Change {p0}…", p0=m_text.visible(p.get("label") or p["id"])), f"agent:{p['id']}") for p in agents]
+        + [
+            (m_i18n.tr("The room: lead, goal, result file, what is done without you…"), "room"),
+            (m_i18n.tr("Changes — look back, undo…"), "history"),
+        ],
     )
 
 
@@ -127,20 +173,23 @@ def setting_shown(key: str, value: object, cfg: dict[str, Any]) -> str:
     if key in ("reports_to", "lead"):
         return m_store.whom(str(value), cfg)
     if key == "without_person":
-        return "; ".join(m_store.WITHOUT_PERSON[a] for a in cast("list[str]", value)) or "nothing external"
+        return "; ".join(m_store.WITHOUT_PERSON[a] for a in cast("list[str]", value)) or m_i18n.tr("nothing external")
     return m_text.visible(str(value))
 
 
 def when_words(cfg: dict[str, Any], who: str, key: str) -> str:
     """When a change starts to act — said before it is saved."""
     if who == "room":
-        return "The agents get it with their next assignment."
+        return m_i18n.tr("The agents get it with their next assignment.")
     if key == "use_model":
         # Not /model: Claude saves it as the person's own default for every new session.
-        return f"A model takes effect when the program starts: /restart {m_store.label_of(cfg, who)} — its conversation goes on."
+        return m_i18n.tr(
+            "A model takes effect when the program starts: /restart {p0} — its conversation goes on.",
+            p0=m_store.label_of(cfg, who),
+        )
     if key == "context_trim":
-        return "From its next free minute; what it remembers now is not cut by this."
-    return "It gets its new assignment after its current task."
+        return m_i18n.tr("From its next free minute; what it remembers now is not cut by this.")
+    return m_i18n.tr("It gets its new assignment after its current task.")
 
 
 def field_options(cfg: dict[str, Any], who: str, key: str) -> list[tuple[str, str]]:
@@ -149,26 +198,38 @@ def field_options(cfg: dict[str, Any], who: str, key: str) -> list[tuple[str, st
         if key == "lead":
             return [(m_text.visible(p.get("label") or p["id"]), p["id"]) for p in m_deliver.agents_of(cfg)]
         if key == "round":
-            return [("Every 15 minutes", "15"), ("Every 30 minutes", "30"), ("Every hour", "60"), ("Off", "off")]
+            return [
+                (m_i18n.tr("Every 15 minutes"), "15"),
+                (m_i18n.tr("Every 30 minutes"), "30"),
+                (m_i18n.tr("Every hour"), "60"),
+                (m_i18n.tr("Off"), "off"),
+            ]
         if key == "without_person":
             on = m_store.without_person(cfg)
-            return [(f"{'✓' if a in on else '·'} {words}", f"toggle:{a}") for a, words in m_store.WITHOUT_PERSON.items()]
-        return [("Type it…", "type"), ("None", "default")]
+            return [
+                (m_i18n.tr("{p0} {words}", p0="✓" if a in on else "·", words=words), f"toggle:{a}")
+                for a, words in m_store.WITHOUT_PERSON.items()
+            ]
+        return [(m_i18n.tr("Type it…"), "type"), (m_i18n.tr("None"), "default")]
     p = next(q for q in cfg["participants"] if q["id"] == who)
     kind = m_screen.agent_kind(p)
     if key == "role":
-        rows = [(f"{r} — {words}", r) for r, words in m_store.ROLES.items()]
+        rows = [(m_i18n.tr("{r} — {words}", r=r, words=words), r) for r, words in m_store.ROLES.items()]
     elif key == "use_model":
-        rows = [(name, name) for name in MODELS.get(kind, [])] + [("Another model — type its name…", "type")]
+        rows = [(name, name) for name in MODELS.get(kind, [])] + [(m_i18n.tr("Another model — type its name…"), "type")]
     elif key == "context_trim":
-        rows = [("Compact past 150k", "compact"), ("Clear past 100k", "clear"), ("Keep — leave it to the program", "keep")]
+        rows = [
+            (m_i18n.tr("Compact past 150k"), "compact"),
+            (m_i18n.tr("Clear after handing in work"), "clear"),
+            (m_i18n.tr("Keep — leave it to the program"), "keep"),
+        ]
     elif key == "reports_to":
-        rows = [("The person", "person")] + [
+        rows = [(m_i18n.tr("The person"), "person")] + [
             (m_text.visible(q.get("label") or q["id"]), q["id"]) for q in m_deliver.agents_of(cfg) if q["id"] != who
         ]
     else:
-        rows = [("Type it…", "type")]
-    return rows + [("The default — the scenario's, or the room's", "default")]
+        rows = [(m_i18n.tr("Type it…"), "type")]
+    return rows + [(m_i18n.tr("The default — the scenario's, or the room's"), "default")]
 
 
 def chosen_value(key: str, value: str, cfg: dict[str, Any]) -> object:
@@ -199,13 +260,16 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
         if line == "history":
             records = m_store.read_changes()[-10:]
             if not records:
-                say_("No changes yet.")
+                say_(m_i18n.tr("No changes yet."))
                 return
             ctx.wizard.update(
                 step="team_history",
-                prompt="Undo a change?",
+                prompt=m_i18n.tr("Undo a change?"),
                 options=[
-                    (f"{m_text.local_hm(r.get('at', ''))} · {m_store.change_words(cfg, r)}", f"undo:{r['id']}")
+                    (
+                        m_i18n.tr("{p0} · {p1}", p0=m_text.local_hm(r.get("at", "")), p1=m_store.change_words(cfg, r)),
+                        f"undo:{r['id']}",
+                    )
                     for r in reversed(records)
                 ],
             )
@@ -215,7 +279,8 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
         if who != "room" and who not in m_store.ids_of(cfg):
             return
         rows = []
-        for key, title in fields.items():
+        for key, title_of in fields.items():
+            title = title_of()
             if who == "room":
                 value: object = m_store.lead_of(cfg) if key == "lead" else m_store.team_of(cfg).get(key)
             else:
@@ -224,9 +289,19 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
                 if key == "reports_to":
                     value = m_store.reports_to(m_screen.agent_kind(p), p, cfg)
             own = who == "room" or key in next(q for q in cfg["participants"] if q["id"] == who)
-            rows.append((f"{title}: {setting_shown(key, value, cfg)}{'' if own else ' (the scenario’s)'}", f"field:{key}"))
-        name = "the room" if who == "room" else m_store.label_of(cfg, who)
-        ctx.wizard.update(step="team_card", who=who, prompt=f"Change {name}: which?", options=rows)
+            rows.append(
+                (
+                    m_i18n.tr(
+                        "{title}: {p1}{p2}",
+                        title=title,
+                        p1=setting_shown(key, value, cfg),
+                        p2="" if own else m_i18n.tr(" (the scenario’s)"),
+                    ),
+                    f"field:{key}",
+                )
+            )
+        name = m_i18n.tr("the room") if who == "room" else m_store.label_of(cfg, who)
+        ctx.wizard.update(step="team_card", who=who, prompt=m_i18n.tr("Change {name}: which?", name=name), options=rows)
         return
     if step_ == "team_history":
         rec_id = line.partition(":")[2]
@@ -236,12 +311,15 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
         ctx.wizard.update(
             step="team_undo",
             record=rec_id,
-            prompt="Undo it?",
-            options=[("Undo", "go"), ("Cancel", "back")],
+            prompt=m_i18n.tr("Undo it?"),
+            options=[(m_i18n.tr("Undo"), "go"), (m_i18n.tr("Cancel"), "back")],
         )
         say_(
-            f"Undo: {m_store.change_words(cfg, rec)}. Work done and money spent stay; history cleared from an agent "
-            "does not come back." + "\n" * 4
+            m_i18n.tr(
+                "Undo: {p0}. Work done and money spent stay; history cleared from an agent does not come back.",
+                p0=m_store.change_words(cfg, rec),
+            )
+            + "\n" * 4
         )
         return
     if step_ == "team_undo":
@@ -253,39 +331,41 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
         try:
             rec, left = m_store.undo_changes(rec_id, ctx.args.as_)
         except ValueError as exc:
-            say_(f"! Not undone: {m_text.clean_field(str(exc), 200)}.")
+            say_(m_i18n.tr("! Not undone: {p0}.", p0=m_text.clean_field(str(exc), 200)))
             return
         if rec["changes"]:
-            say_(f"Undone: {m_store.change_words(m_store.load_config(), rec)}.")
+            say_(m_i18n.tr("Undone: {p0}.", p0=m_store.change_words(m_store.load_config(), rec)))
         for why in left:
-            say_(f"! Left as it is: {why}.")
+            say_(m_i18n.tr("! Left as it is: {why}.", why=why))
         return
     if step_ == "team_card":
         key = line.partition(":")[2]
         ctx.wizard.update(
             step="team_field",
             key=key,
-            prompt=f"{(ROOM_FIELDS | AGENT_FIELDS)[key]}:",
+            prompt=f"{field_title(key)}:",
             options=field_options(cfg, ctx.wizard["who"], key),
         )
         return
     if step_ in ("team_field", "team_typed"):
         who, key = ctx.wizard["who"], ctx.wizard["key"]
         if step_ == "team_field" and line == "type":
-            ctx.wizard.update(step="team_typed", options=None, prompt=f"{(ROOM_FIELDS | AGENT_FIELDS)[key]} (Esc to go back):")
+            ctx.wizard.update(step="team_typed", options=None, prompt=m_i18n.tr("{p0} (Esc to go back):", p0=field_title(key)))
             say_(ctx.wizard["prompt"])
             return
         after = line if step_ == "team_typed" else chosen_value(key, line, cfg)
         if who != "room" and key == "role" and (after == "lead") != (who == m_store.lead_of(cfg)):
             # One lead: who leads changes in the room's card, where the one before is given another role.
             say_(
-                "! The room has one lead: change who leads in /team → The room → Lead."
+                m_i18n.tr("! The room has one lead: change who leads in /team → The room → Lead.")
                 + "\n" * (len(ctx.wizard.get("options") or []) + 2)
             )
             return
         why = m_store.change_problem(cfg, who, key, after)
         if why:
-            say_(f"! {why}. Try again." + "\n" * (len(ctx.wizard.get("options") or []) + 2))  # above the menu still open
+            say_(
+                m_i18n.tr("! {why}. Try again.", why=why) + "\n" * (len(ctx.wizard.get("options") or []) + 2)
+            )  # above the menu still open
             return
         before = m_store.explicit_value(cfg, who, key)
         if who == "room" and key == "lead":
@@ -301,10 +381,21 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
             old = m_store.lead_of(cfg)
             changes += [{"who": str(after), "key": "role", "after": "lead"}]
             changes += [{"who": old, "key": "role", "after": "worker"}] if old and old != after else []
-        ctx.wizard.update(step="team_confirm", changes=changes, prompt="Save it?", options=[("Save", "go"), ("Cancel", "back")])
-        name = "the room" if who == "room" else m_store.label_of(cfg, who)
+        ctx.wizard.update(
+            step="team_confirm",
+            changes=changes,
+            prompt=m_i18n.tr("Save it?"),
+            options=[(m_i18n.tr("Save"), "go"), (m_i18n.tr("Cancel"), "back")],
+        )
+        name = m_i18n.tr("the room") if who == "room" else m_store.label_of(cfg, who)
         say_(
-            f"{name} — {(ROOM_FIELDS | AGENT_FIELDS)[key].lower()}: {setting_shown(key, before, cfg)} → {setting_shown(key, after, cfg)}. "
+            m_i18n.tr(
+                "{name} — {p1}: {p2} → {p3}. ",
+                name=name,
+                p1=field_title(key).lower(),
+                p2=setting_shown(key, before, cfg),
+                p3=setting_shown(key, after, cfg),
+            )
             + when_words(cfg, who, key)
             + "\n" * 4  # room for the choice under it
         )
@@ -318,9 +409,9 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
         try:
             rec, _ = m_store.apply_changes(changes, ctx.args.as_)
         except ValueError as exc:
-            say_(f"! Not saved: {exc}.")
+            say_(m_i18n.tr("! Not saved: {exc}.", exc=exc))
             return
-        say_(f"Saved: {m_store.change_words(m_store.load_config(), rec)}.")
+        say_(m_i18n.tr("Saved: {p0}.", p0=m_store.change_words(m_store.load_config(), rec)))
         return
 
 
@@ -334,20 +425,26 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.update(
             step="exit_confirm",
             from_cmd="/exit",
-            prompt="Close chat? Agents keep running",
-            options=[("No", "n"), ("Yes", "y")],
+            prompt=m_i18n.tr("Close chat? Agents keep running"),
+            options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes"), "y")],
         )
         return
     if line in ("/mute", "/unmute", "/unlimit"):
         ctx.wizard.clear()
         people = ctx.people_for(line)
         if not people:
-            say_({"/mute": "No one to mute.", "/unmute": "No one is muted.", "/unlimit": "No one is out of its limit."}[line])
+            say_(
+                {
+                    "/mute": m_i18n.tr("No one to mute."),
+                    "/unmute": m_i18n.tr("No one is muted."),
+                    "/unlimit": m_i18n.tr("No one is out of its limit."),
+                }[line]
+            )
             return
         prompt = {
-            "/mute": "Mute whom? The room stops sending them messages",
-            "/unmute": "Unmute whom?",
-            "/unlimit": "Whose limit is over? The room sends its messages again",
+            "/mute": m_i18n.tr("Mute whom? The room stops sending them messages"),
+            "/unmute": m_i18n.tr("Unmute whom?"),
+            "/unlimit": m_i18n.tr("Whose limit is over? The room sends its messages again"),
         }[line]
         ctx.wizard.update(
             step="mute_pick",
@@ -362,29 +459,33 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.update(
             step="name_pick",
             from_cmd="/name",
-            prompt="Rename whom?",
+            prompt=m_i18n.tr("Rename whom?"),
             options=[(m_store.label_of(ctx.config, x) + (" (you)" if x == ctx.args.as_ else ""), x) for x in ctx.known],
         )
         return
     if line.startswith("/remove "):
         pid = ctx.names.get(line[len("/remove ") :].strip().lower().lstrip("@"))
         if not pid or pid in ("all", ctx.args.as_):
-            say_("Choose someone from the list.")
+            say_(m_i18n.tr("Choose someone from the list."))
             return
         ctx.wizard.clear()
         ctx.wizard.update(
             step="rm_confirm",
             pid=pid,
-            options=[("No", "n"), ("Yes, disconnect", "y")],
-            prompt=f"Disconnect {m_store.label_of(ctx.config, pid)}?",
+            options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes, disconnect"), "y")],
+            prompt=m_i18n.tr("Disconnect {p0}?", p0=m_store.label_of(ctx.config, pid)),
             from_cmd="/remove-name",
         )
-        say_(f"Disconnect {m_store.label_of(ctx.config, pid)}? Room messages will stop. The agent will keep running.")
+        say_(
+            m_i18n.tr(
+                "Disconnect {p0}? Room messages will stop. The agent will keep running.", p0=m_store.label_of(ctx.config, pid)
+            )
+        )
         return
     if line == "/remove":
         people = [pid for pid in ctx.known if pid != ctx.args.as_]
         if not people:
-            say_("No one to disconnect.")
+            say_(m_i18n.tr("No one to disconnect."))
             return
         ctx.wizard.clear()
         ctx.wizard.update(
@@ -393,7 +494,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             from_cmd="/remove",
             options=[(m_store.label_of(ctx.config, x), str(i)) for i, x in enumerate(people, 1)],
         )
-        ctx.wizard["prompt"] = "Choose an agent to disconnect"
+        ctx.wizard["prompt"] = m_i18n.tr("Choose an agent to disconnect")
         say_(ctx.wizard["prompt"] + ".")
         return
     if line == "/help":
@@ -403,7 +504,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         options = []
         for key, title, _, _, _ in ctx.help_tasks:
             if key == "pause":
-                title = "Resume the room" if paused else "Pause the room"
+                title = m_i18n.tr("Resume the room") if paused else m_i18n.tr("Pause the room")
             options.append((m_i18n.help_words(title, lang), key))
         ctx.wizard.update(
             step="help_pick", from_cmd="/help", prompt=m_i18n.help_words("What would you like to do?", lang), options=options
@@ -420,12 +521,12 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         arg = line[3:].strip()
         if arg == "close":
             ctx.close_dm()
-            say_("The private-talk panel is closed.")
+            say_(m_i18n.tr("The private-talk panel is closed."))
             return
         if arg:
             pid = ctx.names.get(arg.lower().lstrip("@"))
             if not pid or pid in ("all", ctx.args.as_):
-                say_("Choose someone from the list.")
+                say_(m_i18n.tr("Choose someone from the list."))
                 return
             ctx.open_dm(pid)
             return
@@ -433,12 +534,12 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         cfg = m_store.load_config()
         others = [q["id"] for q in cfg["participants"] if q["id"] != ctx.args.as_]
         if not others:
-            say_("No agents in the room yet. Add one with /add.")
+            say_(m_i18n.tr("No agents in the room yet. Add one with /add."))
             return
         ctx.wizard.update(
             step="dm_pick",
             from_cmd="/dm",
-            prompt="Talk privately with whom?",
+            prompt=m_i18n.tr("Talk privately with whom?"),
             options=[(m_store.label_of(cfg, x), x) for x in others],
         )
         return
@@ -448,7 +549,11 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         st = m_screen.read_status()
         waiting = [
             (
-                f"‼ {m_store.label_of(cfg, pid)} waits for you: {m_text.clean_field(x.get('detail', ''), 60) or 'needs your input'}",
+                m_i18n.tr(
+                    "‼ {p0} waits for you: {p1}",
+                    p0=m_store.label_of(cfg, pid),
+                    p1=m_text.clean_field(x.get("detail", ""), 60) or "needs your input",
+                ),
                 "agent:" + pid,
             )
             for pid, x in st.items()
@@ -463,29 +568,35 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
 
         def row(m: dict[str, Any], kind: str) -> tuple[str, str]:
             first = m_text.clean_field(m_text.visible(m["text"]).splitlines()[0] if m["text"].strip() else "", 50)
-            where = "Open conversation" if m["from"] in agents else "Open"
-            return f"{m_store.label_of(cfg, m['from'])} {m_text.local_hm(m['at'])} — {first}  · {where}", f"{kind}:{m['id']}"
+            where = m_i18n.tr("Open conversation") if m["from"] in agents else m_i18n.tr("Open")
+            return m_i18n.tr(
+                "{p0} {p1} — {first}  · {where}",
+                p0=m_store.label_of(cfg, m["from"]),
+                p1=m_text.local_hm(m["at"]),
+                first=first,
+                where=where,
+            ), f"{kind}:{m['id']}"
 
         items = [row(m, "msg") for m in unread]
         earlier = [
             row(m, "old")
             for m in reversed([m for m in m_log.for_person(everything, ctx.args.as_, all_time=True) if m["id"] in read][-20:])
         ]
-        waiting = [(label + "  · Open agent terminal", value) for label, value in waiting]
+        waiting = [(label + m_i18n.tr("  · Open agent terminal"), value) for label, value in waiting]
         if not waiting and not items and not earlier:
-            say_("No messages for you yet.")
+            say_(m_i18n.tr("No messages for you yet."))
             return
         others = sum(
             1 for m in everything if m["from"] != ctx.args.as_ and "all" in m["to"] and m["id"] not in read and m not in unread
         )
-        mark = [("✓ Mark all as read", "all:")] if items else []
+        mark = [(m_i18n.tr("✓ Mark all as read"), "all:")] if items else []
         # The line between new and earlier only when there is something new above it: with nothing new
         # the choice started on it, and it looked chosen — the question says it then.
-        line_ = [("── Earlier for you ──", "sep:")] if earlier and (items or waiting) else []
+        line_ = [(m_i18n.tr("── Earlier for you ──"), "sep:")] if earlier and (items or waiting) else []
         new = len(waiting) + len(items)
-        prompt = (f"For you · {new} new" if new else "No unread messages. Earlier messages are below.") + (
-            f" · +{others} for everyone" if others else ""
-        )
+        prompt = (
+            m_i18n.tr("For you · {new} new", new=new) if new else m_i18n.tr("No unread messages. Earlier messages are below.")
+        ) + (m_i18n.tr(" · +{others} for everyone", others=others) if others else "")
         ctx.wizard.update(step="mine_pick", from_cmd="/mine", options=waiting + items + mark + line_ + earlier, prompt=prompt)
         return
     if line == "/restart":
@@ -495,12 +606,12 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             q["id"] for q in cfg["participants"] if q.get("started_by_room") and m_screen.agent_kind(q) in ("claude", "codex")
         ]
         if not mine:
-            say_("No agent the room started. Add one with /add.")
+            say_(m_i18n.tr("No agent the room started. Add one with /add."))
             return
         ctx.wizard.update(
             step="restart_pick",
             from_cmd="/restart",
-            prompt="Restart whom? The conversation continues",
+            prompt=m_i18n.tr("Restart whom? The conversation continues"),
             options=[(m_store.label_of(cfg, x), x) for x in mine],
         )
         return
@@ -508,7 +619,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         # «/answer Bob», from the command menu's names or typed.
         pid = ctx.names.get(line[len("/answer ") :].strip().lower().lstrip("@"))
         if not pid or pid in ("all", ctx.args.as_):
-            say_("Choose someone from the list.")
+            say_(m_i18n.tr("Choose someone from the list."))
             return
         ctx.wizard.clear()
         ctx.wizard.update(step="answer_pick", from_cmd="/answer")
@@ -520,14 +631,18 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         panes = m_deliver.current_panes(cfg)
         others = [p["id"] for p in cfg["participants"] if p["id"] != ctx.args.as_]
         if not others:
-            say_("No agents in the room yet. Add one with /add.")
+            say_(m_i18n.tr("No agents in the room yet. Add one with /add."))
             return
-        prompt = {"/view": "View an agent", "/open": "Open an agent's window", "/answer": "Answer whom?"}[line]
+        prompt = {
+            "/view": m_i18n.tr("View an agent"),
+            "/open": m_i18n.tr("Open an agent's window"),
+            "/answer": m_i18n.tr("Answer whom?"),
+        }[line]
         ctx.wizard.update(
             step=line[1:] + "_pick",
             from_cmd=line,
             prompt=prompt,
-            options=[(m_store.label_of(cfg, x) + ("" if panes.get(x) else " — not in tmux"), x) for x in others],
+            options=[(m_store.label_of(cfg, x) + ("" if panes.get(x) else m_i18n.tr(" — not in tmux")), x) for x in others],
         )
         say_(prompt + ".")
         return
@@ -535,22 +650,26 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.clear()
         ctx.wizard.update(
             step="clear_confirm",
-            options=[("No", "n"), ("Yes, clear the history", "y")],
-            prompt="Clear the room's history?",
+            options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes, clear the history"), "y")],
+            prompt=m_i18n.tr("Clear the room's history?"),
             from_cmd="/clear",
         )
         say_(
-            "Clear the room's history? Everyone's feed starts empty; the messages move to an archive "
-            "in .collab/archive/, they are not deleted."
+            m_i18n.tr(
+                "Clear the room's history? Everyone's feed starts empty; the messages move to an archive in .collab/archive/, they are not deleted."
+            )
         )
         return
     if line == "/stop":
         ctx.wizard.clear()
         _, closing, staying = m_lifecycle.stop_plan(m_store.load_config())
         ctx.wizard.update(
-            step="stop_confirm", options=[("No", "n"), ("Yes, stop the room", "y")], prompt="Stop the room?", from_cmd="/stop"
+            step="stop_confirm",
+            options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes, stop the room"), "y")],
+            prompt=m_i18n.tr("Stop the room?"),
+            from_cmd="/stop",
         )
-        say_("Stop the room? " + m_lifecycle.describe_stop(closing, staying))
+        say_(m_i18n.tr("Stop the room? ") + m_lifecycle.describe_stop(closing, staying))
         return
     if line == "/language":
         # Its own question in both: a person who cannot read the room's language still finds theirs.
@@ -584,6 +703,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             say_(m_i18n.words_in("lang.unchanged", m_store.room_language(ctx.config)))
             return
         m_store.set_room_language(target)
+        m_i18n.speak(target)
         if line == "also":
             m_store.set_user_language(target)
         ctx.refresh_people()  # the room's file changed: the chat reads it again, its menu and help follow
@@ -608,28 +728,28 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.clear()
         if line not in ("go", "decline", "later"):
             # A draft typed while the card opened: it is a message, never a yes.
-            say_("The proposal waits: /team shows it.")
+            say_(m_i18n.tr("The proposal waits: /team shows it."))
             if line.strip():
                 ctx.submit(line)
             return
         if line == "later":
-            say_("It waits: /team shows it.")
+            say_(m_i18n.tr("It waits: /team shows it."))
             return
         if line == "decline":
             m_store.set_proposal_state(mid, "declined")
             m = next((x for x in m_log.read_messages() if x.get("id") == mid), {})
             if m.get("from") in m_store.ids_of(m_store.load_config()):
                 # Unsigned and quiet: not a request a next proposal could name.
-                m_log.append_message(m_text.ROOM, [m["from"]], "Your proposal is declined.", mid)
-            say_("Declined.")
+                m_log.append_message(m_text.ROOM, [m["from"]], m_i18n.tr("Your proposal is declined."), mid)
+            say_(m_i18n.tr("Declined."))
             return
         try:
             lines = m_agents.apply_proposal(mid, ctx.args.as_, digest)
         except Exception as exc:  # noqa: BLE001 — a record anyone could write: said, and the chat stays
-            say_(f"! Not applied: {m_text.clean_field(str(exc), 200)}.")
+            say_(m_i18n.tr("! Not applied: {p0}.", p0=m_text.clean_field(str(exc), 200)))
             return
         except SystemExit as exc:
-            say_(f"! Not applied: {m_text.clean_field(str(exc.code), 200)}.")
+            say_(m_i18n.tr("! Not applied: {p0}.", p0=m_text.clean_field(str(exc.code), 200)))
             return
         for text in lines:
             say_(text)
@@ -643,26 +763,22 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             return
         if line not in m_store.SCENARIOS:
             return
-        missing = m_agents.scenario_unavailable(m_store.SCENARIOS[line])
-        ctx.wizard.update(
-            step="scenario_go",
-            scenario=line,
-            prompt=m_i18n.words_in("team.unavailable", lang, what="; ".join(missing))
-            if missing
-            else m_i18n.words_in("team.launch.question", lang),
-            options=[(m_i18n.words_in("team.back", lang), "back")]
-            if missing
-            else [
-                (m_i18n.words_in("team.launch", lang, agents=agents_words(len(m_store.SCENARIOS[line]["seats"]), lang)), "go"),
-                (m_i18n.words_in("team.back", lang), "back"),
-            ],
-        )
-        # Room under the rows for the choice: the menu is drawn over the feed's bottom lines.
-        say_("\n".join(m_store.scenario_preview(line, lang)) + "\n" * 4)
+        ctx.wizard["draft"] = json.loads(json.dumps(m_store.SCENARIOS[line]["seats"]))  # changed here before the launch
+        ctx.wizard["scenario"] = line
+        show_draft(ctx, say_, lang)
         return
     if ctx.wizard.get("step") == "scenario_go":
         if line == "back":
             ctx.wizard_back()
+            return
+        draft = ctx.wizard["draft"]
+        seats = [(m_text.visible(seat["label"]), str(i)) for i, seat in enumerate(draft)]
+        if line in ("edit", "remove"):
+            ctx.wizard.update(step=f"draft_{line}", prompt=m_i18n.words_in("team.which", lang), options=seats)
+            return
+        if line == "add":
+            roles = [(m_i18n.words_in(f"role.{r}", lang), r) for r in ("worker", "reviewer")]
+            ctx.wizard.update(step="draft_add_role", prompt=m_i18n.words_in("team.add.role", lang), options=roles)
             return
         if line != "go":
             return
@@ -672,9 +788,97 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             say_(m_i18n.words_in("team.has_one", lang))
             return
         say_(m_i18n.words_in("team.starting", lang, title=m_store.scenario_title(name, lang)))
-        started, failed = m_agents.start_scenario(name, str(rp.root))
+        try:
+            started, failed = m_agents.start_scenario(name, str(rp.root), draft)
+        except ValueError as exc:
+            say_(m_i18n.words_in("team.bad", lang, why=m_text.clean_field(str(exc), 200)))
+            return
         ctx.feed(m_text.paint(m_agents.team_started(m_store.load_config(), started, failed), "38;5;252"))
         ctx.refresh_people()
+        return
+    if ctx.wizard.get("step") == "draft_remove":
+        draft = ctx.wizard["draft"]
+        if line.isdigit() and int(line) < len(draft):
+            if draft[int(line)]["role"] == "lead":
+                say_(m_i18n.words_in("team.lead.stays", lang))
+            else:
+                draft.pop(int(line))
+        show_draft(ctx, say_, lang)
+        return
+    if ctx.wizard.get("step") == "draft_edit":
+        if not line.isdigit() or int(line) >= len(ctx.wizard["draft"]):
+            return
+        seat = ctx.wizard["draft"][int(line)]
+        fields = [(m_i18n.words_in(f"team.field.{f}", lang), f) for f in ("role", "topic", "model", "memory")]
+        ctx.wizard.update(
+            step="draft_field", seat=int(line), prompt=m_i18n.words_in("team.field", lang, label=seat["label"]), options=fields
+        )
+        return
+    if ctx.wizard.get("step") == "draft_field":
+        seat = ctx.wizard["draft"][ctx.wizard["seat"]]
+        if line == "role":
+            options = [(m_i18n.words_in(f"role.{r}", lang), r) for r in ("worker", "reviewer")]
+        elif line == "model":
+            options = [(x, x) for x in m_store.MODEL_ORDER.get(seat["kind"], [])] + [
+                (m_i18n.words_in("team.model.other", lang), "type")
+            ]
+        elif line == "memory":
+            options = [(m_i18n.words_in(f"team.memory.{x}", lang), x) for x in ("compact", "clear", "keep")]
+        elif line == "topic":
+            ctx.wizard.update(step="draft_typed", field="topic", options=None, prompt=m_i18n.words_in("team.type", lang))
+            say_(ctx.wizard["prompt"])
+            return
+        else:
+            return
+        if line == "role" and seat["role"] == "lead":
+            say_(m_i18n.words_in("team.lead.stays", lang))
+            show_draft(ctx, say_, lang)
+            return
+        ctx.wizard.update(step="draft_value", field=line, options=options, prompt=m_i18n.words_in(f"team.field.{line}", lang))
+        return
+    if ctx.wizard.get("step") in ("draft_value", "draft_typed"):
+        seat, field = ctx.wizard["draft"][ctx.wizard["seat"]], ctx.wizard["field"]
+        if line == "type":
+            ctx.wizard.update(step="draft_typed", options=None, prompt=m_i18n.words_in("team.type", lang))
+            say_(ctx.wizard["prompt"])
+            return
+        key = str({"model": "use_model", "memory": "context_trim"}.get(field, field))
+        value: object = m_store.MEMORY[line] if field == "memory" and line in m_store.MEMORY else line
+        why = m_store.setting_problem(key, value, {"participants": []})
+        if why:
+            say_(m_i18n.words_in("team.bad", lang, why=why))
+            return
+        seat[key] = value
+        show_draft(ctx, say_, lang)
+        return
+    if ctx.wizard.get("step") == "draft_add_role":
+        if line not in ("worker", "reviewer"):
+            return
+        ctx.wizard.update(step="draft_add_topic", role=line, options=None, prompt=m_i18n.words_in("team.add.topic", lang))
+        say_(ctx.wizard["prompt"])
+        return
+    if ctx.wizard.get("step") == "draft_add_topic":
+        why = m_store.setting_problem("topic", line, {"participants": []})
+        if why:
+            say_(m_i18n.words_in("team.bad", lang, why=why))
+            return
+        draft, role = ctx.wizard["draft"], ctx.wizard["role"]
+        base = m_i18n.words_in(f"role.{role}", lang).capitalize()
+        taken = {seat["label"] for seat in draft} | {seat["seat"] for seat in draft}
+        label = next(n for n in [base] + [m_i18n.tr("{base} {i}", base=base, i=i) for i in range(2, 100)] if n not in taken)
+        sid = next(f"added{i}" for i in range(1, 100) if f"added{i}" not in taken)
+        draft.append(
+            {
+                "seat": sid,
+                "kind": "claude",
+                "label": label,
+                "role": role,
+                "topic": line,
+                "use_model": "sonnet",
+                "context_trim": m_store.MEMORY["clear"],
+            }
+        )
+        show_draft(ctx, say_, lang)
         return
     if line == "/add":
         # Only agents the room starts itself: a session already running somewhere
@@ -682,36 +886,40 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.clear()
         kinds = [k for k in m_screen.PRESETS if shutil.which(m_screen.PRESETS[k]["command"][0])]
         if not kinds:
-            say_("No Claude Code or Codex installation found.")
+            say_(m_i18n.tr("No Claude Code or Codex installation found."))
             return
         ctx.wizard.update(
             step="kind",
             kinds=kinds,
-            prompt="Which agent to start?",
+            prompt=m_i18n.tr("Which agent to start?"),
             from_cmd="/add",
             options=[(m_screen.PRESETS[k]["label"], str(i)) for i, k in enumerate(kinds, 1)],
         )
-        say_("Add an agent. " + ctx.wizard["prompt"])
+        say_(m_i18n.tr("Add an agent. ") + ctx.wizard["prompt"])
         return
     if ctx.wizard.get("step") == "own_name":
         problem = line and (
             m_text.name_problem(line)
-            or ("that is already someone else's name here" if m_store.label_taken(ctx.config, ctx.args.as_, line) else "")
+            or (
+                m_i18n.tr("that is already someone else's name here")
+                if m_store.label_taken(ctx.config, ctx.args.as_, line)
+                else ""
+            )
         )
         if problem:
-            say_(f"! {problem}. Try another name, or Enter to keep yours.")
+            say_(m_i18n.tr("! {problem}. Try another name, or Enter to keep yours.", problem=problem))
             return
         then = ctx.wizard.get("then") or {}
         ctx.wizard.clear()
         if line:
             ctx.handle(f"/name {ctx.args.as_} {line}")
         else:
-            say_(f"You stay {m_store.label_of(ctx.config, ctx.args.as_)}. /name changes it any time.")
+            say_(m_i18n.tr("You stay {p0}. /name changes it any time.", p0=m_store.label_of(ctx.config, ctx.args.as_)))
         ctx.wizard.update(then)  # the welcome, when this is the first visit — after the name is set
         return
     if line == "" and ctx.wizard.get("step") != "folder":  # in «folder» an empty Enter asks again
         ctx.wizard.clear()
-        say_("Canceled.")
+        say_(m_i18n.tr("Canceled."))
         return
     step_ = ctx.wizard.get("step")
     if step_ == "exit_confirm":
@@ -729,7 +937,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         if kind == "all":
             m_log.mark_all_mine_read(ctx.args.as_)
             ctx.count_mine()
-            say_("All marked as read. Only what comes from now on counts.")
+            say_(m_i18n.tr("All marked as read. Only what comes from now on counts."))
             return
         if kind == "sep":
             ctx.run_wizard_step("/mine")  # the line between new and earlier is no choice: the list stays
@@ -773,36 +981,40 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.update(
             step="restart_confirm",
             pid=line,
-            options=[("No", "n"), ("Yes, restart", "y")],
-            prompt=f"Restart {m_store.label_of(cfg, line)}?",
+            options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes, restart"), "y")],
+            prompt=m_i18n.tr("Restart {p0}?", p0=m_store.label_of(cfg, line)),
         )
         say_(
-            f"Restart {m_store.label_of(cfg, line)}? Its program closes and starts again in the same window with "
-            "the same conversation; what it was doing at this moment stops. It reads the room's newest rules."
+            m_i18n.tr(
+                "Restart {p0}? Its program closes and starts again in the same window with the same conversation; what it was doing at this moment stops. It reads the room's newest rules.",
+                p0=m_store.label_of(cfg, line),
+            )
         )
         return
     if step_ == "restart_confirm":
         pid = ctx.wizard["pid"]
         ctx.wizard.clear()
         if line != "y":
-            say_("Canceled.")
+            say_(m_i18n.tr("Canceled."))
             return
         cfg = m_store.load_config()
         q = next((x for x in cfg["participants"] if x["id"] == pid), None)
         if q is None:
-            say_("It is no longer in the room.")
+            say_(m_i18n.tr("It is no longer in the room."))
             return
         found = m_screen.agent_session(q)  # read once, here: restart_agent takes it, not a second search
         if not found:
             ctx.wizard.update(
                 step="restart_fresh",
                 pid=pid,
-                options=[("No", "n"), ("Yes, a new conversation", "y")],
-                prompt=f"{m_store.label_of(cfg, pid)}'s conversation was not found. Start a new one?",
+                options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes, a new conversation"), "y")],
+                prompt=m_i18n.tr("{p0}'s conversation was not found. Start a new one?", p0=m_store.label_of(cfg, pid)),
             )
             say_(
-                f"{m_store.label_of(cfg, pid)}'s conversation was not found. Start it with a new conversation? "
-                "What it knew stays only in its files."
+                m_i18n.tr(
+                    "{p0}'s conversation was not found. Start it with a new conversation? What it knew stays only in its files.",
+                    p0=m_store.label_of(cfg, pid),
+                )
             )
             return
         line, step_ = "go", "restart_go"
@@ -812,22 +1024,22 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         pid = ctx.wizard["pid"]
         ctx.wizard.clear()
         if line != "y":
-            say_("Canceled.")
+            say_(m_i18n.tr("Canceled."))
             return
         step_ = "restart_new"
     if step_ in ("restart_go", "restart_new"):
         cfg = m_store.load_config()
         q = next((x for x in cfg["participants"] if x["id"] == pid), None)
         if q is None:
-            say_("It is no longer in the room.")
+            say_(m_i18n.tr("It is no longer in the room."))
             return
         try:
             m_agents.restart_agent(cfg.get("session", "collab-room"), q, fresh=step_ == "restart_new", sid=found)
         except (m_store.OperationFailed, SystemExit) as exc:
-            ctx.feed(m_text.paint(f"! Could not restart: {exc}", "1;38;5;196"))
+            ctx.feed(m_text.paint(m_i18n.tr("! Could not restart: {exc}", exc=exc), "1;38;5;196"))
             return
-        how = "with a new conversation" if step_ == "restart_new" else "with its conversation"
-        say_(f"Restarting {m_store.label_of(cfg, pid)} {how}. Waiting for a connection check reply.")
+        how = m_i18n.tr("with a new conversation") if step_ == "restart_new" else m_i18n.tr("with its conversation")
+        say_(m_i18n.tr("Restarting {p0} {how}. Waiting for a connection check reply.", p0=m_store.label_of(cfg, pid), how=how))
         ctx.refresh_people()
         return
     if step_ == "mute_pick":
@@ -835,7 +1047,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.clear()
         if line in ctx.known:
             # By id: by name, two of one name muted the last of them.
-            ctx.handle(f"{verb} {line}")
+            ctx.handle(m_i18n.tr("{verb} {line}", verb=verb, line=line))
         return
     if step_ == "name_pick":
         if line not in ctx.known:
@@ -844,17 +1056,17 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             step="rename",
             pid=line,
             options=None,
-            prompt=f"New name for {m_store.label_of(ctx.config, line)} (Enter to save, Esc to go back):",
+            prompt=m_i18n.tr("New name for {p0} (Enter to save, Esc to go back):", p0=m_store.label_of(ctx.config, line)),
         )
         say_(ctx.wizard["prompt"])
         return
     if step_ == "rename":
         pid, label = ctx.wizard["pid"], line
         problem = m_text.name_problem(label) or (
-            "that is already someone else's name here" if m_store.label_taken(ctx.config, pid, label) else ""
+            m_i18n.tr("that is already someone else's name here") if m_store.label_taken(ctx.config, pid, label) else ""
         )
         if problem:
-            say_(f"! {problem}. Try another name.")
+            say_(m_i18n.tr("! {problem}. Try another name.", problem=problem))
             return
         ctx.wizard.clear()
         ctx.handle(f"/name {pid} {label}")
@@ -865,7 +1077,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         if line == "tour":
             ctx.run_wizard_step("/help")
         else:
-            say_("You can open the guide any time: type /help.")
+            say_(m_i18n.tr("You can open the guide any time: type /help."))
             if offer_team(m_store.load_config()):
                 open_scenarios(ctx)
         return
@@ -880,13 +1092,13 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             return  # the menu stays open: Esc closes it
         if key == "pause":
             paused = m_store.load_config().get("paused")
-            action, command = ("Resume the room", "/resume") if paused else ("Pause the room", "/pause")
+            action, command = (m_i18n.tr("Resume the room"), "/resume") if paused else (m_i18n.tr("Pause the room"), "/pause")
         title, action = m_i18n.help_words(title, lang), m_i18n.help_words(action, lang)
         steps = [m_i18n.help_words(x, lang) for x in steps]
         back = m_i18n.words_in("team.back", lang)
         ctx.wizard.update(step="help_task", options=[(action, "go"), (back, "back")], prompt=title, command=command)
         # Room under the steps for the choice: the menu is drawn over the feed's bottom lines.
-        say_(title + "\n" + "\n".join(f"  {i}. {x}" for i, x in enumerate(steps, 1)) + "\n" * 4)
+        say_(title + "\n" + "\n".join(m_i18n.tr("  {i}. {x}", i=i, x=x) for i, x in enumerate(steps, 1)) + "\n" * 4)
         return
     if step_ == "help_task":
         if line == "back":
@@ -904,7 +1116,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         cfg = m_store.load_config()
         pane = m_deliver.current_panes(cfg).get(line)
         if not pane:
-            say_("Live view unavailable: this agent is not in tmux.")
+            say_(m_i18n.tr("Live view unavailable: this agent is not in tmux."))
             return
         ctx.ui.viewing = {"pid": line, "pane": pane, "label": m_store.label_of(cfg, line)}
         ctx.draw_view()
@@ -916,7 +1128,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         cfg = m_store.load_config()
         label = m_store.label_of(cfg, line)
         if not m_deliver.current_panes(cfg).get(line):
-            say_(f"Cannot open {label}'s window: this agent is not in tmux.")
+            say_(m_i18n.tr("Cannot open {label}'s window: this agent is not in tmux.", label=label))
             return
 
         # Opened once the key is handled, outside the chat's lock: holding it while the popup was
@@ -926,12 +1138,16 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             with ctx.lock:
                 if why:
                     say_(
-                        f"Cannot open {label}'s window over the chat: {why}. Use /open for a command to paste into a new terminal tab."
+                        m_i18n.tr(
+                            "Cannot open {label}'s window over the chat: {why}. Use /open for a command to paste into a new terminal tab.",
+                            label=label,
+                            why=why,
+                        )
                     )
                 else:
                     ctx.repaint()
                     # «Answer whom?.» stayed the last line, as if still asked.
-                    say_("Back in the room.")
+                    say_(m_i18n.tr("Back in the room."))
 
         ctx.after_key().append(show_popup)
         return
@@ -940,7 +1156,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.wizard.clear()
         cfg = m_store.load_config()
         if not m_deliver.current_panes(cfg).get(line):
-            say_("Cannot open: this agent is not in tmux.")
+            say_(m_i18n.tr("Cannot open: this agent is not in tmux."))
             return
         command, label = m_agents.open_command(line), m_store.label_of(cfg, line)
         # Say plainly that the command is already in the clipboard — and show it,
@@ -952,7 +1168,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
     if step_ == "clear_confirm":
         ctx.wizard.clear()
         if line.lower() not in ("y", "yes", "д", "да"):
-            say_("Canceled.")
+            say_(m_i18n.tr("Canceled."))
             return
         where = m_log.archive_history()
         # The history ↑ goes too: it kept the old messages and «feed starts empty» was not
@@ -961,46 +1177,50 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         ctx.blocks.clear()
         ctx.ui.older, ctx.ui.top, ctx.ui.unseen = 0, None, 0
         ctx.repaint()
-        say_(f"History cleared. The old messages are in {m_text.tilde(str(where))}.")
+        say_(m_i18n.tr("History cleared. The old messages are in {p0}.", p0=m_text.tilde(str(where))))
         return
     if step_ == "stop_confirm":
         ctx.wizard.clear()
         if line.lower() not in ("y", "yes", "д", "да"):
-            say_("Canceled.")
+            say_(m_i18n.tr("Canceled."))
             return
-        say_("Stopping the room…")
+        say_(m_i18n.tr("Stopping the room…"))
         m_tmuxio.tmux("kill-session", "-t", f"={m_lifecycle.stop_plan(m_store.load_config())[0]}", check=False)
         return
     if step_ == "rm_pick":
         if not line.isdigit() or not 1 <= int(line) <= len(ctx.wizard["people"]):
-            say_("Enter a number from the list.")
+            say_(m_i18n.tr("Enter a number from the list."))
             return
         pid = ctx.wizard["people"][int(line) - 1]
         ctx.wizard.update(
             step="rm_confirm",
             pid=pid,
-            options=[("No", "n"), ("Yes, disconnect", "y")],
-            prompt=f"Disconnect {m_store.label_of(ctx.config, pid)}?",
+            options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes, disconnect"), "y")],
+            prompt=m_i18n.tr("Disconnect {p0}?", p0=m_store.label_of(ctx.config, pid)),
         )
-        say_(f"Disconnect {m_store.label_of(ctx.config, pid)}? Room messages will stop. The agent will keep running.")
+        say_(
+            m_i18n.tr(
+                "Disconnect {p0}? Room messages will stop. The agent will keep running.", p0=m_store.label_of(ctx.config, pid)
+            )
+        )
         return
     if step_ == "rm_confirm":
         if line.lower() not in ("y", "yes", "д", "да"):
             ctx.wizard.clear()
-            say_("Canceled.")
+            say_(m_i18n.tr("Canceled."))
             return
         try:
             label = m_agents.remove_participant(ctx.wizard["pid"])
         except ValueError as exc:
-            say_(f"! {exc}")
+            say_(m_i18n.tr("! {exc}", exc=exc))
         else:
-            say_(f"{label} disconnected from the room.")
+            say_(m_i18n.tr("{label} disconnected from the room.", label=label))
         ctx.wizard.clear()
         ctx.refresh_people()
         return
     if step_ == "kind":
         if not line.isdigit() or not 1 <= int(line) <= len(ctx.wizard["kinds"]):
-            say_("Enter a number from the list.")
+            say_(m_i18n.tr("Enter a number from the list."))
             return
         folders = []
         for f in [str(rp.root), *m_agents.room_folders(ctx.config), *m_boot.recent_folders()]:
@@ -1012,10 +1232,10 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             kind=ctx.wizard["kinds"][int(line) - 1],
             folders=folders,
             options=[(m_text.tilde(f), str(i)) for i, f in enumerate(folders, 1)]
-            + [("Browse folders…", "browse"), ("Enter path manually…", "other")],
-            prompt="Project folder",
+            + [(m_i18n.tr("Browse folders…"), "browse"), (m_i18n.tr("Enter path manually…"), "other")],
+            prompt=m_i18n.tr("Project folder"),
         )
-        say_("Project folder.")
+        say_(m_i18n.tr("Project folder."))
         return
     if step_ == "browse":
         cur = Path(ctx.wizard["cwd"])
@@ -1031,11 +1251,11 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             # In the menu's own header: a line in the feed would be under the open menu, unseen.
             # The choice stays on that row (it jumped to the top of a long list).
             # The folder's name, cleaned: the rows were, the header was not.
-            ctx.wizard["prompt"] = f"Cannot open {m_text.clean_field(line[7:], 60)}/ — choose another folder"
+            ctx.wizard["prompt"] = m_i18n.tr("Cannot open {p0}/ — choose another folder", p0=m_text.clean_field(line[7:], 60))
             ctx.ui.menu_index = next((i for i, (_, v) in enumerate(ctx.wizard["options"]) if v == line), 0)
             return
         elif line == "type":
-            ctx.wizard.update(step="folder", options=None, prompt="Type the folder path (Esc to go back):")
+            ctx.wizard.update(step="folder", options=None, prompt=m_i18n.tr("Type the folder path (Esc to go back):"))
             say_(ctx.wizard["prompt"])
             return
         else:
@@ -1046,11 +1266,11 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         return
     if step_ == "folder_pick":
         if line == "other":
-            ctx.wizard.update(step="folder", options=None, prompt="Type the folder path (Esc to go back):")
+            ctx.wizard.update(step="folder", options=None, prompt=m_i18n.tr("Type the folder path (Esc to go back):"))
             say_(ctx.wizard["prompt"])
             return
         if not line.isdigit() or not 1 <= int(line) <= len(ctx.wizard["folders"]):
-            say_("Choose a folder from the list.")
+            say_(m_i18n.tr("Choose a folder from the list."))
             return
         line = ctx.wizard["folders"][int(line) - 1]
         step_ = "folder"
@@ -1058,12 +1278,12 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         if not line:
             # An empty path never means some other project (Enter after an error
             # started the agent in the room's folder).
-            say_("Enter a folder path, or press Esc to choose from the list.")
+            say_(m_i18n.tr("Enter a folder path, or press Esc to choose from the list."))
             return
         try:
             folder = Path(line).expanduser()
         except RuntimeError:  # «~someone» with no such user: it dropped the whole /add
-            say_(f"Folder not found: {m_text.clean_field(line, 60)}")
+            say_(m_i18n.tr("Folder not found: {p0}", p0=m_text.clean_field(line, 60)))
             return
         problem = m_agents.folder_problem(folder)
         if problem:
@@ -1073,12 +1293,14 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             step="name_new",
             folder=str(folder.resolve()),
             options=None,
-            prompt="Name this agent — Enter takes the suggestion, or type another (Esc to go back):",
+            prompt=m_i18n.tr("Name this agent — Enter takes the suggestion, or type another (Esc to go back):"),
         )
         say_(ctx.wizard["prompt"])
         base = m_screen.PRESETS[ctx.wizard["kind"]]["label"]
         suggestion = next(
-            n for n in [base] + [f"{base} {i}" for i in range(2, 100)] if not m_store.label_taken(ctx.config, "", n)
+            n
+            for n in [base] + [m_i18n.tr("{base} {i}", base=base, i=i) for i in range(2, 100)]
+            if not m_store.label_taken(ctx.config, "", n)
         )
         ctx.buffer()[:] = list(suggestion)
         ctx.ui.pos = len(ctx.buffer())
@@ -1087,24 +1309,24 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
     if step_ == "name_new":
         label = line
         if not label:
-            say_("Enter a name.")
+            say_(m_i18n.tr("Enter a name."))
             return
         # The same checks as /name: /add gave two agents one name.
         problem = m_text.name_problem(label) or (
-            "that is already someone else's name here" if m_store.label_taken(ctx.config, "", label) else ""
+            m_i18n.tr("that is already someone else's name here") if m_store.label_taken(ctx.config, "", label) else ""
         )
         if problem:
-            say_(f"! {problem}. Try another name.")
+            say_(m_i18n.tr("! {problem}. Try another name.", problem=problem))
             return
         try:
             pid = m_agents.launch_new_agent(ctx.config, ctx.wizard["kind"], ctx.wizard["folder"], label)
         except SystemExit as exc:
             # fail() must not close the owner's seat: say it, with the reason, and stay.
             ctx.wizard.clear()
-            ctx.feed(m_text.paint(f"! Could not start the agent: {exc}. Try /add again.", "1;38;5;196"))
+            ctx.feed(m_text.paint(m_i18n.tr("! Could not start the agent: {exc}. Try /add again.", exc=exc), "1;38;5;196"))
             return
-        say_(f"Starting {label} in room window {pid}. Waiting for a connection check reply.")
-        say_(f"Settings: {m_store.settings_words(ctx.wizard['kind'], {'id': pid}, m_store.load_config())}.")
+        say_(m_i18n.tr("Starting {label} in room window {pid}. Waiting for a connection check reply.", label=label, pid=pid))
+        say_(m_i18n.tr("Settings: {p0}.", p0=m_store.settings_words(ctx.wizard["kind"], {"id": pid}, m_store.load_config())))
         ctx.wizard.clear()
         ctx.refresh_people()
         return

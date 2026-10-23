@@ -11,6 +11,7 @@ import datetime as dt
 import json
 import re
 from typing import Any
+import collab.i18n as m_i18n
 import collab.store as m_store
 
 # The kinds of work a plan names: a report sums by them, so they are a fixed set.
@@ -24,7 +25,12 @@ COMMIT = re.compile(r"[0-9a-f]{7,40}")
 
 def check_task_id(task: str) -> str:
     if not TASK_ID.fullmatch(task):
-        m_store.fail(f"a task id is letters, digits, «.», «-» or «_», at most 40, starting with a letter or digit: {task!r}")
+        m_store.fail(
+            m_i18n.tr(
+                "a task id is letters, digits, «.», «-» or «_», at most 40, starting with a letter or digit: {task}",
+                task=repr(task),
+            )
+        )
     return task
 
 
@@ -100,9 +106,9 @@ def task_take(pid: str, task: str, kind: str, lane: str = "", by: str = "") -> d
     """`pid` is on `task` from now. The one it was on, if another, is left — not done."""
     check_task_id(task)
     if kind not in KINDS:
-        m_store.fail(f"kind is one of: {', '.join(KINDS)}")
+        m_store.fail(m_i18n.tr("kind is one of: {p0}", p0=", ".join(KINDS)))
     if lane and lane not in LANES:
-        m_store.fail(f"lane is one of: {', '.join(LANES)}")
+        m_store.fail(m_i18n.tr("lane is one of: {p0}", p0=", ".join(LANES)))
     rp = m_store.room().paths
     at = m_store.now()
     data = current_tasks()
@@ -122,9 +128,9 @@ def task_done(pid: str, task: str, commit: str = "") -> bool:
     it never took is refused: a done without its take counts no time."""
     check_task_id(task)
     if commit and not COMMIT.fullmatch(commit):
-        m_store.fail(f"a commit is its hex id, 7 to 40 characters: {commit!r}")
+        m_store.fail(m_i18n.tr("a commit is its hex id, 7 to 40 characters: {commit}", commit=repr(commit)))
     if not any(e.get("event") == "take" and e.get("pid") == pid and e.get("task") == task for e in task_events()):
-        m_store.fail(f"{pid} never took {task}: take it first (collab task take)")
+        m_store.fail(m_i18n.tr("{pid} never took {task}: take it first (collab task take)", pid=pid, task=task))
     rp = m_store.room().paths
     log_task_event({"at": m_store.now(), "event": "done", "pid": pid, "task": task, "commit": commit})
     data = current_tasks()

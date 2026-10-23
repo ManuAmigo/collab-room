@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
@@ -126,7 +127,7 @@ def chat_old_versions(ctx: ChatFeedContext) -> list[str]:
             if q.get("kind") == "codex" and cli and Path(cli).name != now_name and (q["id"], cli) not in ctx.told_old:
                 ctx.told_old.add((q["id"], cli))
                 who = m_store.label_of(ctx.config, q["id"])
-                lines.append(f"· {who} runs an older collab — /restart {who} when convenient.")
+                lines.append(m_i18n.tr("· {who} runs an older collab — /restart {who_} when convenient.", who=who, who_=who))
     return lines
 
 
@@ -139,7 +140,8 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
     for pid in ctx.known:
         if pid == ctx.args.as_ or pid not in st:
             continue
-        line = m_text.visible(m_screen.describe(pid, st[pid], ctx.args.stale))
+        line = m_text.visible(m_screen.describe(pid, st[pid], ctx.args.stale))  # English: what the chat reads
+        shown_line = m_text.visible(m_screen.describe(pid, st[pid], ctx.args.stale, m_store.room_language(ctx.config)))
         state = st[pid].get("state", "")
         # The bottom line speaks English; messages in the feed stay as they are.
         # An unknown state from status.json is shown cleaned: it may come from an agent.
@@ -172,10 +174,10 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
         if ctx.shown_state.get(pid) != news:
             ctx.shown_state[pid] = news
             if state in ("needs_owner", "lost", "draft"):
-                out.append(m_text.paint(line.replace(pid, m_store.label_of(ctx.config, pid), 1), "1;38;5;196"))
+                out.append(m_text.paint(shown_line.replace(pid, m_store.label_of(ctx.config, pid), 1), "1;38;5;196"))
     if m_store.load_config().get("paused"):
         n = m_log.held_count()
-        parts.insert(0, m_text.paint("Paused" + (f" · {n} waiting" if n else ""), "1;38;5;214"))
+        parts.insert(0, m_text.paint(m_i18n.tr("Paused") + (m_i18n.tr(" · {n} waiting", n=n) if n else ""), "1;38;5;214"))
     rows_ = ctx.status_bar_rows(cells, parts, shutil.get_terminal_size((100, 24)))
     ctx.ui.extra_rows = len(rows_) - 1
     ctx.ui.bar = "\n".join(rows_)
@@ -201,9 +203,9 @@ def chat_fold_into_dm(ctx: ChatFeedContext, m: dict[str, Any]) -> bool:
     read = m_log.read_set(rp.receipts_dir, ctx.args.as_)
     new = sum(1 for x in ctx.dm_talk(m_log.read_messages(), ctx.args.as_, agent) if x["from"] == agent and x["id"] not in read)
     text = m_text.paint(
-        f"· {ctx.me} ⇄ {m_store.label_of(ctx.config, agent)} in /dm · {new} new"
+        m_i18n.tr("· {me} ⇄ {p1} in /dm · {new} new", me=ctx.me, p1=m_store.label_of(ctx.config, agent), new=new)
         if new
-        else f"· {ctx.me} ⇄ {m_store.label_of(ctx.config, agent)} in /dm",
+        else m_i18n.tr("· {me} ⇄ {p1} in /dm", me=ctx.me, p1=m_store.label_of(ctx.config, agent)),
         "2",
     )
     if ctx.folded[0] == agent and ctx.blocks and ctx.blocks[-1] is ctx.folded[1]:
@@ -250,7 +252,7 @@ def chat_pump(ctx: ChatFeedContext) -> None:
             try:
                 tick_log: list[dict[str, Any]] | None = m_log.read_log_tick()
             except m_store.OperationFailed as exc:  # a link in the log: said once, the feed goes on
-                trouble(f"! {exc}")
+                trouble(m_i18n.tr("! {exc}", exc=exc))
                 tick_log = None
             with contextlib.suppress(Exception):
                 before = ctx.ui.mine_count
@@ -273,7 +275,7 @@ def chat_pump(ctx: ChatFeedContext) -> None:
             try:
                 ctx.held_alerts.extend("\n" + alert for alert in ctx.states())
             except Exception as exc:  # noqa: BLE001
-                trouble(f"! Could not read the agents' states: {exc!r}")
+                trouble(m_i18n.tr("! Could not read the agents' states: {exc}", exc=repr(exc)))
             while ctx.held_alerts and not hold:
                 ctx.feed(ctx.held_alerts.pop(0))
             log = [] if hold or tick_log is None else tick_log
@@ -288,7 +290,7 @@ def chat_pump(ctx: ChatFeedContext) -> None:
                         if m["from"] != ctx.args.as_ or m_log.unsigned_person(m, ctx.config):
                             ctx.feed(ctx.show(m))
                     except Exception as exc:  # noqa: BLE001
-                        trouble(f"! Could not show message {m_text.visible(m['id'])}: {exc!r}")
+                        trouble(m_i18n.tr("! Could not show message {p0}: {exc}", p0=m_text.visible(m["id"]), exc=repr(exc)))
             # A proposal for the team waiting for the person: its card opens by itself when no question is open —
             # one Enter applies it. Each once: «Later» leaves it to /team. By the room's record of proposals, which
             # delivery fills — not by the tick's messages, which may come before it is judged.
@@ -309,7 +311,7 @@ def chat_pump(ctx: ChatFeedContext) -> None:
                             ctx.wizard().update(m_store.proposal_card(m, cfg, str(req.get("text") or "")))
                             ctx.ui.redraw_input()
                 except Exception as exc:  # noqa: BLE001
-                    trouble(f"! Could not show a proposal: {exc!r}")
+                    trouble(m_i18n.tr("! Could not show a proposal: {exc}", exc=repr(exc)))
             while sink := m_store.chat_mode().sink:
                 ctx.feed(m_text.paint(sink.pop(0), "38;5;245"))
             if ctx.ui.viewing:
@@ -337,14 +339,17 @@ def chat_refresh_people(ctx: ChatFeedContext) -> bool:
         # once per version of the file; the chat goes on with whom it had; a fixed file is read again.
         ctx.feed(
             m_text.paint(
-                f"! The room's settings can't be read: {m_text.clean_field(str(exc), 200)} — the chat goes on with "
-                "the participants it had; fix .collab.json and it reads them again.",
+                m_i18n.tr(
+                    "! The room's settings can't be read: {p0} — the chat goes on with the participants it had; fix .collab.json and it reads them again.",
+                    p0=m_text.clean_field(str(exc), 200),
+                ),
                 "1;38;5;196",
             )
         )
         return False
     ctx.config.clear()
     ctx.config.update(fresh)
+    m_i18n.speak(m_store.room_language(ctx.config))  # a /language from another chat: this one follows
     ctx.known[:] = m_store.ids_of(ctx.config)
     ctx.names.clear()
     ctx.names.update(m_store.aliases(ctx.config))
@@ -353,5 +358,7 @@ def chat_refresh_people(ctx: ChatFeedContext) -> bool:
         # The chosen recipient left. Do NOT fall back to Everyone: a private draft would leak
         # to the whole room on Enter. Ask for a new choice instead.
         ctx.ui.selected = None
-        ctx.feed(m_text.paint("! The recipient left the room — press Tab to choose who gets your message.", "1;38;5;196"))
+        ctx.feed(
+            m_text.paint(m_i18n.tr("! The recipient left the room — press Tab to choose who gets your message."), "1;38;5;196")
+        )
     return True

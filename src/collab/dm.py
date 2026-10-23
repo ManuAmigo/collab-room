@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
@@ -131,7 +132,7 @@ def cmd_dm(args: argparse.Namespace) -> None:
         return bool(rec) and os.environ.get("TMUX_PANE") == rec["pane"] and str(os.getpid()) == rec["pid"]
 
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        m_store.fail("the /dm panel needs a terminal: open it with /dm in the chat")
+        m_store.fail(m_i18n.tr("the /dm panel needs a terminal: open it with /dm in the chat"))
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
     buf: list[str] = []
@@ -232,9 +233,13 @@ def cmd_dm(args: argparse.Namespace) -> None:
         for row in range(rows):
             out += "\033[2K" + (body[first + row] if first + row < len(body) else "") + "\033[0m\r\n"
         # The keys are on the rule above the input, as in the chat: the two rules are one line across.
-        hint = "━ ↑ History · Ctrl+O chat · Tab tabs · Ctrl+] close · /dm name " if focused else "┄ Ctrl+O here · Tab tabs "
+        hint = (
+            m_i18n.tr("━ ↑ History · Ctrl+O chat · Tab tabs · Ctrl+] close · /dm name ")
+            if focused
+            else m_i18n.tr("┄ Ctrl+O here · Tab tabs ")
+        )
         if top[0] is not None:
-            hint = ("━" if focused else "┄") + " ↑/↓ Earlier/later messages · Esc Latest "
+            hint = ("━" if focused else "┄") + m_i18n.tr(" ↑/↓ Earlier/later messages · Esc Latest ")
         out += f"\033[{h - under};1H\033[2K" + rule(hint)
         for i in range(under):
             out += f"\033[{h - under + 1 + i};1H\033[2K" + (typing[i] if i < len(typing) else "")

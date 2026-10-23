@@ -11,7 +11,10 @@ English until it is changed. `/language` (or `/язык`) changes the room's: Ap
 help, ready teams and the room's words to its agents follow; each agent gets its assignment again, told to answer in
 the room's language. Every chat command has a Russian name too — `/добавить`, `/команда`, `/помощь`, `/язык` … —
 and both work in any room; a Russian room's menu shows the Russian ones. Names, ids, paths, models, what people and
-agents write, and the commands agents run are never translated.
+agents write, and the commands agents run are never translated. The command line speaks its room's language (the person's default outside a
+room), and so do the installer and the room's errors; the room's own lines in the log stay English — agents and old
+chats read them — and a chat retells them in its language. What the program parses itself (an agent's status line,
+a delivery's log) stays English.
 
 ## Starting and choosing a room
 
@@ -263,6 +266,10 @@ Once an agent's commits land through the merge queue, delivery types `/clear` in
 idle moment, after any message waiting for it: the next task does not re-read the last one's history on every
 wake. Only a Claude: a Codex keeps its conversation (the room finds it by its connection check).
 
+A ready team's «clear» memory is `{"do": "clear", "after": "handoff"}`: once the agent has handed in its work — its
+answer (`say --re`) to a task from whom it reports to — it is given `/clear` at its next idle moment, if it owes no
+answer; a note on the way is not handing in. «Compact» goes by a threshold.
+
 A room can also cut a long context: `"context_trim": {"at": 150000, "do": "compact"}` in `.collab.json`; `false` in
 the room or the agent — never. The built-in one is off for now. A Codex is off whatever they say: its `/clear` starts
 a new chat. Once a Claude's latest answer read more than
@@ -310,7 +317,9 @@ A room `collab start` has just created opens its first chat on «What will we do
 context and types nothing of its own — as before ready teams. Then six ready teams (Development, Research, Text,
 Decision, Long work, One assistant).
 Choosing one shows its team as rows — name · role · topic · model · memory · whom it reports to — the result file and
-what is done without you; nothing starts before «Launch the team». A team whose program is not installed is not
+what is done without you, and it can be changed before the launch: an agent's role, topic, model or memory, an agent
+added (a worker or a reviewer, with its topic) or removed; the lead stays — who leads changes after the launch, in
+`/team`. Nothing is written and nothing starts before «Launch the team», which starts the team as changed. A team whose program is not installed is not
 started, and no other program is put in its place unasked. Launching copies the scenario into the room's file
 (`team.seats`, `team.output`) and starts each seat's agent the way `/add` does, with only its `seat` recorded: its
 settings go by the seat. The chat then says how many of how many started and who leads; one that did not start is

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, NoReturn, cast
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 
 
@@ -60,8 +61,12 @@ def log_unreadable(exc: OSError) -> NoReturn:
     rp = m_store.room().paths
     # Only a link is called one: a read a sandbox forbade was reported as «a link».
     if exc.errno == errno.ELOOP:
-        m_store.fail(f"refusing: {rp.messages_path} is a link — the room's state must be its own files")
-    m_store.fail(f"cannot read {rp.messages_path}: {exc.strerror}")
+        m_store.fail(
+            m_i18n.tr(
+                "refusing: {messages_path} is a link — the room's state must be its own files", messages_path=rp.messages_path
+            )
+        )
+    m_store.fail(m_i18n.tr("cannot read {messages_path}: {strerror}", messages_path=rp.messages_path, strerror=exc.strerror))
 
 
 def read_messages() -> list[dict[str, Any]]:
@@ -178,6 +183,7 @@ def append_message(
     silent: bool = False,
     brief: bool = False,
     proposal: dict[str, Any] | None = None,
+    said: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     rp = m_store.room().paths
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": m_store.now(), "from": sender, "to": to, "text": text}
@@ -191,11 +197,21 @@ def append_message(
         record["brief"] = True  # an agent's assignment (deliver.send_briefs): told by this, never by its words
     if proposal is not None:
         record["proposal"] = proposal  # a change of the team the person applies (store.proposal_card)
+    if said is not None:
+        record["said"] = said  # the room's own line: its English template and parameters, retold in the chat's language
     if sign:
         record["sig"] = signature(owner_key(create=True), record)
         mark_signing(record["id"])
     m_store.write_state(rp.messages_path, json.dumps(record, ensure_ascii=False) + "\n", append=True)
     return record
+
+
+def room_line(to: list[str], en: str, silent: bool = False, **params: Any) -> dict[str, Any]:
+    """The room's own line to people, as text in English (agents and old chats read that) and as its template with
+    its parameters — a chat in another language retells it (m_i18n.retell). Each template has its Russian one in
+    the catalog (a test reads every call)."""
+    shown = {k: str(v) for k, v in params.items()}
+    return append_message(m_text.ROOM, to, en.format(**shown) if shown else en, silent=silent, said={"t": en, "p": shown})
 
 
 UNREADABLE_SAID: set[str] = set()

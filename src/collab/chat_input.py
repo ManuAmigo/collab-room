@@ -8,6 +8,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.tmuxio as m_tmuxio
 
 
@@ -213,7 +214,7 @@ def chat_read_keys(ctx: ChatInputContext) -> None:
                         if rec and ctx.dm_window_alive(ctx.args.as_):
                             m_tmuxio.tmux("select-pane", "-t", rec["pane"], check=False)
                         else:
-                            ctx.feed(m_text.paint("No private-talk panel is open — /dm <name> opens one.", "38;5;252"))
+                            ctx.feed(m_text.paint(m_i18n.tr("No private-talk panel is open — /dm <name> opens one."), "38;5;252"))
                         ctx.render()
                         continue
                     if ch == "\x03":
@@ -246,7 +247,9 @@ def chat_read_keys(ctx: ChatInputContext) -> None:
                         and not "".join(ctx.buf).lstrip().startswith(("/", "@"))
                     ):
                         # No recipient chosen: keep the draft, send nothing.
-                        ctx.feed(m_text.paint("! Choose a recipient with Tab first — your text is kept.", "1;38;5;196"))
+                        ctx.feed(
+                            m_text.paint(m_i18n.tr("! Choose a recipient with Tab first — your text is kept."), "1;38;5;196")
+                        )
                     elif ch in "\r\n" and not in_paste:
                         if ctx.buf and ctx.buf[-1] == "\\":
                             # «\» at the end of the line + Enter: a new line, not sending.

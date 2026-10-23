@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence, cast
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 
@@ -95,7 +96,12 @@ def only_own_seat(config: dict[str, Any], pid: str, verb: str) -> None:
         mine = [p["id"] for p in config["participants"] if p.get("claude_session") == sid]
         if pid not in mine:
             m_store.fail(
-                f"an agent {verb} only its own seat ({', '.join(mine) or 'none'}); {pid!r} is someone else's — ask the person"
+                m_i18n.tr(
+                    "an agent {verb} only its own seat ({p1}); {pid} is someone else's — ask the person",
+                    verb=verb,
+                    p1=", ".join(mine) or "none",
+                    pid=repr(pid),
+                )
             )
 
 
@@ -539,7 +545,7 @@ def status_lock() -> contextlib.AbstractContextManager[None]:
         try:
             fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
         except OSError as exc:
-            m_store.fail(f"refusing the status lock: {exc.strerror} (a link in the room's state?)")
+            m_store.fail(m_i18n.tr("refusing the status lock: {strerror} (a link in the room's state?)", strerror=exc.strerror))
         finally:
             os.close(dir_fd)
         try:
@@ -629,7 +635,7 @@ STATE_WORDS = {
 SCREEN_STALE_MIN = 2.0
 
 
-def describe(pid: str, st: dict[str, Any], stale_min: float) -> str:
+def describe(pid: str, st: dict[str, Any], stale_min: float, lang: str = "en") -> str:
     # Cleaned on show too: status.json may be written by others, and `collab status` printed its
     # escape codes straight to the terminal.
     state, detail = st.get("state", "unknown"), m_text.clean_field(str(st.get("detail", "")), 300)
@@ -643,16 +649,29 @@ def describe(pid: str, st: dict[str, Any], stale_min: float) -> str:
         except (KeyError, ValueError):
             age = 0
         if age > limit:
-            why = "" if st.get("source") == "self" else ", delivery is not running"
-            return f"· {pid}: No update for {int(age)} min{why} (last seen: {BAR_WORDS.get(state, state)})"
+            last = m_i18n.status_word(BAR_WORDS.get(state, state), lang)
+            if st.get("source") == "self":
+                return m_i18n.tr("· {pid}: No update for {n} min (last seen: {last})", lang, pid=pid, n=int(age), last=last)
+            return m_i18n.tr(
+                "· {pid}: No update for {n} min, delivery is not running (last seen: {last})",
+                lang,
+                pid=pid,
+                n=int(age),
+                last=last,
+            )
     mark = "‼" if state in ("needs_owner", "lost", "draft") else "·"
     bg = re.fullmatch(r"background (\d+)", detail) if state == "idle" else None
     if bg:
         n = int(bg.group(1))
-        return f"· {pid} is ready · {n} background task" + ("s" if n > 1 else "")
+        if n == 1:
+            return m_i18n.tr("· {pid} is ready · 1 background task", lang, pid=pid)
+        return m_i18n.tr("· {pid} is ready · {n} background tasks", lang, pid=pid, n=n)
     if state == "needs_owner" and not detail:
-        return f"{mark} {pid} needs your input. Open the agent's window to continue."
-    return f"{mark} {pid} {STATE_WORDS.get(state, state)}" + (f": {detail}" if detail else "")
+        return m_i18n.tr("{mark} {pid} needs your input. Open the agent's window to continue.", lang, mark=mark, pid=pid)
+    words = m_i18n.state_words(state, STATE_WORDS.get(state, state), lang)
+    if detail:
+        return m_i18n.tr("{mark} {pid} {words}: {detail}", lang, mark=mark, pid=pid, words=words, detail=detail)
+    return m_i18n.tr("{mark} {pid} {words}", lang, mark=mark, pid=pid, words=words)
 
 
 def args_tail() -> int:
@@ -808,7 +827,7 @@ def caller_session_or_refuse() -> str:
     try:
         return caller_claude_session()
     except Exception as exc:  # noqa: BLE001 — whatever it is, the answer is «not sure», so no
-        m_store.fail(f"could not tell which Claude session runs this command ({exc}); nothing was changed")
+        m_store.fail(m_i18n.tr("could not tell which Claude session runs this command ({exc}); nothing was changed", exc=exc))
         return ""
 
 
@@ -836,8 +855,11 @@ def check_name_is_mine(pid: str, config: dict[str, Any]) -> None:
     sid = caller_session_or_refuse()
     if sid and sid != bound and claude_session_alive(bound):
         m_store.fail(
-            f"«{m_store.label_of(config, pid)}» ({pid}) is another running Claude session in this room. "
-            "Speak under your own ID; a new agent is added by the person with /add."
+            m_i18n.tr(
+                "«{p0}» ({pid}) is another running Claude session in this room. Speak under your own ID; a new agent is added by the person with /add.",
+                p0=m_store.label_of(config, pid),
+                pid=pid,
+            )
         )
 
 

@@ -112,7 +112,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
     ui.menu_line = ""
 
     if tty:
-        prompt = f"\001\033[1;{m_store.color_of(config, args.as_)}m\002{me} ›\001\033[0m\002 "
+        prompt = m_i18n.tr("\u0001\u001b[1;{p0}m\u0002{me} ›\u0001\u001b[0m\u0002 ", p0=m_store.color_of(config, args.as_), me=me)
     else:
         prompt = f"{args.as_}> "
 
@@ -254,13 +254,16 @@ def cmd_chat(args: argparse.Namespace) -> None:
         own = os.environ.get("TMUX_PANE", "")
         if not tty or not signs():
             say_ = lambda text: feed(m_text.paint(text, "38;5;252"))
-            say_("The private-talk panel opens only beside the person's own chat window.")
+            say_(m_i18n.tr("The private-talk panel opens only beside the person's own chat window."))
             m_chat_base.set_dm_tabs(args.as_, [], "")
             return
         width = m_tmuxio.tmux("display-message", "-p", "-t", own, "#{pane_width}", check=False).stdout.strip()
         if not width.isdigit() or int(width) < 90:
             feed(
-                m_text.paint("! The window is too narrow for a panel beside the chat — use /answer, or write here.", "1;38;5;196")
+                m_text.paint(
+                    m_i18n.tr("! The window is too narrow for a panel beside the chat — use /answer, or write here."),
+                    "1;38;5;196",
+                )
             )
             m_chat_base.set_dm_tabs(args.as_, [], "")
             return
@@ -286,7 +289,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         )
         pane, _, ppid = out.stdout.strip().partition(" ")
         if out.returncode != 0 or not pane:
-            feed(m_text.paint(f"! Could not open the panel: {out.stderr.strip()}", "1;38;5;196"))
+            feed(m_text.paint(m_i18n.tr("! Could not open the panel: {p0}", p0=out.stderr.strip()), "1;38;5;196"))
             m_chat_base.set_dm_tabs(args.as_, [], "")
             return
         # Written by this chat alone, with the window's process: only that window signs as the person.
@@ -356,9 +359,12 @@ def cmd_chat(args: argparse.Namespace) -> None:
         return m_chat_feed.chat_pump(feed_context)
 
     if not tty:
-        print(f"collab-room as {args.as_}. Write `@id text` to address, plain text goes to all. Ctrl-D to leave.")
+        print(
+            m_i18n.tr("collab-room as {as_}. Write `@id text` to address, plain text goes to all. Ctrl-D to leave.", as_=args.as_)
+        )
     else:
         setup()
+    m_i18n.speak(m_store.room_language(config))  # the chat speaks its room's language
     welcome = tty and not inst.welcomed_path.exists() and args.as_ in m_store.people_ids(config)
     feed_context = m_chat_feed.ChatFeedContext(
         STALE_CHAT=m_chat_base.STALE_CHAT,
@@ -417,11 +423,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
         # before the latest messages it scrolled out of sight.
         feed(
             m_text.paint(
-                "Welcome to your room\n  Write to your agents here.\n"
-                "  Tab chooses who receives your message. Enter sends it.\n"
-                "  Type / to choose an action. You don't need to remember commands.\n"
-                "  Each agent works in a window of its own — you never need to go there:\n"
-                "  /view shows its screen, /answer opens it to reply, Ctrl+] brings you back.",
+                m_i18n.tr(
+                    "Welcome to your room\n  Write to your agents here.\n  Tab chooses who receives your message. Enter sends it.\n  Type / to choose an action. You don't need to remember commands.\n  Each agent works in a window of its own — you never need to go there:\n  /view shows its screen, /answer opens it to reply, Ctrl+] brings you back."
+                ),
                 "1;38;5;252",
             )
             + "\n" * 4
@@ -440,7 +444,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
     wizard: dict[str, Any] = {}
     if welcome:
         wizard.update(
-            step="welcome", prompt="Welcome to your room", options=[("Show me around", "tour"), ("Skip for now", "skip")]
+            step="welcome",
+            prompt=m_i18n.tr("Welcome to your room"),
+            options=[(m_i18n.tr("Show me around"), "tour"), (m_i18n.tr("Skip for now"), "skip")],
         )
     if tty and not welcome and args.as_ in m_store.people_ids(config) and m_chat_wizard.offer_team(config):
         # A new room: «What will we do?» first — a ready team, or none (Esc, or «No ready team»).
@@ -452,7 +458,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
             step="own_name",
             then=dict(wizard),
             options=None,
-            prompt=f"The room calls you {mine} — your account's name. Your name (Enter keeps {mine}):",
+            prompt=m_i18n.tr(
+                "The room calls you {mine} — your account's name. Your name (Enter keeps {mine_}):", mine=mine, mine_=mine
+            ),
         )
         feed("\n" + wizard["prompt"])
     ui.cfg_mtime = rp.config_path.stat().st_mtime if rp.config_path.exists() else 0.0
@@ -680,22 +688,24 @@ def run_chat(args: argparse.Namespace) -> None:
         rp = m_store.room().paths
         try:
             m_store.write_state(
-                rp.state_dir / "chat-exit.log", f"{m_store.now()} {args.as_} pid {os.getpid()}: {reason}\n", append=True
+                rp.state_dir / "chat-exit.log",
+                m_i18n.tr("{p0} {as_} pid {p2}: {reason}\n", p0=m_store.now(), as_=args.as_, p2=os.getpid(), reason=reason),
+                append=True,
             )
         except (OSError, SystemExit, m_store.OperationFailed):
             pass  # the log must never be why the chat fails
 
     def on_signal(number: int, _frame: Any) -> None:
-        raise SystemExit(f"signal {signal.Signals(number).name}")
+        raise SystemExit(m_i18n.tr("signal {name}", name=signal.Signals(number).name))
 
     for sig in (signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, on_signal)
     code: Any = 0
     try:
         cmd_chat(args)
-        ended("closed: /exit, Ctrl+C or end of input")
+        ended(m_i18n.tr("closed: /exit, Ctrl+C or end of input"))
     except SystemExit as exc:
-        ended(str(exc.code) if isinstance(exc.code, str) else f"exit code {exc.code}")
+        ended(str(exc.code) if isinstance(exc.code, str) else m_i18n.tr("exit code {code}", code=exc.code))
         code = exc.code
     except BaseException:
         ended("crashed:\n" + traceback.format_exc())

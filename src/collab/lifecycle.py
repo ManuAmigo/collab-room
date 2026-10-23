@@ -44,11 +44,15 @@ def default_team() -> dict[str, Any]:
 def cmd_init(args: argparse.Namespace) -> None:
     rp = m_store.room().paths
     if rp.config_path.exists() and not args.force:
-        m_store.fail(f"{rp.config_path.name} already exists (use --force to replace it)")
+        m_store.fail(m_i18n.tr("{name} already exists (use --force to replace it)", name=rp.config_path.name))
     sample = default_team()
     m_store.write_room(sample, args.ask or (sys.stdin.isatty() and not args.no_ask))
     who = ", ".join(p["id"] for p in sample["participants"])
-    print(f"Created the room ({who}) in {rp.base}; the project folder is unchanged. Run `collab start`.")
+    print(
+        m_i18n.tr(
+            "Created the room ({who}) in {base}; the project folder is unchanged. Run `collab start`.", who=who, base=rp.base
+        )
+    )
 
 
 def choose_language() -> None:
@@ -97,7 +101,7 @@ def cmd_home(args: argparse.Namespace) -> None:
         if choice is None:
             if not sys.stdin.isatty():
                 print("\n".join(label for label, _ in rows))
-                print("Run `collab` in a terminal to choose, or `collab start` in a project folder.")
+                print(m_i18n.tr("Run `collab` in a terminal to choose, or `collab start` in a project folder."))
             return
         kind, folder = choice
         if kind != "other":
@@ -110,9 +114,9 @@ def cmd_home(args: argparse.Namespace) -> None:
     rp = m_store.room().paths
     if rp.config_path.is_file():
         if kind != "open":
-            print("A room already exists here. Opening it with its history.")
+            print(m_i18n.tr("A room already exists here. Opening it with its history."))
     else:
-        print(f"Creating a room in {m_text.tilde(str(rp.root))}.")
+        print(m_i18n.tr("Creating a room in {p0}.", p0=m_text.tilde(str(rp.root))))
     cmd_start(args)
 
 
@@ -137,14 +141,18 @@ def start_deliverer(session: str) -> None:
         its_root = words[words.index("--room") + 1] if "--room" in words[:-1] else ""
         if "deliver" in words and its_root and os.path.realpath(its_root) == os.path.realpath(str(rp.root)):
             print(
-                f"A deliverer runs outside the room's window (pid {outside}) — stop it (kill {outside}), "
-                "then run `collab start` again.",
+                m_i18n.tr(
+                    "A deliverer runs outside the room's window (pid {outside}) — stop it (kill {outside_}), then run `collab start` again.",
+                    outside=outside,
+                    outside_=outside,
+                ),
                 file=sys.stderr,
             )
         else:
             print(
-                "A deliverer runs outside the room's window — find it (ps ax | grep 'collab deliver'), "
-                "stop it, then run `collab start` again.",
+                m_i18n.tr(
+                    "A deliverer runs outside the room's window — find it (ps ax | grep 'collab deliver'), stop it, then run `collab start` again."
+                ),
                 file=sys.stderr,
             )
         return
@@ -259,12 +267,13 @@ def not_running(config: dict[str, Any]) -> None:
         pane = data.get("panes", {}).get(p["id"])
         if pane and m_tmuxio.tmux("list-panes", "-t", pane, check=False).returncode == 0:
             continue
-        line = m_text.visible(
-            f"{m_store.label_of(config, p['id'])} is in the room's settings but not running: the room was running "
-            "already, and start only returned to it — collab stop, then collab start starts it (history stays)."
+        rec = m_log.room_line(
+            m_store.people_ids(config),
+            "{name} is in the room's settings but not running: the room was running already, and start only returned to "
+            "it — collab stop, then collab start starts it (history stays).",
+            name=m_text.visible(m_store.label_of(config, p["id"])),
         )
-        print(line)
-        m_log.append_message(m_text.ROOM, m_store.people_ids(config), line)
+        print(rec["text"])
 
 
 @m_store.room_locked
@@ -321,11 +330,11 @@ def cmd_pause(args: argparse.Namespace) -> None:
 def cmd_clear(args: argparse.Namespace) -> None:
     if not args.yes:
         if not sys.stdin.isatty():
-            m_store.fail("add --yes to clear the history without a question")
-        if not m_term.confirm("Clear the room's history? It is moved to an archive, not deleted."):
-            print("Canceled.")
+            m_store.fail(m_i18n.tr("add --yes to clear the history without a question"))
+        if not m_term.confirm(m_i18n.tr("Clear the room's history? It is moved to an archive, not deleted.")):
+            print(m_i18n.tr("Canceled."))
             return
-    print(f"History moved to {m_log.archive_history()}.")
+    print(m_i18n.tr("History moved to {p0}.", p0=m_log.archive_history()))
 
 
 def stop_plan(config: dict[str, Any]) -> tuple[str, list[str], list[str]]:
@@ -362,7 +371,7 @@ def cmd_stop(args: argparse.Namespace) -> None:
     config = m_store.load_config()
     session, closing, staying = stop_plan(config)
     if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
-        print("The room is not running.")
+        print(m_i18n.tr("The room is not running."))
         return
     owner_root = m_tmuxio.session_room(session)
     if owner_root != os.path.realpath(str(rp.root)) and (owner_root or rp.base == rp.root):
@@ -376,12 +385,12 @@ def cmd_stop(args: argparse.Namespace) -> None:
     print(describe_stop(closing, staying))
     if not args.yes:
         if not sys.stdin.isatty():
-            m_store.fail("add --yes to stop the room without a question")
-        if not m_term.confirm("Stop the room? Agents started by the room will be closed."):
-            print("Canceled.")
+            m_store.fail(m_i18n.tr("add --yes to stop the room without a question"))
+        if not m_term.confirm(m_i18n.tr("Stop the room? Agents started by the room will be closed.")):
+            print(m_i18n.tr("Canceled."))
             return
     m_tmuxio.tmux("kill-session", "-t", f"={session}", check=False)
-    print("The room is stopped.")
+    print(m_i18n.tr("The room is stopped."))
 
 
 def room_options(session: str) -> None:
@@ -463,9 +472,13 @@ def move_room_home(args: argparse.Namespace) -> None:
     old_config, old_state = rp.root / ".collab.json", rp.root / ".collab"
     home = m_boot.room_home(rp.root)
     if old_config.is_symlink() or old_state.is_symlink():
-        m_store.fail(f"refusing to move the room: {old_config} or {old_state} is a link")
+        m_store.fail(
+            m_i18n.tr(
+                "refusing to move the room: {old_config} or {old_state} is a link", old_config=old_config, old_state=old_state
+            )
+        )
     if (home / ".collab.json").exists() or (home / ".collab").exists():
-        m_store.fail(f"refusing to move the room: {home} is already there — nothing was changed")
+        m_store.fail(m_i18n.tr("refusing to move the room: {home} is already there — nothing was changed", home=home))
     # Read once, from the checked file itself, and what is shown is what is written to the new home:
     # a second name of .collab.json made in the project moved along with the file and let an agent
     # edit the moved room for good; a link put in place while the person answered was
@@ -479,7 +492,7 @@ def move_room_home(args: argparse.Namespace) -> None:
         data = {}
     # Its shape before anything reads it: «participants»: [1] fell over with a traceback.
     if not isinstance(data.get("participants", []), list) or not all(isinstance(p, dict) for p in data.get("participants", [])):
-        m_store.fail("not moved: .collab.json in the project is not a room's file — check it and run `collab` again")
+        m_store.fail(m_i18n.tr("not moved: .collab.json in the project is not a room's file — check it and run `collab` again"))
     # Everyone but the person's own chat, as this program writes it. One without a command still
     # gets a window from start — a bare shell — and with tmux delivery the room typed a message into
     # it, run by the shell. Only a seat that opens nothing (pane: false) is not asked about.
@@ -491,7 +504,7 @@ def move_room_home(args: argparse.Namespace) -> None:
     if unusual:
         # A target is a window delivery types into: one pointed at the person's chat would make
         # an agent's words look typed there.
-        print("This room's file holds start commands besides your chat, or windows to type into:")
+        print(m_i18n.tr("This room's file holds start commands besides your chat, or windows to type into:"))
         for p in unusual:
             if "target" in p:
                 what = f"types into window {p['target']}" + (f" ({' '.join(map(str, p['command']))})" if p.get("command") else "")
@@ -501,8 +514,8 @@ def move_room_home(args: argparse.Namespace) -> None:
                 what = "opens a shell window" + (" and types messages into it" if p.get("delivery") == "tmux" else "")
             # Anybody's text, shown right before the yes/no: no control codes.
             print("  " + m_text.visible(f"{p.get('id')}: {what}").replace("\n", " "))
-        if not sys.stdin.isatty() or not m_term.confirm("Keep them and start them?"):
-            m_store.fail("not moved; check .collab.json in the project and run `collab` again")
+        if not sys.stdin.isatty() or not m_term.confirm(m_i18n.tr("Keep them and start them?")):
+            m_store.fail(m_i18n.tr("not moved; check .collab.json in the project and run `collab` again"))
     session = data.get("session", "collab-room")
     if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode == 0:
         # The session and the windows come from the project's files, which an agent may write: they
@@ -531,7 +544,7 @@ def move_room_home(args: argparse.Namespace) -> None:
         try:
             src = os.open(str(old_state), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError:
-            m_store.fail(f"refusing to move the room: {old_state} is a link")
+            m_store.fail(m_i18n.tr("refusing to move the room: {old_state} is a link", old_state=old_state))
         try:
             os.mkdir(home / ".collab", 0o700)
             copy_own_files(src, home / ".collab", skipped)
@@ -541,21 +554,21 @@ def move_room_home(args: argparse.Namespace) -> None:
             try:
                 shutil.rmtree(old_state)  # link-safe here (shutil.rmtree.avoids_symlink_attacks)
             except OSError as exc:
-                print(f"The old {old_state} was not removed: {exc.strerror}")
+                print(m_i18n.tr("The old {old_state} was not removed: {strerror}", old_state=old_state, strerror=exc.strerror))
     if raw is not None:
         fd = os.open(str(home / ".collab.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(fd, "wb") as fh:
             fh.write(raw)
         old_config.unlink()
     m_store.use_room(str(rp.root))
-    print(f"Room files moved out of the project: {m_text.tilde(str(home))}")
+    print(m_i18n.tr("Room files moved out of the project: {p0}", p0=m_text.tilde(str(home))))
     if skipped:
         print(
             f"Left in {m_text.tilde(str(old_state))} — links or files with a second name, not the room's own: "
             + ", ".join(skipped)
         )
         if ".collab/messages.jsonl" in skipped:
-            print("The room's history was among them: the moved room starts without it.")
+            print(m_i18n.tr("The room's history was among them: the moved room starts without it."))
 
 
 def project_file_bytes(path: Path) -> bytes | None:
@@ -566,11 +579,11 @@ def project_file_bytes(path: Path) -> bytes | None:
     except FileNotFoundError:
         return None
     except OSError:
-        m_store.fail(f"refusing to move the room: {path} is a link")
+        m_store.fail(m_i18n.tr("refusing to move the room: {path} is a link", path=path))
     with os.fdopen(fd, "rb") as fh:
         info = os.fstat(fh.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            m_store.fail(f"refusing to move the room: {path} is a link or has a second name")
+            m_store.fail(m_i18n.tr("refusing to move the room: {path} is a link or has a second name", path=path))
         return fh.read()
 
 
@@ -727,15 +740,17 @@ def open_room_windows(
 def cmd_start(args: argparse.Namespace) -> None:
     rp = m_store.room().paths
     if shutil.which(m_tmuxio.TMUX) is None:
-        m_store.fail(f"tmux is required: {m_tmuxio.tmux_install_hint()}, and run `collab start` again")
+        m_store.fail(m_i18n.tr("tmux is required: {p0}, and run `collab start` again", p0=m_tmuxio.tmux_install_hint()))
     venv = m_tmuxio.leave_venv()
     if venv:
-        print(f"The active venv {m_text.tilde(venv)} is left out of the room: its windows run without it.")
+        print(m_i18n.tr("The active venv {p0} is left out of the room: its windows run without it.", p0=m_text.tilde(venv)))
     m_log.owner_key(create=True)  # installed before this feature or removed: the room makes its own
     if not all(c.isprintable() for c in str(rp.root)):
         # The room's path is in every hint typed into an agent's window: a «\r» in a folder's name pressed
         # Enter there mid-message, an ESC was a key.
-        m_store.fail(f"the project folder's path has control characters: {m_text.tilde(str(rp.root))} — rename the folder")
+        m_store.fail(
+            m_i18n.tr("the project folder's path has control characters: {p0} — rename the folder", p0=m_text.tilde(str(rp.root)))
+        )
     if not rp.config_path.is_file():
         # First start in this project: create the room right here — with the person only.
         # It used to seat and start every installed agent («maybe I won't have
@@ -747,7 +762,9 @@ def cmd_start(args: argparse.Namespace) -> None:
         team["language"] = m_store.user_language()  # the person's default; a room made before speaks English
         m_store.write_room(team, sys.stdin.isatty())
         m_store.replace_state(m_store.offer_team_path(), m_store.now() + "\n")  # «What will we do?» at its first chat
-        print(f"Room created for {team['participants'][0]['label']}. Pick a ready team or add agents in the chat.")
+        print(
+            m_i18n.tr("Room created for {p0}. Pick a ready team or add agents in the chat.", p0=team["participants"][0]["label"])
+        )
     if rp.base == rp.root:
         move_room_home(args)
         rp = m_store.room().paths
@@ -757,10 +774,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     config = m_store.load_config()
     if not m_tmuxio.tmux_can_read(rp.root):
         m_store.fail(
-            f"tmux cannot open {m_text.tilde(str(rp.root))}: macOS keeps this folder private from the program "
-            "that started tmux (Documents, Desktop and Downloads are protected), so every window of the "
-            "room would close at once — the «[exited]» you saw. Use a project folder outside them, or "
-            "allow access in System Settings → Privacy & Security → Files and Folders."
+            m_i18n.tr(
+                "tmux cannot open {p0}: macOS keeps this folder private from the program that started tmux (Documents, Desktop and Downloads are protected), so every window of the room would close at once — the «[exited]» you saw. Use a project folder outside them, or allow access in System Settings → Privacy & Security → Files and Folders.",
+                p0=m_text.tilde(str(rp.root)),
+            )
         )
     m_agents.remember_room()
     session = getattr(args, "session", None) or config.get("session", "collab-room")
@@ -768,7 +785,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         # `start --session X` ran the room as X, but /add and /restart read the room's file and opened
         # their windows in the session named there — not this one. The name is the room's now.
         if not m_store.WORD.fullmatch(session):
-            m_store.fail("--session must be 1 to 64 letters, digits, _ and -")
+            m_store.fail(m_i18n.tr("--session must be 1 to 64 letters, digits, _ and -"))
         config["session"] = session
         m_store.write_config(config)
     owner_root = (
@@ -780,7 +797,13 @@ def cmd_start(args: argparse.Namespace) -> None:
         session = m_boot.room_session_name(rp.root)
         config["session"] = session
         m_store.write_config(config)
-        print(f"The tmux session name was another room's ({m_text.tilde(owner_root)}); this room now uses {session}.")
+        print(
+            m_i18n.tr(
+                "The tmux session name was another room's ({p0}); this room now uses {session}.",
+                p0=m_text.tilde(owner_root),
+                session=session,
+            )
+        )
     # `=name` is the exact name: without it tmux finds a session by its beginning ("room" would match "room-old").
     if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode == 0:
         # Running already: return to it. Agents and the queue stay as they are; the deliverer is
@@ -820,7 +843,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 continue
             panes[p["id"]] = m_tmuxio.exact(p["target"])
     if not own:
-        m_store.fail("nobody needs a pane here; add a participant without `target` (e.g. the owner's chat)")
+        m_store.fail(m_i18n.tr("nobody needs a pane here; add a participant without `target` (e.g. the owner's chat)"))
     try:
         kept = open_room_windows(session, config, own, relaunch, gone, panes)
     except BaseException:
@@ -835,16 +858,20 @@ def cmd_start(args: argparse.Namespace) -> None:
         + (f" Started again: {', '.join(p['id'] for p in relaunch)}." if relaunch else "")
     )
     for p, why in gone:
-        line = m_text.visible(
-            f"{m_store.label_of(config, p['id'])}: its window {p['target']} — {why.rstrip('.')}. It gets no messages "
-            f"until its window is there again; /remove {m_store.label_of(config, p['id'])} takes it out of the room."
-        )
-        print(line)
+        name = m_text.visible(m_store.label_of(config, p["id"]))
         m_screen.write_status(p["id"], "lost", why, "screen")
-        m_log.append_message(m_text.ROOM, m_store.people_ids(config), line)
+        rec = m_log.room_line(
+            m_store.people_ids(config),
+            "{name}: its window {target} — {why}. It gets no messages until its window is there again; /remove {name} "
+            "takes it out of the room.",
+            name=name,
+            target=m_text.visible(str(p["target"])),
+            why=m_text.visible(why.rstrip(".")),
+        )
+        print(rec["text"])
     if True:  # always: agents added later through /add need the deliverer too
         if os.environ.get("COLLAB_NO_AUTODELIVER"):
-            print("Run `collab deliver` (any terminal) so tmux participants receive their messages.")
+            print(m_i18n.tr("Run `collab deliver` (any terminal) so tmux participants receive their messages."))
         else:
             # The deliverer lives in the room's own hidden window: no second terminal to keep open,
             # and it ends with the room.

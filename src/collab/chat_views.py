@@ -3,6 +3,7 @@ import shlex
 from pathlib import Path
 from typing import Any, Callable
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.log as m_log
 
@@ -19,17 +20,17 @@ def view_frame(label: str, returncode: int, shot: str, h: int, w: int) -> tuple[
     body = (
         [m_text.colours_only(x) for x in shot.rstrip("\n").split("\n")]
         if returncode == 0
-        else ["", m_text.paint("  Live view unavailable: the agent's window is gone", "1;38;5;196")]
+        else ["", m_text.paint(m_i18n.tr("  Live view unavailable: the agent's window is gone"), "1;38;5;196")]
     )
     while body and not m_text.ANSI.sub("", body[-1]).strip():
         body.pop()  # the capture is the window's full height: its empty bottom is not the screen
     area = max(1, h - 4)
-    lines = [m_text.paint(f" Live view · {label} · Read-only ", "1;7")] + body[-(area - 1) :]
+    lines = [m_text.paint(m_i18n.tr(" Live view · {label} · Read-only ", label=label), "1;7")] + body[-(area - 1) :]
     out = "\0337"
     for r in range(area):
         text = lines[r] if r < len(lines) else ""
         out += f"\033[{r + 1};1H\033[2K" + (m_text.wrap_visible(text, w - 1)[0] if text else "") + "\033[0m"
-    return out + "\0338", m_text.paint("── Esc — Back to chat " + "─" * max(0, min(w, 120) - 22), "1;38;5;214")
+    return out + "\0338", m_text.paint(m_i18n.tr("── Esc — Back to chat ") + "─" * max(0, min(w, 120) - 22), "1;38;5;214")
 
 
 def history_frame(lines: list[str], top: int, area: int) -> str:
@@ -44,9 +45,9 @@ def history_frame(lines: list[str], top: int, area: int) -> str:
 
 def history_hint(older: Any, top: Any, unseen: int, w: int) -> str:
     """The line over the input while the person reads history."""
-    first = "Beginning of the room · " if not older and top == 0 else ""
-    new = f" · {unseen} new" if unseen else ""
-    label = f"── {first}↑/↓ Earlier/later messages · Esc Latest{new} "
+    first = m_i18n.tr("Beginning of the room · ") if not older and top == 0 else ""
+    new = m_i18n.tr(" · {unseen} new", unseen=unseen) if unseen else ""
+    label = m_i18n.tr("── {first}↑/↓ Earlier/later messages · Esc Latest{new} ", first=first, new=new)
     return m_text.paint(label + "─" * max(0, min(w, 120) - len(label)), "1;38;5;214")
 
 
@@ -115,13 +116,26 @@ def reading_frame(
                 # The quote is text on the person's screen too: cleaned, and a line «from the person»
                 # the chat did not sign is marked, as in the feed.
                 first = m_text.clean_field(m_text.visible(orig["text"]).replace("→", "->"), 80)
-                forged = " ⚠ not from the chat" if m_log.unsigned_person(orig, config) else ""
+                forged = m_i18n.tr(" ⚠ not from the chat") if m_log.unsigned_person(orig, config) else ""
                 # «your message» only when it is: an agent's answer to its own words read as the
                 # person's, with no ⚠.
                 whose = (
-                    "your message" if orig.get("from") == me else f"{m_store.label_of(config, orig.get('from', ''))}'s message"
+                    m_i18n.tr("your message")
+                    if orig.get("from") == me
+                    else m_i18n.tr("{p0}'s message", p0=m_store.label_of(config, orig.get("from", "")))
                 )
-                body.append(m_text.paint(f"  ↳ to {whose} of {m_text.local_hm(orig['at'])}: «{first}»{forged}", "2"))
+                body.append(
+                    m_text.paint(
+                        m_i18n.tr(
+                            "  ↳ to {whose} of {p1}: «{first}»{forged}",
+                            whose=whose,
+                            p1=m_text.local_hm(orig["at"]),
+                            first=first,
+                            forged=forged,
+                        ),
+                        "2",
+                    )
+                )
         body += [piece for line in pretty(config, m, w - 1, 0).split("\n") for piece in m_text.wrap_visible(line, w - 1)]
     area = max(1, h - 4)
     title = f" /mine · {reading['at'] + 1} of {len(reading['ids'])} "
@@ -130,8 +144,12 @@ def reading_frame(
         rest = len(body) - (area - 2)
         body = body[: area - 2] + [
             m_text.paint(
-                f"… {rest} more lines — collab show {shlex.quote(m_text.visible(str(m['id'])))}"
-                f" --room {shlex.quote(m_text.tilde(str(root)))}",
+                m_i18n.tr(
+                    "… {rest} more lines — collab show {p1} --room {p2}",
+                    rest=rest,
+                    p1=shlex.quote(m_text.visible(str(m["id"]))),
+                    p2=shlex.quote(m_text.tilde(str(root))),
+                ),
                 "2",
             )
         ]
@@ -140,5 +158,5 @@ def reading_frame(
     for row in range(area):
         text = lines[row] if row < len(lines) else ""
         out += f"\033[{row + 1};1H\033[2K" + (m_text.wrap_visible(text, w - 1)[0] if text else "") + "\033[0m"
-    keys_ = "── ↑/↓ Previous / next · Enter or Esc — back to the list "
+    keys_ = m_i18n.tr("── ↑/↓ Previous / next · Enter or Esc — back to the list ")
     return out + "\0338", m_text.paint(keys_ + "─" * max(0, min(w, 120) - len(keys_)), "1;38;5;214"), m

@@ -10,6 +10,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
@@ -20,10 +21,15 @@ def fmt(message: dict[str, Any], with_id: bool = True, config: dict[str, Any] | 
     # One line, whatever the fields hold: a line break in «to» faked an «[owner → …]» line.
     head = " ".join(
         m_text.visible(
-            f"[{message['from']} → {', '.join(map(str, message['to']))}] {m_text.local_hm(str(message['at']))}"
+            m_i18n.tr(
+                "[{p0} → {p1}] {p2}",
+                p0=message["from"],
+                p1=", ".join(map(str, message["to"])),
+                p2=m_text.local_hm(str(message["at"])),
+            )
         ).split()
     )
-    tail = f"\n  id: {' '.join(m_text.visible(str(message['id'])).split())}" if with_id else ""
+    tail = m_i18n.tr("\n  id: {p0}", p0=" ".join(m_text.visible(str(message["id"])).split())) if with_id else ""
     warn = m_deliver.UNSIGNED + "\n" if config and m_log.unsigned_person(message, config) else ""
     # The text indented: a head starts at the line's first column, a line of a text never does.
     body = "\n".join("  " + line if line else "" for line in m_text.body_text(message["text"]).split("\n"))
@@ -41,7 +47,11 @@ WHOLE = "\x1e"  # a feed line that starts so is never cut into lines: a command 
 
 # The top border of the chat and of its /dm panel (not «Private» — the log is shared; «Direct messages»
 # says how they are addressed, «DM» where the border is tight).
-BORDER_CHAT, BORDER_DM, BORDER_DM_SHORT = "{room} · Room chat", "Direct messages · {name}", "DM · {name}"
+BORDER_CHAT, BORDER_DM, BORDER_DM_SHORT = (
+    "{room} · Room chat",
+    "Direct messages · {name}",
+    "DM · {name}",
+)
 
 
 def input_head(config: dict[str, Any], me: str, to: str | None, limit: int = 0) -> str:
@@ -50,7 +60,7 @@ def input_head(config: dict[str, Any], me: str, to: str | None, limit: int = 0) 
     the names give way so the head takes at most that many columns: in 24 columns, or with a long
     name, the input ran past the window onto the states row."""
     mine = m_store.label_of(config, me)
-    theirs = "choose with Tab" if to is None else m_store.label_of(config, to)
+    theirs = m_i18n.tr("choose with Tab") if to is None else m_store.label_of(config, to)
     if limit and m_text.text_cols(mine) + m_text.text_cols(theirs) + 6 > limit:
         each = max(3, (limit - 6) // 2)
         mine = m_text.fit_cols(mine, each).rstrip() if m_text.text_cols(mine) > each else mine
@@ -60,7 +70,7 @@ def input_head(config: dict[str, Any], me: str, to: str | None, limit: int = 0) 
         target = m_text.paint(theirs, "1;38;5;196")
     else:
         target = m_text.paint(theirs, "1;" + (m_store.color_of(config, to) if to != "all" else "37"))
-    return f"{who} {m_text.paint('→', '2')} {target} {m_text.paint('›', '2')} "
+    return m_i18n.tr("{who} {p1} {target} {p3} ", who=who, p1=m_text.paint("→", "2"), target=target, p3=m_text.paint("›", "2"))
 
 
 def pretty(config: dict[str, Any], m: dict[str, Any], width: int, max_lines: int) -> str:
@@ -72,13 +82,15 @@ def pretty(config: dict[str, Any], m: dict[str, Any], width: int, max_lines: int
     rp = m_store.room().paths
     who = m_text.paint(m_store.label_of(config, m["from"]), "1;" + m_store.color_of(config, m["from"]))
     to = ", ".join(m_store.label_of(config, t) for t in m["to"])
-    head = f"{who} {m_text.paint('→ ' + to + ' · ' + m_text.visible(m_text.local_hm(str(m.get('at', '')))), '2')}"
+    head = m_i18n.tr(
+        "{who} {p1}", who=who, p1=m_text.paint("→ " + to + " · " + m_text.visible(m_text.local_hm(str(m.get("at", "")))), "2")
+    )
     if m_log.unsigned_person(m, config):
-        head += " " + m_text.paint("⚠ not from the chat", "1;38;5;196")
+        head += " " + m_text.paint(m_i18n.tr("⚠ not from the chat"), "1;38;5;196")
     body: list[str] = []
     # «→» in a text is drawn «->»: only the room draws a head with «→», and a body line «Anna →
     # Everyone · 13:05» read as a head.
-    for para in m_text.body_text(m["text"]).splitlines() or [""]:
+    for para in m_text.body_text(m_i18n.retell(m)).splitlines() or [""]:
         body.extend(m_text.wrap_cols(para, max(20, width - 2)) or [""])
     if max_lines and len(body) > max_lines:
         rest = len(body) - (max_lines - 1)
@@ -86,7 +98,12 @@ def pretty(config: dict[str, Any], m: dict[str, Any], width: int, max_lines: int
         # The id quoted too: a forged log line with id «x; command» made the hint a command to paste.
         body = body[: max_lines - 1] + [
             m_text.paint(
-                f"… {rest} more lines — collab show {shlex.quote(m_text.visible(str(m['id'])))} --room {shlex.quote(m_text.tilde(str(rp.root)))}",
+                m_i18n.tr(
+                    "… {rest} more lines — collab show {p1} --room {p2}",
+                    rest=rest,
+                    p1=shlex.quote(m_text.visible(str(m["id"]))),
+                    p2=shlex.quote(m_text.tilde(str(rp.root))),
+                ),
                 "2",
             )
         ]
@@ -101,8 +118,8 @@ def feed_block(config: dict[str, Any], m: dict[str, Any], width: int, max_lines:
         return pretty(config, m, width, max_lines)
     to = ", ".join(m_store.label_of(config, t) for t in m["to"])
     when = m_text.visible(m_text.local_hm(str(m.get("at", ""))))
-    text = " ".join(m_text.body_text(m["text"]).split())
-    line = f"{m_store.label_of(config, m['from'])} → {to} · {when}  {text}"
+    text = " ".join(m_text.body_text(m_i18n.retell(m)).split())
+    line = m_i18n.tr("{p0} → {to} · {when}  {text}", p0=m_store.label_of(config, m["from"]), to=to, when=when, text=text)
     if m_text.text_cols(line) > width:
         line = m_text.cut_cols(line, max(1, width - 1)) + "…"
     return "\n" + m_text.paint(line, "2")
@@ -181,7 +198,7 @@ def status_bar_rows(cells: list[tuple[str, str, str, str, str, int]], parts: lis
     for name, model, short, mark, since, fill in cells:
         rendered.append(
             m_text.paint(
-                f" {m_text.status_cell(mark, name, short if words else '', model, since, inner - 2)} ",
+                f" {m_text.status_cell(mark, name, m_i18n.status_word(short) if words else '', model, since, inner - 2)} ",
                 f"1;38;5;16;48;5;{fill}",
             )
         )
@@ -250,17 +267,17 @@ def input_hint(chars: int, mine: int, dm_open: bool, here: bool, history: str | 
     """The line over the input: history, the draft's size, or what to press — by situation."""
     # Above a draft, how to drop it at once (a long pasted text could not be
     # selected and deleted).
-    hint = f"── {chars} chars · Ctrl+U Clear draft "
+    hint = m_i18n.tr("── {chars} chars · Ctrl+U Clear draft ", chars=chars)
     # One line of help above the input, by situation («show how to see history when
     # nothing is typed, so nobody has to look for it» — above the input, not in it: a dim hint in
     # the input was once taken for typed text).
-    idle = "── ↑ History · / Commands · Tab Recipient "
+    idle = m_i18n.tr("── ↑ History · / Commands · Tab Recipient ")
     if mine:
-        idle = f"── ● {mine} for you · /mine " + idle[3:]
+        idle = m_i18n.tr("── ● {mine} for you · /mine ", mine=mine) + idle[3:]
     # With a /dm panel beside it: Ctrl+O goes there, and the half where typing goes is bright —
     # the other one dim («unclear how to get back to the chat»).
     if dm_open:
-        idle = ("━━ " if here else "┄┄ ") + idle[3:] + "· Ctrl+O → DM "
+        idle = ("━━ " if here else "┄┄ ") + idle[3:] + m_i18n.tr("· Ctrl+O → DM ")
     fill = ("━" if here else "┄") if dm_open else "─"
     look = ("1;38;5;214" if here else "2") if dm_open else "2"
     return (

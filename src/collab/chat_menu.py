@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 import collab.text as m_text
+import collab.i18n as m_i18n
 import collab.chat_base as m_chat_base
 
 
@@ -72,7 +73,7 @@ def chat_draw_menu(ctx: ChatMenuContext, items: list[tuple[str, str, str]], h: i
         # The menu covers the bottom of the feed, where the question was said — so the
         # question heads the menu itself, or the choices come without what they answer.
         more = f"{ctx.ui.menu_index % len(items) + 1}/{len(items)}  " if len(items) > cap else ""
-        hint = "  ↑↓ choose · Enter select · Esc back"
+        hint = m_i18n.tr("  ↑↓ choose · Enter select · Esc back")
         # One row, never wrapped: a long folder path gives way in its middle, the end is its name.
         prompt = ctx.wizard.get("prompt", "Choose")
         if len(more) + m_text.text_cols(prompt) + len(hint) + 3 > w:
@@ -82,7 +83,7 @@ def chat_draw_menu(ctx: ChatMenuContext, items: list[tuple[str, str, str]], h: i
             prompt = m_text.cut_cols(prompt, space // 2 - 1) + "…" + m_text.cut_cols(prompt, space - space // 2, from_end=True)
         header = m_text.paint(f"  {more}", "2") + m_text.paint(prompt, "1") + m_text.paint(hint, "2")
     else:
-        header = m_text.paint(m_text.cut_cols("  ↑↓ choose · Enter select · keep typing to filter", w - 1), "2")
+        header = m_text.paint(m_text.cut_cols(m_i18n.tr("  ↑↓ choose · Enter select · keep typing to filter"), w - 1), "2")
     # Each row written over the old one, then the rest of the line erased: erasing first left
     # it blank for a moment on every key.
     out += f"\033[{top};1H" + header + "\033[K"
@@ -95,7 +96,9 @@ def chat_draw_menu(ctx: ChatMenuContext, items: list[tuple[str, str, str]], h: i
     for i, (label, _, hint) in enumerate(rows_):
         mark = "›" if i == sel else " "
         cell = fit(label, label_w)
-        text = f" {mark} {cell}{' ' * (label_w - m_text.text_cols(cell))}" + (f"   {hint}" if hint else "")
+        text = m_i18n.tr(" {mark} {cell}{p2}", mark=mark, cell=cell, p2=" " * (label_w - m_text.text_cols(cell))) + (
+            f"   {hint}" if hint else ""
+        )
         text = m_text.cut_cols(text, w - 1)  # columns: CJK paths cut at half the width they took
         out += f"\033[{top + 1 + i};1H" + (m_text.paint(text, "1;38;5;75") if i == sel else text) + "\033[K"
     sys.stdout.write(out + "\0338")

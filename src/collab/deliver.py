@@ -99,7 +99,7 @@ def confirm_joins(config: dict[str, Any], messages: list[dict[str, Any]]) -> Non
                 # about working or ready: unknown until the agent's own hook or screen says.
                 if (m_screen.read_status().get(p["id"]) or {}).get("state") == "joining":
                     m_screen._write_status(p["id"], "unknown", "", "self")
-            m_log.append_message(m_text.ROOM, ["all"], f"{p.get('label') or p['id']} connected.", silent=True)
+            m_log.room_line(["all"], "{name} connected.", silent=True, name=p.get("label") or p["id"])
 
 
 # Agents' messages to each other in a row with no word from a person: past it the room pauses and asks
@@ -168,11 +168,11 @@ def pause_for_talk(config: dict[str, Any], n: int) -> None:
     data["paused"] = True
     m_store.write_config(data)
     m_tmuxio.tmux("set-option", "-t", f"={data.get('session', 'collab-room')}:", "@collab_paused", "1", check=False)
-    m_log.append_message(
-        m_text.ROOM,
+    m_log.room_line(
         m_store.people_ids(config),
-        f"Agents wrote {n} messages to each other in a row without you, each waking an agent with its whole "
+        "Agents wrote {n} messages to each other in a row without you, each waking an agent with its whole "
         "context. The room is paused: what they say waits. /resume lets them go on.",
+        n=n,
     )
 
 
@@ -183,15 +183,15 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     config = m_store.load_config()
     known = m_store.ids_of(config)
     if args.sender not in known:
-        m_store.fail(f"unknown sender {args.sender!r}")
+        m_store.fail(m_i18n.tr("unknown sender {sender}", sender=repr(args.sender)))
     to = args.to or ["all"]
     bad = [t for t in to if t not in known and t not in m_text.SPECIAL]
     if bad:
-        m_store.fail(f"unknown recipient(s): {', '.join(bad)}")
+        m_store.fail(m_i18n.tr("unknown recipient(s): {p0}", p0=", ".join(bad)))
     if not text.strip():
-        m_store.fail("message cannot be empty")
+        m_store.fail(m_i18n.tr("message cannot be empty"))
     if args.re and not any(m["id"] == args.re for m in m_log.read_messages()):
-        m_store.fail(f"no message {args.re} to reply to")
+        m_store.fail(m_i18n.tr("no message {re} to reply to", re=args.re))
     m_screen.check_name_is_mine(args.sender, config)
     quiet = bool(getattr(args, "quiet", False))
     silent = bool(getattr(args, "silent", False))  # the room's own notes (merge queue): never typed
@@ -203,13 +203,13 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     if quiet and args.re:
         # An answer is waited for by whoever asked: quiet, it waited for their next message — and an agent
         # with no task asks the room nothing. An answer always wakes.
-        m_store.fail("--quiet is for notes nobody answers; an answer (--re) is never quiet")
+        m_store.fail(m_i18n.tr("--quiet is for notes nobody answers; an answer (--re) is never quiet"))
     if config.get("paused") and args.sender not in m_store.people_ids(config):
         # Paused: agents must stop talking. What an agent still says is kept, not
         # lost, and goes out on resume.
         held = {"from": args.sender, "to": to, "text": text.strip(), "re": args.re or "", "quiet": quiet, "silent": silent}
         m_store.write_state(rp.held_path, json.dumps(held, ensure_ascii=False) + "\n", append=True)
-        print("Held: the room is paused; your message goes out when it resumes.")
+        print(m_i18n.tr("Held: the room is paused; your message goes out when it resumes."))
         return
     record = m_log.append_message(args.sender, to, text.strip(), args.re or "", quiet=quiet, silent=silent)
     streak = 0 if args.sender in m_store.people_ids(config) else talk_streak(m_log.read_messages(), config)
@@ -221,11 +221,15 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     # config it cannot parse, is no reason to fail the say. Any other error is ours and shows.
     with contextlib.suppress(OSError, ValueError, KeyError, m_store.OperationFailed):
         m_screen.bind_claude_session(args.sender)
-    print(f"Queued {record['id']} from {args.sender} to {', '.join(to)}.")
+    print(m_i18n.tr("Queued {p0} from {sender} to {p2}.", p0=record["id"], sender=args.sender, p2=", ".join(to)))
     limit = config.get("talk_limit", TALK_LIMIT)
     if limit and streak >= limit:
         pause_for_talk(config, streak)
-        print(f"Paused: agents wrote {streak} messages to each other without the person; wait for the person.")
+        print(
+            m_i18n.tr(
+                "Paused: agents wrote {streak} messages to each other without the person; wait for the person.", streak=streak
+            )
+        )
 
 
 def waits_of(awaiting: dict[str, Any], pid: str) -> list[dict[str, Any]]:
@@ -290,15 +294,21 @@ def watch_for_reply(p: dict[str, Any], state: str, messages: list[dict[str, Any]
     to = sorted({w["from"] for w in alerts if w["from"] in m_store.people_ids(m_store.config_now())}) or m_store.people_ids(
         m_store.config_now()
     )
-    many = lambda n: "" if n == 1 else f" ({n} messages)"
-    if silent:
-        m_log.append_message(
-            m_text.ROOM, to, f"{who} is idle, but hasn't replied in the room{many(len(silent))}. Check the agent's window."
+    if len(silent) == 1:
+        m_log.room_line(to, "{who} is idle, but hasn't replied in the room. Check the agent's window.", who=who)
+    elif silent:
+        m_log.room_line(
+            to, "{who} is idle, but hasn't replied in the room ({n} messages). Check the agent's window.", who=who, n=len(silent)
         )
-    if unstarted:
-        # Never started: the message was typed but not taken up — a delivery problem, not silence.
-        m_log.append_message(
-            m_text.ROOM, to, f"{who} received a message but never started on it{many(len(unstarted))}. Check the agent's window."
+    # Never started: the message was typed but not taken up — a delivery problem, not silence.
+    if len(unstarted) == 1:
+        m_log.room_line(to, "{who} received a message but never started on it. Check the agent's window.", who=who)
+    elif unstarted:
+        m_log.room_line(
+            to,
+            "{who} received a message but never started on it ({n} messages). Check the agent's window.",
+            who=who,
+            n=len(unstarted),
         )
 
 
@@ -336,9 +346,7 @@ def hold_for_limit(p: dict[str, Any], pane: str, state: str, config: dict[str, A
         rec["over"] = t
         limits[p["id"]] = rec
         m_store.write_json(rp.limits_path, limits)
-        m_log.append_message(
-            m_text.ROOM, m_store.people_ids(config), f"{p.get('label') or p['id']} is back from its usage limit."
-        )
+        m_log.room_line(m_store.people_ids(config), "{name} is back from its usage limit.", name=p.get("label") or p["id"])
         return False
     line = m_screen.usage_limit(pane, kind=m_screen.agent_kind(p), shot=shot) if state == "idle" else ""
     # The same line again is a new limit once something was typed after the last one ended — the
@@ -382,10 +390,12 @@ def hold_for_limit(p: dict[str, Any], pane: str, state: str, config: dict[str, A
         m_log.write_set(rp.delivered_dir, p["id"], m_log.read_set(rp.delivered_dir, p["id"]) - again)
     who = p.get("label") or p["id"]
     hm = m_text.until_hm(until)
-    m_log.append_message(
-        m_text.ROOM,
+    m_log.room_line(
         m_store.people_ids(config),
-        f"{who} is out of its usage limit until about {hm}. Messages to it wait and go out again then ({len(again)} to resend).",
+        "{who} is out of its usage limit until about {hm}. Messages to it wait and go out again then ({n} to resend).",
+        who=who,
+        hm=hm,
+        n=len(again),
     )
     return True
 
@@ -407,7 +417,7 @@ def deliver_once(config: dict[str, Any], panes: dict[str, str]) -> list[tuple[st
         try:
             typed = deliver_one(p, pane, config, messages)
         except (Exception, SystemExit) as exc:  # noqa: BLE001
-            print(f"delivery to {p['id']} failed: {exc}", file=sys.stderr)
+            print(m_i18n.tr("delivery to {p0} failed: {exc}", p0=p["id"], exc=exc), file=sys.stderr)
             continue
         if typed:
             done.append((p["id"], typed))
@@ -455,8 +465,12 @@ def tell_outside_changes(config: dict[str, Any]) -> None:
     except SystemExit:
         return  # the room's file unreadable for now: load_config says why; the tick goes on
     if rec:
-        line = f"⚠ Settings changed outside the chat: {m_store.change_words(config, rec)}. /team → Changes can undo it."
-        m_log.append_message(m_text.ROOM, m_store.people_ids(config) or ["all"], line, silent=True)
+        m_log.room_line(
+            m_store.people_ids(config) or ["all"],
+            "⚠ Settings changed outside the chat: {what}. /team → Changes can undo it.",
+            silent=True,
+            what=m_store.change_words(config, rec),
+        )
 
 
 @m_store.room_locked
@@ -506,8 +520,13 @@ def handle_proposals(config: dict[str, Any], recent: list[dict[str, Any]]) -> No
             continue
         m_store.set_proposal_state(m["id"], "applied")
         who = m_store.label_of(config, str(m["from"]))
-        line = f"By your request, {who} changed: {m_store.change_words(m_store.load_config(), rec)}. /team → Changes can undo it."
-        m_log.append_message(m_text.ROOM, people, line, silent=True)
+        m_log.room_line(
+            people,
+            "By your request, {who} changed: {what}. /team → Changes can undo it.",
+            silent=True,
+            who=who,
+            what=m_store.change_words(m_store.load_config(), rec),
+        )
 
 
 @m_store.room_locked
@@ -530,12 +549,13 @@ def tell_setting_changes(config: dict[str, Any]) -> None:
         if isinstance(old, dict) and new and old != new:
             what = ", ".join(f"{k} {v}" for k, v in new.items() if old.get(k) != v)
             words.append(f"{p.get('label') or p['id']} — {what}")
-    lines = [f"Settings changed: {'; '.join(words)}."] if words else []
+    if words:
+        m_log.room_line(people or ["all"], "Settings changed: {what}.", silent=True, what="; ".join(words))
     raw: object = seen.get("problems")
     old_problems = cast("list[object]", raw) if isinstance(raw, list) else []
-    lines += [f"Setting ignored — {why}." for why in problems if why not in old_problems]
-    for line in lines:
-        m_log.append_message(m_text.ROOM, people or ["all"], line, silent=True)
+    for why in problems:
+        if why not in old_problems:
+            m_log.room_line(people or ["all"], "Setting ignored — {why}.", silent=True, why=why)
 
 
 def brief_path() -> Path:
@@ -968,6 +988,15 @@ def trim_due(p: dict[str, Any], config: dict[str, Any], messages: list[dict[str,
     ctx, at = m_ledger.context_of(p["id"])
     done = m_store.read_json(trim_path()).get(p["id"])
     done = done if isinstance(done, dict) else {}
+    if rule == m_store.HANDOFF_CLEAR:
+        # Handed in: its answer (--re) to a task from whom it reports to, since its last /clear.
+        to = m_store.reports_to(m_screen.agent_kind(p), p, config)
+        asked = {m["id"] for m in messages if m.get("from") == to and p["id"] in m.get("to", [])}
+        given = str(done.get("given") or "")
+        handed = any(m.get("from") == p["id"] and m.get("re") in asked and str(m.get("at") or "") > given for m in messages)
+        if not handed or in_merge_queue(p["id"]) or owes_answer(p["id"], config, messages, given):
+            return None
+        return "clear", ctx, 0
     if ctx < rule["at"] or at <= str(done.get("answer") or ""):
         return None
     if in_merge_queue(p["id"]):
@@ -985,12 +1014,21 @@ def trim_agent(p: dict[str, Any], pane: str, config: dict[str, Any], due: tuple[
         m_log.write_set(clear_dir(), p["id"], set())
     trimmed(p["id"])
     # In the person's chat only, never typed: what a day of it saved is measured against these.
-    m_log.append_message(
-        m_text.ROOM,
-        m_store.people_ids(config) or ["all"],
-        f"{p.get('label') or p['id']}: context {ctx // 1000}k tokens, past {at // 1000}k — given /{do}.",
-        silent=True,
-    )
+    name = p.get("label") or p["id"]
+    if not at:
+        m_log.room_line(
+            m_store.people_ids(config) or ["all"], "{name}: handed in its work — given /clear.", silent=True, name=name
+        )
+    else:
+        m_log.room_line(
+            m_store.people_ids(config) or ["all"],
+            "{name}: context {k}k tokens, past {at}k — given /{do}.",
+            silent=True,
+            name=name,
+            k=ctx // 1000,
+            at=at // 1000,
+            do=do,
+        )
     stop_if_asked()
     return f"{do} {p['id']}"
 
@@ -1047,7 +1085,7 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
             # «to» typed a fake «[owner → …]» line without the ⚠ mark. Skipped.
             delivered |= {str(m.get("id")) for m in bad}
             m_log.write_set(rp.delivered_dir, p["id"], delivered)
-            print(f"skipped {len(bad)} malformed message(s) for {p['id']}", file=sys.stderr, flush=True)
+            print(m_i18n.tr("skipped {p0} malformed message(s) for {p1}", p0=len(bad), p1=p["id"]), file=sys.stderr, flush=True)
             pending = [m for m in pending if m_store.well_formed(m)]
             if not pending:
                 return ""
@@ -1084,7 +1122,11 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
             # The window went away, or tmux refused: these messages wait, the others go on.
             STOPPING["typing"] = False
             with contextlib.suppress(OSError):
-                print(f"could not type {batch[0]['id']} into {p['id']}: {sent.stderr.strip()}", file=sys.stderr, flush=True)
+                print(
+                    m_i18n.tr("could not type {p0} into {p1}: {p2}", p0=batch[0]["id"], p1=p["id"], p2=sent.stderr.strip()),
+                    file=sys.stderr,
+                    flush=True,
+                )
             stop_if_asked()
             return ""
         m_log.write_set(rp.delivered_dir, p["id"], delivered | {m["id"] for m in batch})
@@ -1121,7 +1163,7 @@ def cmd_deliver(args: argparse.Namespace) -> None:
     config = m_store.load_config()
     panes = current_panes(config)
     if not any(p.get("delivery") == "tmux" and p["id"] in panes for p in config["participants"]) and not args.idle_ok:
-        m_store.fail("no tmux participant has a pane; run `collab start` or set `target`")
+        m_store.fail(m_i18n.tr("no tmux participant has a pane; run `collab start` or set `target`"))
     if args.from_now:
         for p in config["participants"]:
             if p.get("delivery") == "tmux":
@@ -1163,8 +1205,9 @@ def cmd_deliver(args: argparse.Namespace) -> None:
             return  # the room's own deliverer is running; it delivers
         # What to do, not only what is.
         m_store.fail(
-            "another deliverer is already running for this room — it delivers, nothing to do; "
-            "to restart it, run `collab start` (it replaces the room's deliverer)"
+            m_i18n.tr(
+                "another deliverer is already running for this room — it delivers, nothing to do; to restart it, run `collab start` (it replaces the room's deliverer)"
+            )
         )
     # Who holds it: `start` replaces only the deliverer in the room's window and must name another.
     os.ftruncate(lock, 0)
@@ -1181,17 +1224,17 @@ def cmd_deliver(args: argparse.Namespace) -> None:
                 panes = current_panes(config)
                 confirm_joins(config, m_log.read_log_tick())
                 for pid, mid in deliver_once(config, panes):
-                    print(f"delivered {mid} → {pid}", flush=True)
+                    print(f"delivered {mid} → {pid}", flush=True)  # the deliverer's own log: English
             except SystemExit as exc:
                 if args.once:
                     raise
                 # A tick that failed must not end delivery: it stopped silently and agents were
                 # left without mail while the room looked fine.
-                print(f"delivery tick failed: {exc}", file=sys.stderr, flush=True)
+                print(m_i18n.tr("delivery tick failed: {exc}", exc=exc), file=sys.stderr, flush=True)
             except Exception as exc:  # noqa: BLE001 — same: report, and the next tick tries again
                 if args.once:
                     raise
-                print(f"delivery tick failed: {exc!r}", file=sys.stderr, flush=True)
+                print(m_i18n.tr("delivery tick failed: {exc}", exc=repr(exc)), file=sys.stderr, flush=True)
             if args.once:
                 return
             time.sleep(args.interval)

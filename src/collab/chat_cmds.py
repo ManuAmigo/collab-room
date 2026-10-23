@@ -42,7 +42,7 @@ def chat_wizard_back(ctx: m_chat_wizard.ChatCommandContext) -> None:
     if ctx.wizard.get("step") == "welcome":
         m_agents.mark_welcomed()  # Esc is «Skip for now»: the welcome does not come back
         ctx.wizard.clear()
-        ctx.feed(m_text.paint("You can open the guide any time: type /help.", "38;5;252"))
+        ctx.feed(m_text.paint(m_i18n.tr("You can open the guide any time: type /help."), "38;5;252"))
         if m_chat_wizard.offer_team(m_store.load_config()):
             m_chat_wizard.open_scenarios(ctx)  # as «Skip for now» does: a new room's question comes next
         return
@@ -81,8 +81,8 @@ def chat_ask_exit(ctx: m_chat_wizard.ChatCommandContext) -> None:
         step="exit_confirm",
         prev=prev,
         draft=draft,
-        prompt="Close chat? Agents keep running",
-        options=[("No", "n"), ("Yes", "y")],
+        prompt=m_i18n.tr("Close chat? Agents keep running"),
+        options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes"), "y")],
     )
     ctx.ui.menu_index = 0
 
@@ -97,7 +97,12 @@ def chat_stay_open(ctx: m_chat_wizard.ChatCommandContext) -> None:
 
 
 def chat_show_folders(ctx: m_chat_wizard.ChatCommandContext, cur: Path) -> None:
-    ctx.wizard.update(step="browse", cwd=str(cur), options=m_agents.folder_rows(cur), prompt=f"Folder: {m_text.tilde(str(cur))}")
+    ctx.wizard.update(
+        step="browse",
+        cwd=str(cur),
+        options=m_agents.folder_rows(cur),
+        prompt=m_i18n.tr("Folder: {p0}", p0=m_text.tilde(str(cur))),
+    )
     ctx.ui.menu_index = 0
 
 
@@ -113,7 +118,10 @@ def chat_submit(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
         text = exc.code if isinstance(exc, SystemExit) else str(exc)
         ctx.wizard.clear()
         ctx.feed(
-            m_text.paint(f"! Couldn't do that: {text if isinstance(text, str) and text else type(exc).__name__}", "1;38;5;196")
+            m_text.paint(
+                m_i18n.tr("! Couldn't do that: {p0}", p0=text if isinstance(text, str) and text else type(exc).__name__),
+                "1;38;5;196",
+            )
         )
 
 
@@ -154,9 +162,11 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
         m_lifecycle.set_paused(line == "/pause")
         ctx.feed(
             m_text.paint(
-                "Room paused — agents get no messages, and what they say waits until /resume. A started turn may still finish."
+                m_i18n.tr(
+                    "Room paused — agents get no messages, and what they say waits until /resume. A started turn may still finish."
+                )
                 if line == "/pause"
-                else "Room resumed — waiting messages go out now.",
+                else m_i18n.tr("Room resumed — waiting messages go out now."),
                 "1;38;5;214",
             )
         )
@@ -167,33 +177,47 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
         if not who:
             ctx.feed(
                 m_text.paint(
-                    f"! {verb} <name>; names: {', '.join(m_store.label_of(ctx.config, x) for x in ctx.known if x != ctx.args.as_)}",
+                    m_i18n.tr(
+                        "! {verb} <name>; names: {p1}",
+                        verb=verb,
+                        p1=", ".join(m_store.label_of(ctx.config, x) for x in ctx.known if x != ctx.args.as_),
+                    ),
                     "1;38;5;196",
                 )
             )
             return
         pid = ctx.names.get(who.lower().lstrip("@"))
         if not pid or pid == "all":
-            ctx.feed(m_text.paint(f"! No participant {who}", "1;38;5;196"))
+            ctx.feed(m_text.paint(m_i18n.tr("! No participant {who}", who=who), "1;38;5;196"))
             return
         if verb == "/unlimit":
             # The limit was raised, the agent sits idle — its messages held until the recorded time.
             try:
                 label, had = m_agents.clear_limit(pid)
             except ValueError as exc:
-                ctx.feed(m_text.paint(f"! {exc}", "1;38;5;196"))
+                ctx.feed(m_text.paint(m_i18n.tr("! {exc}", exc=exc), "1;38;5;196"))
                 return
-            text = f"{label}'s usage limit cleared — messages go to it again." if had else f"{label} is not out of its limit."
+            text = (
+                m_i18n.tr("{label}'s usage limit cleared — messages go to it again.", label=label)
+                if had
+                else m_i18n.tr("{label} is not out of its limit.", label=label)
+            )
             ctx.feed(m_text.paint(text, "38;5;252"))
             return
         try:
             label = m_agents.set_muted(pid, verb == "/mute")
         except ValueError as exc:
-            ctx.feed(m_text.paint(f"! {exc}", "1;38;5;196"))
+            ctx.feed(m_text.paint(m_i18n.tr("! {exc}", exc=exc), "1;38;5;196"))
             return
         ctx.feed(
             m_text.paint(
-                f"{label} {'muted — only messages to it by name reach it' if verb == '/mute' else 'unmuted — it hears new messages again'}.",
+                m_i18n.tr(
+                    "{label} {p1}.",
+                    label=label,
+                    p1="muted — only messages to it by name reach it"
+                    if verb == "/mute"
+                    else "unmuted — it hears new messages again",
+                ),
                 "38;5;252",
             )
         )
@@ -204,12 +228,14 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
     if line.startswith("/name"):
         parts = line.split(maxsplit=2)
         if len(parts) < 3 or parts[1] not in ctx.known:
-            ctx.feed(m_text.paint(f"! /name <ID> <Name>; IDs: {', '.join(ctx.known)}", "1;38;5;196"))
+            ctx.feed(m_text.paint(m_i18n.tr("! /name <ID> <Name>; IDs: {p0}", p0=", ".join(ctx.known)), "1;38;5;196"))
             return
         if m_text.name_problem(parts[2]) or m_store.label_taken(ctx.config, parts[1], parts[2]):
             ctx.feed(
                 m_text.paint(
-                    f"! {m_text.name_problem(parts[2]) or 'that is already someone else' + chr(39) + 's name here'}",
+                    m_i18n.tr(
+                        "! {p0}", p0=m_text.name_problem(parts[2]) or "that is already someone else" + chr(39) + "s name here"
+                    ),
                     "1;38;5;196",
                 )
             )
@@ -222,7 +248,9 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
             ctx.config.update(ctx.holder["config"])
             ctx.names.clear()
             ctx.names.update(m_store.aliases(ctx.config))
-            m = m_log.append_message(ctx.args.as_, ["all"], f"{old} is now called {parts[2]}.", sign=ctx.signs())
+            m = m_log.append_message(
+                ctx.args.as_, ["all"], m_i18n.tr("{old} is now called {p1}.", old=old, p1=parts[2]), sign=ctx.signs()
+            )
             ctx.printed.add(m["id"])
             ctx.feed(ctx.show(m))
         return
@@ -234,9 +262,9 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
         near = difflib.get_close_matches(word, known_cmds, n=1)
         ctx.feed(
             m_text.paint(
-                f"! Unknown command {word}"
-                + (f" — did you mean {near[0]}?" if near else "")
-                + " To send text that starts with /, begin it with //.",
+                m_i18n.tr("! Unknown command {word}", word=word)
+                + (m_i18n.tr(" — did you mean {p0}?", p0=near[0]) if near else "")
+                + m_i18n.tr(" To send text that starts with /, begin it with //."),
                 "1;38;5;196",
             )
         )
@@ -247,15 +275,15 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
         if line.startswith("@"):
             to, text = m_store.parse_addressing(line, ctx.known, ctx.names)
         elif ctx.ui.selected is None:
-            ctx.feed(m_text.paint("! Choose a recipient with Tab first.", "1;38;5;196"))
+            ctx.feed(m_text.paint(m_i18n.tr("! Choose a recipient with Tab first."), "1;38;5;196"))
             return
         else:
             to, text = [ctx.ui.selected], line
     except ValueError as exc:
-        ctx.feed(m_text.paint(f"! {exc}", "1;38;5;196"))
+        ctx.feed(m_text.paint(m_i18n.tr("! {exc}", exc=exc), "1;38;5;196"))
         return
     if not text:
-        ctx.feed(m_text.paint("! empty message", "1;38;5;196"))
+        ctx.feed(m_text.paint(m_i18n.tr("! empty message"), "1;38;5;196"))
         return
     with ctx.lock:
         m = m_log.append_message(ctx.args.as_, to, text, sign=ctx.signs())
@@ -347,4 +375,4 @@ def chat_choose_command(ctx: m_chat_wizard.ChatCommandContext) -> str | None:
         return None
     ctx.buffer().clear()
     ctx.ui.pos = 0
-    return f"{cmd} {pid}"  # by id, not by name: names may repeat
+    return m_i18n.tr("{cmd} {pid}", cmd=cmd, pid=pid)  # by id, not by name: names may repeat
