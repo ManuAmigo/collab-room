@@ -118,6 +118,29 @@ def claude_of_window(home: Path, target: str) -> str:
     return str(info.get("sessionId", ""))
 
 
+def brief_owner(config: dict[str, Any], sid: object) -> str:
+    """Whose assignment a Claude Code session is given by its SessionStart hook: the participant bound to
+    that session, or — after /clear, which starts a new one — the agent the room started whose window's
+    Claude now runs it, as Claude itself records it. Never by a name the hook is given: COLLAB_AS is
+    anyone's to set. "" — nobody, or two."""
+    if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid):
+        return ""
+    bound = [p["id"] for p in config["participants"] if p.get("claude_session") == sid]
+    if bound:
+        return bound[0] if len(bound) == 1 else ""
+    home = Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser()
+    mine = [
+        p["id"]
+        for p in config["participants"]
+        if p.get("started_by_room")
+        and agent_kind(p) == "claude"
+        and claude_of_window(home, p.get("target") or "") == sid
+        # tmux gives «%N» out again after its server restarts: the window must still be this agent's process
+        and not pane_guard(p, p.get("target") or "", idle=False)
+    ]
+    return mine[0] if len(mine) == 1 else ""
+
+
 # Between the room's head «[room → codex]» and its text in a Codex log: the time and the line break,
 # as JSON writes them («09:17\\n  »), or nothing (older versions). Not a «[»: no other head fits in.
 CHECK_GAP = r"(?: \d\d:\d\d)?(?:\\+n)?[ ]*"

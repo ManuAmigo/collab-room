@@ -53,6 +53,10 @@
           {
             "type": "command",
             "command": "command -v collab >/dev/null && collab hook-model --as \"${COLLAB_AS:-claude}\" >/dev/null 2>&1 || true"
+          },
+          {
+            "type": "command",
+            "command": "command -v collab >/dev/null && collab brief --hook 2>/dev/null || true"
           }
         ]
       }

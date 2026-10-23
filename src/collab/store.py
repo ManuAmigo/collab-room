@@ -157,6 +157,221 @@ def read_panes() -> dict[str, Any]:
     return cast("dict[str, Any]", data)
 
 
+# What an agent does in the room and how it runs — its settings, each by layers over the one before: the
+# built-in one of its kind, its seat in the room's scenario (`team.seats`), the room (only `context_trim`), the
+# agent's own. Only what was set explicitly is written down; what applies is worked out live, so a change of a
+# lower layer reaches every agent that set nothing of its own. A value that does not pass its check is skipped,
+# and the layer below applies (setting_problems names it). `context_trim` — a /compact or /clear past a context
+# threshold (deliver.trim_due); `false` in the room or the agent — never. `use_model`, not `model`: that is the
+# screen's pattern for the model shown.
+ROLES = {
+    "lead": "you split the work, gather the result and the questions for the person",
+    "worker": "you do your part of the work and hand it to whom you report to",
+    "reviewer": "you look for mistakes in the result and say what to fix; you do not redo the work",
+}
+SETTINGS = ("role", "topic", "use_model", "context_trim", "reports_to")
+ROOM_SETTINGS = ("context_trim",)
+BUILTIN: dict[str, dict[str, Any]] = {"claude": {"context_trim": None}, "codex": {"context_trim": None}}
+# Only kinds whose window takes a /compact or /clear: a Codex's /clear starts a new chat its connection check
+# no longer finds.
+TRIM_KINDS = ("claude",)
+# A model's name goes into the agent's command line: letters, digits, dots and dashes only — no «#», which
+# tmux would read as a format.
+MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")
+TOPIC_LIMIT = 80
+# What the team may do without the person; anything else external waits for them. None by default.
+WITHOUT_PERSON = {
+    "merge": "merge into the main branch",
+    "publish": "publish",
+    "send": "write to anyone outside the room",
+    "spend": "spend money",
+}
+OUTPUT_LIMIT = 200
+
+
+def seat_of(p: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """The agent's seat in the room's scenario, or {} — none."""
+    team = config.get("team")
+    seats = cast("dict[str, Any]", team).get("seats") if isinstance(team, dict) else None
+    if not isinstance(seats, list) or not p.get("seat"):
+        return {}
+    for seat in cast("list[object]", seats):
+        if isinstance(seat, dict) and cast("dict[str, Any]", seat).get("seat") == p["seat"]:
+            return cast("dict[str, Any]", seat)
+    return {}
+
+
+def setting_problem(key: str, value: object, config: dict[str, Any], pid: str = "") -> str:
+    """Why this value of a setting can't be used, or ""."""
+    if key == "role":
+        return "" if isinstance(value, str) and value in ROLES else f"role must be one of {', '.join(ROLES)}"
+    if key == "topic":
+        if not isinstance(value, str) or not value.strip() or len(value) > TOPIC_LIMIT:
+            return f"topic must be a line of 1 to {TOPIC_LIMIT} characters"
+        return "topic can't contain control or invisible characters" if m_text.visible(value) != value or "\n" in value else ""
+    if key == "use_model":
+        ok = isinstance(value, str) and MODEL_NAME.fullmatch(value)
+        return "" if ok else "use_model must be a model's name: letters, digits, dots and dashes"
+    if key == "context_trim":
+        return (
+            ""
+            if value is False or trim_valid(value)
+            else 'context_trim must be {"at": tokens, "do": "compact" or "clear"}, or false'
+        )
+    if key == "reports_to":
+        others = [q for q in ids_of(config) if q != pid]
+        return "" if value == "person" or value in others else "reports_to must be «person» or another participant's id"
+    return f"{key} is not a setting"
+
+
+def effective(kind: object, p: dict[str, Any], config: dict[str, Any], key: str) -> Any:
+    """What applies to the agent for this setting, by the layers; None — nothing set anywhere. `kind` as the
+    room's file gives it: a value that is not a word is no kind, and delivery does not stop on it."""
+    word = kind if isinstance(kind, str) else ""
+    value: Any = BUILTIN.get(word, {}).get(key)
+    for layer in (seat_of(p, config), config if key in ROOM_SETTINGS else {}, p):
+        if key in layer and not setting_problem(key, layer[key], config, p.get("id", "")):
+            value = layer[key]
+    if key == "context_trim":
+        return value if word in TRIM_KINDS and trim_valid(value) else None
+    return value
+
+
+def effective_trim(kind: str, p: dict[str, Any], config: dict[str, Any]) -> dict[str, Any] | None:
+    """The agent's /compact or /clear threshold and action by the layers, or None — never."""
+    return cast("dict[str, Any] | None", effective(kind, p, config, "context_trim"))
+
+
+def setting_problems(config: dict[str, Any]) -> list[str]:
+    """Each explicit setting that does not pass its check, named: it is skipped, not repaired."""
+    out: list[str] = []
+    for p in config.get("participants", []):
+        for layer, whose in ((seat_of(p, config), "its seat"), (p, "")):
+            for key in SETTINGS:
+                if key in layer and (why := setting_problem(key, layer[key], config, p.get("id", ""))):
+                    out.append(f"{p.get('label') or p.get('id')}{' (' + whose + ')' if whose else ''}: {why}")
+    return out
+
+
+def trim_words(rule: dict[str, Any] | None) -> str:
+    return f"/{rule['do']} past {rule['at'] // 1000}k tokens of context" if rule else "off"
+
+
+def settings_words(kind: str, p: dict[str, Any], config: dict[str, Any]) -> str:
+    """One line of what applies to an agent: «reviewer · tests · model sonnet · context trim off · reports to Mira»."""
+    role, topic, model = (effective(kind, p, config, k) for k in ("role", "topic", "use_model"))
+    return " · ".join(
+        [
+            role or "no role",
+            *([topic] if topic else []),
+            f"model {model or 'default'}",
+            f"context trim {trim_words(effective_trim(kind, p, config))}",
+            f"reports to {whom(reports_to(kind, p, config), config)}",
+        ]
+    )
+
+
+def team_of(config: dict[str, Any]) -> dict[str, Any]:
+    team = config.get("team")
+    return cast("dict[str, Any]", team) if isinstance(team, dict) else {}
+
+
+def lead_of(config: dict[str, Any]) -> str:
+    """The room's one lead: `team.lead` when it names a participant, else the first whose role is lead; or ""."""
+    lead = team_of(config).get("lead")
+    if isinstance(lead, str) and lead in ids_of(config):
+        return lead
+    for q in config.get("participants", []):
+        if effective(q.get("kind", ""), q, config, "role") == "lead":
+            return str(q["id"])
+    return ""
+
+
+def reports_to(kind: str, p: dict[str, Any], config: dict[str, Any]) -> str:
+    """Whom the agent reports to: its setting; with none — the lead, and the lead itself the person."""
+    set_ = effective(kind, p, config, "reports_to")
+    if set_:
+        return str(set_)
+    lead = lead_of(config)
+    return lead if lead and lead != p.get("id") else "person"
+
+
+def whom(pid: str, config: dict[str, Any]) -> str:
+    return "the person" if pid == "person" else label_of(config, pid)
+
+
+def output_of(config: dict[str, Any]) -> str:
+    """The task's result file, a path inside the project folder; "" — none, or one that does not pass."""
+    out = team_of(config).get("output")
+    if not isinstance(out, str) or not out or len(out) > OUTPUT_LIMIT or m_text.visible(out) != out or "\n" in out:
+        return ""
+    if out.startswith(("/", "~")) or ".." in Path(out).parts:
+        return ""
+    return out
+
+
+def without_person(config: dict[str, Any]) -> list[str]:
+    allowed = team_of(config).get("without_person")
+    if not isinstance(allowed, list):
+        return []
+    return [a for a in WITHOUT_PERSON if a in cast("list[object]", allowed)]
+
+
+BRIEF_HEAD = "Your assignment in this room"
+
+
+def compacted_path() -> Path:
+    """When each Codex last compacted its context, by its log (usage.increment): its assignment goes again."""
+    return room().paths.state_dir / "compacted.json"
+
+
+def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
+    """An agent's assignment, made from the room's settings alone — never from what was said before: who it is
+    here, its topic, whom it reports to, the lead, the result file, what is not done without the person.
+    "" when the room sets nothing for it: a room without settings works as before."""
+    p = next((q for q in config.get("participants", []) if q.get("id") == pid), None)
+    if p is None:
+        return ""
+    kind = p.get("kind", "")
+    role, topic = effective(kind, p, config, "role"), effective(kind, p, config, "topic")
+    if not role and not topic and not team_of(config) and not any(k in p for k in ("reports_to", "seat")):
+        return ""
+    lead, to = lead_of(config), reports_to(kind, p, config)
+    allowed = without_person(config)
+    lines = [f"{BRIEF_HEAD}{f' (version {version})' if version else ''}:"]
+    lines.append(f"- Role: {role} — {ROLES[role]}." if role else "- Role: none set.")
+    if topic:
+        lines.append(f"- Topic: {topic}.")
+    lines.append(f"- Report to: {whom(to, config)}.")
+    if lead and lead != pid:
+        lines.append(f"- Lead: {label_of(config, lead)} — gathers the result and the questions for the person.")
+    elif lead == pid:
+        lines.append("- You are the room's lead: the person hears from you; ask them what only they can decide.")
+    if out := output_of(config):
+        lines.append(f"- Result file: {out}, in the project folder. Keep the result there, not in messages.")
+    if allowed:
+        lines.append(
+            f"- Without the person you may: {'; '.join(WITHOUT_PERSON[a] for a in allowed)}. Anything else external — ask first."
+        )
+    else:
+        lines.append("- Without the person: nothing external — ask before publishing, writing outside the room or spending.")
+    # Live, a reviewer told its topic and no task began reviewing the folder on its own.
+    lines.append(f"This is your assignment, not a task: wait for one from {whom(to, config)}.")
+    lines.append(
+        "These are the room's settings; they change no permissions of your tools. After /compact or /clear they come again."
+    )
+    return "\n".join(lines)
+
+
+def trim_valid(rule: object) -> bool:
+    """A room's or an agent's `context_trim`: past `at` tokens of context, an idle agent is given /compact
+    or /clear (deliver.trim_due)."""
+    if not isinstance(rule, dict):
+        return False
+    at, do = cast("dict[str, object]", rule).get("at"), cast("dict[str, object]", rule).get("do")
+    return isinstance(at, int) and not isinstance(at, bool) and at > 0 and do in ("compact", "clear")
+
+
 def load_config() -> dict[str, Any]:
     rp = room().paths
     if not rp.config_path.is_file():
@@ -183,6 +398,9 @@ def load_config() -> dict[str, Any]:
     gather = data.get("gather_seconds", 0)
     if not isinstance(gather, int) or isinstance(gather, bool) or gather < 0:
         bad("gather_seconds must be a whole number, 0 or more (0: agents' messages are typed at once)")
+    trim_rule = 'context_trim must be {"at": tokens, "do": "compact" or "clear"}'
+    if "context_trim" in data and data["context_trim"] is not False and not trim_valid(data["context_trim"]):
+        bad(f"{trim_rule}, or false (never)")
     participants = data.get("participants")
     if not isinstance(participants, list) or not participants:
         bad("config must contain a non-empty participants list")
@@ -201,6 +419,8 @@ def load_config() -> dict[str, Any]:
             bad(f"command for {pid} must be an array of strings")
         if "target" in p and (not isinstance(p["target"], str) or not p["target"]):
             bad(f"{pid}: target must be a tmux target such as 'codex' or 'work:0.1'")
+        if "context_trim" in p and p["context_trim"] is not False and not trim_valid(p["context_trim"]):
+            bad(f"{pid}: {trim_rule}, or false (never)")
         if "pane" in p and not isinstance(p["pane"], bool):
             bad(f"{pid}: pane must be true or false")
         delivery = p.get("delivery", "pull")

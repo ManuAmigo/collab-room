@@ -85,12 +85,47 @@ def cmd_add(args: argparse.Namespace) -> None:
     )
     if problem:
         m_store.fail(problem)
-    pid = m_agents.launch_new_agent(config, args.kind, str(folder.resolve()), label)
+    own = settings_args(args, config)
+    pid = m_agents.launch_new_agent(config, args.kind, str(folder.resolve()), label, own)
     # Not typed in a chat: the people learn who came in, and where it works.
     line = m_text.visible(f"{label} ({base}) was added by collab add, in {m_text.tilde(str(folder.resolve()))}.")
     m_log.append_message(m_text.ROOM, m_store.people_ids(m_store.load_config()), line)
     how = "its window tells its session" if args.kind == "claude" else "it answers the connection check"
     print(f"Starting {label} in room window {pid}. It joins when {how} (collab status).")
+    print(f"Settings: {m_store.settings_words(args.kind, {'id': pid, **own}, m_store.load_config())}.")
+
+
+def settings_args(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
+    """The settings `collab add` was given — only these become the agent's own. Checked before anything
+    starts: a bad one is refused, not skipped. The person's to give: an agent that adds another may not
+    make it the lead, have the team report to it, or pick its model — it asks the person."""
+    given = [args.context_trim, args.role, args.topic, args.model, args.reports_to]
+    if any(v is not None for v in given) and m_screen.caller_session_or_refuse():
+        m_store.fail("an agent's settings are the person's to give — ask them; nothing was started")
+    own: dict[str, Any] = {}
+    if args.context_trim:
+        own["context_trim"] = trim_arg(args.kind, args.context_trim)
+    for key, value in (("role", args.role), ("topic", args.topic), ("use_model", args.model), ("reports_to", args.reports_to)):
+        if value is None:
+            continue
+        problem = m_store.setting_problem(key, value, config)
+        if problem:
+            m_store.fail(f"--{key.replace('use_', '').replace('_', '-')}: {problem}")
+        own[key] = value
+    return own
+
+
+def trim_arg(kind: str, text: str) -> object:
+    """`--context-trim 150000:compact`, `…:clear` or `off`: the agent's own, over the room's."""
+    if text == "off":
+        return False
+    at, _, do = text.partition(":")
+    rule = {"at": int(at), "do": do} if at.isdigit() else None
+    if not m_store.trim_valid(rule):
+        m_store.fail("--context-trim takes TOKENS:compact, TOKENS:clear or off — say 150000:compact")
+    if kind not in m_store.TRIM_KINDS:
+        m_store.fail(f"--context-trim: a {m_screen.PRESETS[kind]['label']} takes only off for now")
+    return rule
 
 
 def cmd_name(args: argparse.Namespace) -> None:
@@ -297,6 +332,27 @@ def cmd_status(args: argparse.Namespace) -> None:
     st = m_screen.read_status()
     for pid in m_store.ids_of(config):
         print(m_screen.describe(pid, st[pid], args.stale) if pid in st else f"· {pid}: No status yet")
+
+
+def cmd_brief(args: argparse.Namespace) -> None:
+    """An agent's assignment, as the room's settings make it now (store.brief). With --hook — for Claude Code's
+    SessionStart: after /compact or /clear the session is given it again, for the participant whose session
+    this is by the room's records, never by --as; silent outside a room and for any other start."""
+    rp = m_store.room().paths
+    if args.hook:
+        if not rp.config_path.is_file():
+            return
+        data = read_hook_stdin()
+        config = m_store.load_config()
+        pid = m_screen.brief_owner(config, data.get("session_id"))
+        if data.get("source") not in ("compact", "clear") or not pid:
+            return
+    else:
+        config = m_store.load_config()
+        pid = args.as_
+        m_store.participant(config, pid)
+    text = m_deliver.current_brief(pid, config)
+    print(text or f"{m_store.label_of(config, pid)}: the room sets nothing for it.")
 
 
 def cmd_hook_model(args: argparse.Namespace) -> None:
@@ -558,6 +614,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("kind", choices=sorted(m_screen.PRESETS))
     s.add_argument("--folder", help="the project folder it works in (default: the room's)")
     s.add_argument("--name", help="its name in the room (default: Claude, Codex… — the next one free)")
+    s.add_argument(
+        "--context-trim",
+        metavar="TOKENS:compact|TOKENS:clear|off",
+        help="its own /compact or /clear past a context threshold, over the room's (default: the room's)",
+    )
+    s.add_argument("--role", choices=list(m_store.ROLES), help="lead, worker or reviewer")
+    s.add_argument("--topic", help="the part of the task it answers for, one line")
+    s.add_argument("--model", help="the model its program runs (default: the program's own)")
+    s.add_argument("--reports-to", dest="reports_to", help="«person» or a participant's id (default: the lead)")
     s.set_defaults(func=cmd_add)
 
     s = sub.add_parser("name", help="give a participant a name shown in the room")
@@ -597,6 +662,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--from-now", action="store_true", help="do not deliver messages that existed before start")
     s.add_argument("--idle-ok", action="store_true", help="keep running even if nobody needs tmux delivery yet")
     s.set_defaults(func=m_deliver.cmd_deliver)
+
+    s = sub.add_parser("brief", help="an agent's assignment from the room's settings (--hook: for Claude Code's SessionStart)")
+    s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))
+    s.add_argument("--hook", action="store_true", help="read the hook's JSON on stdin; print only after /compact or /clear")
+    s.set_defaults(func=cmd_brief)
 
     s = sub.add_parser("hook-model", help="for Claude Code hooks: take the model from the hook's JSON on stdin")
     s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))

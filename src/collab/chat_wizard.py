@@ -723,6 +723,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             ctx.feed(m_text.paint(f"! Could not start the agent: {exc}. Try /add again.", "1;38;5;196"))
             return
         say_(f"Starting {label} in room window {pid}. Waiting for a connection check reply.")
+        say_(f"Settings: {m_store.settings_words(ctx.wizard['kind'], {'id': pid}, m_store.load_config())}.")
         ctx.wizard.clear()
         ctx.refresh_people()
         return

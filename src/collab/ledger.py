@@ -32,6 +32,19 @@ def usage_path() -> Path:
     return m_store.room().paths.state_dir / "usage.jsonl"
 
 
+def context_path() -> Path:
+    return m_store.room().paths.state_dir / "context.json"
+
+
+def context_of(pid: str) -> tuple[int, str]:
+    """The agent's context as its latest answer counted read it (tokens) and that answer's time; (0, "") —
+    not counted yet."""
+    seen = m_store.read_json(context_path()).get(pid)
+    if not isinstance(seen, dict) or not isinstance(seen.get("ctx"), int) or not isinstance(seen.get("at"), str):
+        return 0, ""
+    return seen["ctx"], seen["at"]
+
+
 def usage_line(
     pid: str, label: str, kind: str, entry: dict[str, Any], task: dict[str, Any] | None, wakeups: int, split: bool
 ) -> dict[str, Any]:
@@ -312,6 +325,10 @@ def record(p: dict[str, Any]) -> int:
         split = (began or {}).get("id") != (task or {}).get("id")
         lines.append(usage_line(pid, p.get("label") or pid, m_screen.agent_kind(p), e, task, wakes if i == 0 else 0, split))
     append_usage(lines)
+    latest = max(entries, key=lambda e: str(e.get("to_ts") or ""))
+    contexts = m_store.read_json(context_path())
+    contexts[pid] = {"ctx": int(latest.get("ctx_last") or 0), "at": str(latest.get("to_ts") or "")}
+    m_store.write_json(context_path(), contexts)
     return len(lines)
 
 

@@ -301,6 +301,16 @@ class LedgerTickTest(LedgerRoom):
         self.assertFalse(second["split"])
         self.assertEqual((first["model"], second["model"]), ("Opus 5.5", "Sonnet 5.5"))
 
+    def test_the_context_kept_is_that_of_the_latest_answer(self):
+        # What a /compact or /clear is decided by: the context now, not the longest of the stretch.
+        self.spend(
+            {"model": "Opus 5.5", "input": 1, "ctx_max": 9000, "ctx_last": 9000, "from_ts": PAST, "to_ts": FUTURE},
+            {"model": "Sonnet 5.5", "input": 1, "ctx_max": 4000, "ctx_last": 300, "from_ts": PAST, "to_ts": PAST},
+        )
+        self.mod.record({"id": "petya", "idle": "x"})
+        self.assertEqual(self.mod.context_of("petya"), (9000, FUTURE))
+        self.assertEqual(self.mod.context_of("misha"), (0, ""), "not counted yet")
+
     def test_wakes_go_with_the_first_line_and_wait_when_nothing_was_spent(self):
         self.mod.woke("petya")
         self.mod.woke("petya")

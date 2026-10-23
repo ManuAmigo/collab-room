@@ -62,24 +62,36 @@ def codex_knows_no_daemon(program: str, sub: list[str]) -> bool:
     return _NO_DAEMON[key]
 
 
-def agent_command(kind: str, resume: list[str] | None = None) -> str:
-    """The same preset arguments for /add, relaunch and /restart, including resume."""
+def agent_command(kind: str, resume: list[str] | None = None, model: str = "") -> str:
+    """The same preset arguments for /add, relaunch and /restart, including resume, and the model its
+    settings give it (both programs take --model; none — the program's own choice)."""
     preset = m_screen.PRESETS[kind]["command"]
     program = shutil.which(preset[0]) or preset[0]
+    chosen = ["--model", model] if model and m_store.MODEL_NAME.fullmatch(model) else []
     if kind == "codex":
         # Its own process, not the shared background server (the person's Codex app keeps one): through
         # it a room's Codex did not take the rule written for it just before its start, and the person
         # approved every say by hand. Sandbox and approvals stay as they are.
         flags = ["--no-daemon"] if codex_knows_no_daemon(program, (resume or [])[:1]) else []
         if resume:
-            return shlex.join([program, resume[0], *preset[1:], *flags, *resume[1:]])
-        return shlex.join([program, *preset[1:], *flags])
-    return shlex.join([program, *preset[1:], *(resume or [])])
+            return shlex.join([program, resume[0], *preset[1:], *flags, *chosen, *resume[1:]])
+        return shlex.join([program, *preset[1:], *flags, *chosen])
+    return shlex.join([program, *preset[1:], *chosen, *(resume or [])])
+
+
+def model_for(p: dict[str, Any]) -> str:
+    """The model an agent the room starts again runs on: by its settings' layers, as they are now. The room's
+    file as it is, like the rest of a restart: each value is checked on its own (store.effective), and a
+    restart is not stopped by someone else's seat."""
+    return str(m_store.effective(m_screen.agent_kind(p), p, m_store.read_config_raw(), "use_model") or "")
 
 
 @m_store.room_locked
-def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str) -> str:
-    """Start an agent in its own window of the room's tmux session and register it."""
+def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str, own: dict[str, Any] | None = None) -> str:
+    """Start an agent in its own window of the room's tmux session and register it. `own`: the settings
+    given it explicitly (store.SETTINGS) — only these are written into its seat; the rest go on by the
+    layers below."""
+    own = own or {}
     # The id and the name by the room's file as it is now, under its lock — not the chat's copy: two
     # /add at once (two chats, or /add and a join) got one id, and add_participant replaced the first
     # The session too: `start --session` writes it there, a chat started before kept the
@@ -107,7 +119,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str)
             "-c",
             m_tmuxio.tmux_dir(folder),
             *m_tmuxio.pane_env(),
-            m_tmuxio.in_dir(folder, agent_command(kind)),
+            m_tmuxio.in_dir(folder, agent_command(kind, model=str(own.get("use_model") or ""))),
             check=False,
         )
         if out.returncode != 0:
@@ -128,6 +140,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str)
             "kind": kind,
             "folder": folder,
             **({"cli": cli} if cli else {}),
+            **{k: v for k, v in own.items() if k in m_store.SETTINGS},
         }
         add_participant(entry)
     except BaseException:
@@ -700,7 +713,7 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
         "-c",
         m_tmuxio.tmux_dir(folder),
         *m_tmuxio.pane_env(),
-        m_tmuxio.in_dir(folder, agent_command(kind)),
+        m_tmuxio.in_dir(folder, agent_command(kind, model=model_for(p))),
         check=False,
     )
     if out.returncode != 0:
@@ -751,7 +764,7 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str) -> s
     folder = p.get("folder") or str(rp.root)
     cli = m_installer.codex_room_rule(p["id"], folder) if kind == "codex" else ""  # the newest rule, read at its start
     resume = (["--resume", sid] if kind == "claude" else ["resume", sid]) if sid else []
-    command = agent_command(kind, resume)
+    command = agent_command(kind, resume, model_for(p))
     pane = p.get("target", "")
     # Its own window only: «respawn-pane -k» into a number tmux gave out again would kill someone
     # else's program.

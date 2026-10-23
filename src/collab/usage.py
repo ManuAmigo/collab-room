@@ -11,6 +11,7 @@ import json
 import os
 import re
 import stat
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -24,7 +25,10 @@ CTX_MAX = 64  # Codex turns whose model and effort are kept for the records that
 CHUNK = 8 << 20  # bytes read from one log in one look; the rest waits for the next
 BUDGET = 8 << 20  # and from all of an agent's logs in one call: the room's lock is held meanwhile
 CONTEXT_TAIL = 2 << 20  # how far back a first look at a Codex log seeks its turn's model and effort
-MARKS = {"claude": b'"usage"', "codex": b'"payload"'}  # a line without it has no numbers: not even parsed
+MARKS = {"claude": b'"usage"', "codex": b'"payload"'}
+# A Codex compacted its context: its log's own record of that, at the head of a line (a quote of these words in
+# a message is escaped inside a string). Its assignment is sent again (deliver.send_briefs).
+COMPACTED = b'"type":"compacted"'  # a line without it has no numbers: not even parsed
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}")  # a model's or an effort's name, as shown
 KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")  # an answer's id, as kept in the cursor
 
@@ -290,8 +294,9 @@ class Cursor:
 
 def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
     """What the agent spent since the last call: one record per model and effort — {model, effort, input,
-    output, cache_read, cache_write, answers, ctx_max, from_ts, to_ts}: the answers counted, the longest
-    context of one (input + cache read + cache write), times of the first and last answer. Nothing
+    output, cache_read, cache_write, answers, ctx_max, ctx_last, from_ts, to_ts}: the answers counted, the
+    longest context of one (input + cache read + cache write) and that of the latest, times of the first
+    and last answer. Nothing
     new — []. The first call for an agent starts from now: its past is not counted against the task it is
     on. Called under the room's lock by its one writer (delivery's tick); the cursor is in the room's state,
     so a restart of delivery neither counts again nor loses a piece."""
@@ -306,6 +311,7 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
     files = claude_files(p) if kind == "claude" else codex_file(p, next(iter(cur.files), ""))
     groups: dict[tuple[str | None, str | None], dict[str, Any]] = {}
     read_to: dict[str, dict[str, int]] = {}
+    compacted: list[float] = []
     left = BUDGET
     for path in files:
         at = cur.files.get(str(path), {})
@@ -327,6 +333,8 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             left -= read_to[str(path)].get("off", 0)
         for raw in lines:
+            if kind == "codex" and COMPACTED in raw[:200]:
+                compacted.append(time.time())
             if MARKS[kind] not in raw:
                 continue
             line = raw.decode("utf-8", errors="replace")
@@ -345,7 +353,10 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
             for f in FIELDS:
                 g[f] += nums[f]
             g["answers"] += 1
-            g["ctx_max"] = max(g["ctx_max"], nums["input"] + nums["cache_read"] + nums["cache_write"])
+            size = nums["input"] + nums["cache_read"] + nums["cache_write"]
+            g["ctx_max"] = max(g["ctx_max"], size)
+            if ts >= (g.get("to_ts") or ""):
+                g["ctx_last"] = size  # the context as it is now: what the latest answer read
             g["from_ts"] = min(g.get("from_ts") or ts, ts)
             g["to_ts"] = max(g.get("to_ts") or ts, ts)
     cur.files = read_to  # a log no longer the agent's (its session ended) is not looked at again
@@ -354,4 +365,7 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
         cur.seen, cur.since = dict(keep), keep[0][1]
     state[p["id"]] = asdict(cur)
     m_store.write_json(cursor_path(), state)
+    if compacted:
+        seen = m_store.read_json(m_store.compacted_path())
+        m_store.write_json(m_store.compacted_path(), {**seen, p["id"]: compacted[-1]})
     return [g for g in groups.values() if any(g[f] for f in FIELDS)]

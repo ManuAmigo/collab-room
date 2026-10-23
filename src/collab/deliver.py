@@ -3,6 +3,7 @@ import argparse
 import contextlib
 import datetime as dt
 import errno
+import hashlib
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 import collab.boot as m_boot
 import collab.text as m_text
 import collab.store as m_store
@@ -410,7 +411,114 @@ def deliver_once(config: dict[str, Any], panes: dict[str, str]) -> list[tuple[st
         if typed:
             done.append((p["id"], typed))
     m_ledger.tick(config)  # the tokens' ledger: each agent's spending since its last look
+    tell_setting_changes(config)
+    send_briefs(config)
     return done
+
+
+def agents_of(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """The room's agents — participants with a screen to read; not its people."""
+    people = m_store.people_ids(config)
+    return [p for p in config["participants"] if p["id"] not in people and any(k in p for k in ("idle", "busy", "attention"))]
+
+
+def as_dict(x: object) -> dict[str, Any]:
+    """A state file's entry as a dict; anything else as an empty one — the file is anyone's to edit."""
+    return cast("dict[str, Any]", x) if isinstance(x, dict) else {}
+
+
+def settings_seen_path() -> Path:
+    return m_store.room().paths.state_dir / "settings-seen.json"
+
+
+def applied(p: dict[str, Any], config: dict[str, Any]) -> dict[str, str]:
+    """What applies to an agent, in words, by its settings' layers."""
+    kind = m_screen.agent_kind(p)
+    return {
+        "role": str(m_store.effective(kind, p, config, "role") or "none"),
+        "topic": str(m_store.effective(kind, p, config, "topic") or "none"),
+        "model": str(m_store.effective(kind, p, config, "use_model") or "default"),
+        "context trim": m_store.trim_words(m_store.effective_trim(kind, p, config)),
+        "reports to": m_store.whom(m_store.reports_to(kind, p, config), config),
+    }
+
+
+@m_store.room_locked
+def tell_setting_changes(config: dict[str, Any]) -> None:
+    """What applies to an agent changed — the room's setting, its seat's, a built-in one after an update: one
+    silent line in the person's chat, who and to what. An agent seen the first time is only noted: /add showed
+    it its own. A setting that does not pass its check is named once — it is skipped, not repaired."""
+    people = m_store.people_ids(config)
+    applies: dict[str, Any] = {p["id"]: applied(p, config) for p in agents_of(config)}
+    problems = m_store.setting_problems(config)
+    seen = m_store.read_json(settings_seen_path())
+    now_seen = {"agents": applies, "problems": problems}
+    if now_seen == seen:
+        return
+    m_store.write_json(settings_seen_path(), now_seen)
+    before = as_dict(seen.get("agents"))
+    words = []
+    for p in config["participants"]:
+        old, new = before.get(p["id"]), applies.get(p["id"])
+        if isinstance(old, dict) and new and old != new:
+            what = ", ".join(f"{k} {v}" for k, v in new.items() if old.get(k) != v)
+            words.append(f"{p.get('label') or p['id']} — {what}")
+    lines = [f"Settings changed: {'; '.join(words)}."] if words else []
+    raw: object = seen.get("problems")
+    old_problems = cast("list[object]", raw) if isinstance(raw, list) else []
+    lines += [f"Setting ignored — {why}." for why in problems if why not in old_problems]
+    for line in lines:
+        m_log.append_message(m_text.ROOM, people or ["all"], line, silent=True)
+
+
+def brief_path() -> Path:
+    return m_store.room().paths.state_dir / "briefs.json"
+
+
+def brief_version(pid: str, config: dict[str, Any]) -> tuple[str, int]:
+    """The agent's assignment and its version: the one last sent while it is the same, the next once it changed."""
+    text = m_store.brief(pid, config)
+    old = as_dict(m_store.read_json(brief_path()).get(pid))
+    same = old.get("hash") == hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    version = int(old.get("v") or 0) if isinstance(old.get("v"), int) else 0
+    return text, version if same and version else version + 1
+
+
+def current_brief(pid: str, config: dict[str, Any]) -> str:
+    text, version = brief_version(pid, config)
+    return m_store.brief(pid, config, version) if text else ""
+
+
+@m_store.room_locked
+def send_briefs(config: dict[str, Any]) -> None:
+    """Each agent the room sets anything for gets its assignment as a message from the room — made from the
+    settings, never from what was said before: when it is first seen, when its assignment changed, when its
+    window runs a new process (/restart, relaunch), and when a Codex compacted its context (a Claude is given it
+    by its SessionStart hook). Only its own: each one's is sent to it alone."""
+    state = m_store.read_json(brief_path())
+    compacted = m_store.read_json(m_store.compacted_path())
+    changed = False
+    for p in agents_of(config):
+        pid = p["id"]
+        text, version = brief_version(pid, config)
+        old = as_dict(state.get(pid))
+        if not text:
+            if old:
+                state.pop(pid)
+                changed = True
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        squeezed = compacted.get(pid)
+        again = old.get("pane") != str(p.get("pane_pid", "")) or (
+            isinstance(squeezed, (int, float)) and squeezed > (at if isinstance(at := old.get("at"), (int, float)) else 0)
+        )
+        if old.get("hash") == digest and not again:
+            continue
+        m_log.append_message(m_text.ROOM, [pid], m_store.brief(pid, config, version), brief=True)
+        state[pid] = {"hash": digest, "v": version, "pane": str(p.get("pane_pid", "")), "at": time.time()}
+        changed = True
+    if changed:
+        m_store.write_json(brief_path(), state)
 
 
 _WINDOW_SESSION_SEEN: dict[str, float] = {}
@@ -486,7 +594,7 @@ def deliver_one(p: dict[str, Any], pane: str, config: dict[str, Any], messages: 
     watch_for_reply(p, watch, messages)
     if p.get("delivery") != "tmux":
         return ""
-    return deliver_to(p, pane, state, config)
+    return deliver_to(p, pane, state, config, tasks)
 
 
 class DeliveryStopped(BaseException):
@@ -526,7 +634,12 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
     """The line typed into the agent's window for one message: its head, the text, the ready commands."""
     # The room is named in the command itself: an agent working in another folder (or with
     # another room in its COLLAB_ROOT) must still answer here.
-    if m["from"] == m_text.ROOM:
+    if m["from"] == m_text.ROOM and m.get("brief") is True:
+        # An assignment is taken, not discussed: closed with ack; a question about it goes to the lead or the person.
+        hint = "if no answer is needed: " + room_cmd(
+            "ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"]
+        )
+    elif m["from"] == m_text.ROOM:
         hint = "reply in room: " + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), p["id"])
     else:
         # Both ways to close it, ready to run.
@@ -549,7 +662,11 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
             + room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"])
             + ")"
         )
-    return f"[{m['from']} → {', '.join(m['to'])}] {warn}{body}" + (f"  ({hint})" if p.get("reply_hint", True) else "")
+    # Its role, one word of a closed list, reminds an agent whose context was cut of its assignment; the topic,
+    # free text, is never typed with it.
+    role = m_store.effective(m_screen.agent_kind(p), p, config, "role")
+    you = f"you: {role} · " if role in m_store.ROLES else ""
+    return f"[{m['from']} → {', '.join(m['to'])}] {warn}{body}" + (f"  ({you}{hint})" if p.get("reply_hint", True) else "")
 
 
 DIGEST_WORDS = 8  # words of each message's start in the digest — enough to tell what it is about
@@ -654,28 +771,125 @@ def wants_clear(p: dict[str, Any]) -> bool:
 
 
 def clear_agent(p: dict[str, Any], pane: str) -> str:
-    """/clear typed as a message is: not into a scrolled window, only while idle, only into its own process."""
+    """/clear once its landing is in main."""
+    if not type_command(p, pane, "/clear"):
+        return ""
+    m_log.write_set(clear_dir(), p["id"], set())
+    trimmed(p["id"])  # its context is new: the count of the old one is no reason for a /compact
+    stop_if_asked()
+    return f"cleared {p['id']}"
+
+
+def type_command(p: dict[str, Any], pane: str, text: str) -> bool:
+    """A command typed as a message is: not into a scrolled window, only while idle, only into its own process."""
     if m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}", check=False).stdout.strip() == "1":
-        return ""
+        return False
     if m_screen.screen_state(m_screen.screen_rules(p), pane)[0] != "idle" or m_screen.pane_guard(p, pane):
-        return ""
+        return False
     STOPPING["typing"] = True
-    sent = m_tmuxio.tmux("send-keys", "-t", pane, "-l", "/clear", check=False)
+    sent = m_tmuxio.tmux("send-keys", "-t", pane, "-l", text, check=False)
     if sent.returncode == 0:
         time.sleep(float(os.environ.get("COLLAB_ENTER_DELAY", "0.3")))
         sent = m_tmuxio.tmux("send-keys", "-t", pane, "Enter", check=False)
     STOPPING["typing"] = False
     if sent.returncode != 0:
         stop_if_asked()
+        return False
+    return True  # the caller marks it given, then stops if asked
+
+
+# Every wake re-reads the agent's whole context, and a long one costs most. Past its `context_trim` —
+# {"at": tokens, "do": "compact" | "clear"}, by the layers of store.effective_trim — an idle agent is given
+# /compact or /clear. Off by every layer (the built-in ones are) — nothing is given.
+COMPACT = "/compact Keep: the task you are on, its branch and worktree, the decisions taken, and what is left to do."
+
+
+def trim_path() -> Path:
+    return m_store.room().paths.state_dir / "context-trim.json"
+
+
+def trimmed(pid: str) -> None:
+    """Its context was cleared or compacted: the count of its latest answer is not looked at again."""
+    done = m_store.read_json(trim_path())
+    done[pid] = {"answer": m_ledger.context_of(pid)[1], "given": m_store.now()}
+    m_store.write_json(trim_path(), done)
+
+
+def in_merge_queue(pid: str) -> bool:
+    """A place in the merge queue, waiting or with its checks running: what the landing reports back is
+    the agent's to act on."""
+    try:
+        queue: object = json.loads((m_store.room().paths.state_dir / "merge-queue.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return any(
+        isinstance(e, dict)
+        and e.get("id") == pid
+        and "landed" not in e
+        and "stopped" not in e
+        and isinstance(e.get("pid"), int)
+        and m_installer.process_alive(e["pid"])
+        for e in (queue if isinstance(queue, list) else [])
+    )
+
+
+def owes_answer(pid: str, config: dict[str, Any], messages: list[dict[str, Any]], since: str) -> bool:
+    """A message to it by name since its context last began, neither answered nor closed (`say --re`,
+    `ack --no-reply`), or a person's still waited for: a /clear would take it away unanswered."""
+    if waits_of(m_store.read_json(m_store.room().paths.await_path), pid):
+        return True
+    return any(
+        m_store.well_formed(m)
+        and pid in m["to"]
+        and m["from"] not in (pid, m_text.ROOM)
+        and str(m.get("at") or "") >= since
+        and not is_quiet(m, config)
+        and not is_silent(m, config)
+        and not m_log.answered({"id": m["id"], "at": str(m.get("at") or ""), "from": m["from"]}, pid, messages)
+        for m in messages
+    )
+
+
+def trim_due(p: dict[str, Any], config: dict[str, Any], messages: list[dict[str, Any]]) -> tuple[str, int, int] | None:
+    """(what, its context, the threshold) when an idle agent is to be given /compact or /clear now: past the
+    threshold since its last one, not in the merge queue, and for /clear owing no answer."""
+    rule = m_store.effective_trim(m_screen.agent_kind(p), p, config)
+    if not rule:
+        return None
+    ctx, at = m_ledger.context_of(p["id"])
+    done = m_store.read_json(trim_path()).get(p["id"])
+    done = done if isinstance(done, dict) else {}
+    if ctx < rule["at"] or at <= str(done.get("answer") or ""):
+        return None
+    if in_merge_queue(p["id"]):
+        return None
+    if rule["do"] == "clear" and owes_answer(p["id"], config, messages, str(done.get("given") or "")):
+        return None
+    return rule["do"], ctx, rule["at"]
+
+
+def trim_agent(p: dict[str, Any], pane: str, config: dict[str, Any], due: tuple[str, int, int]) -> str:
+    do, ctx, at = due
+    if not type_command(p, pane, COMPACT if do == "compact" else "/clear"):
         return ""
-    m_log.write_set(clear_dir(), p["id"], set())
+    if do == "clear":
+        m_log.write_set(clear_dir(), p["id"], set())
+    trimmed(p["id"])
+    # In the person's chat only, never typed: what a day of it saved is measured against these.
+    m_log.append_message(
+        m_text.ROOM,
+        m_store.people_ids(config) or ["all"],
+        f"{p.get('label') or p['id']}: context {ctx // 1000}k tokens, past {at // 1000}k — given /{do}.",
+        silent=True,
+    )
     stop_if_asked()
-    return f"cleared {p['id']}"
+    return f"{do} {p['id']}"
 
 
 @m_store.room_locked
-def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any]) -> str:
-    """Type the next message for one agent, under the room's lock, from the log as it is now."""
+def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any], background: int = 0) -> str:
+    """Type the next message for one agent, under the room's lock, from the log as it is now. `background`:
+    its commands still running (its tests) — messages go, a /clear or /compact waits."""
     rp = m_store.room().paths
     # What is typed and its signature's verdict come from this one read — never one from the tick's and
     # the other from a full read: an edit above the tail would then go out without its ⚠.
@@ -701,8 +915,12 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any])
             # Muted hears only what is addressed to it by name: a muted agent
             # still sees and answers a direct message; room-wide talk passes it by.
             pending = [m for m in pending if p["id"] in m.get("to", [])]
-        if state == "idle" and all(is_quiet(m, config) or not m_store.well_formed(m) for m in pending) and wants_clear(p):
-            return clear_agent(p, pane)  # a landing done and nothing to say: the history goes
+        if state == "idle" and all(is_quiet(m, config) or not m_store.well_formed(m) for m in pending):
+            if wants_clear(p):
+                return clear_agent(p, pane)  # a landing done and nothing to say: the history goes
+            due = None if background else trim_due(p, config, messages)
+            if due:
+                return trim_agent(p, pane, config, due)  # a long context and nothing to say: it is cut
         if not pending or state != "idle" or all(is_quiet(m, config) or not m_store.well_formed(m) for m in pending):
             # Only quiet notes waiting: the agent is not woken for them — each wake re-reads its whole
             # context. They wait in its inbox and go with the next

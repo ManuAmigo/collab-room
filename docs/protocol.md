@@ -252,7 +252,44 @@ Once an agent's commits land through the merge queue, delivery types `/clear` in
 idle moment, after any message waiting for it: the next task does not re-read the last one's history on every
 wake. Only a Claude: a Codex keeps its conversation (the room finds it by its connection check).
 
+A room can also cut a long context: `"context_trim": {"at": 150000, "do": "compact"}` in `.collab.json`; `false` in
+the room or the agent — never. The built-in one is off for now. A Codex is off whatever they say: its `/clear` starts
+a new chat. Once a Claude's latest answer read more than
+`at` tokens, delivery types `/compact` (told to keep the task, its branch and worktree, the decisions and what is
+left) or `/clear` at its next idle moment — never while a message waits for it, while its own commands run in the
+background, or while it has a place in the merge queue; `/clear` only when it owes no answer to a message sent to
+it by name. Once per answer counted. The person's chat gets a silent line: who, what, at what context. No setting —
+nothing is typed.
+
 `collab deliver --from-now` marks old messages as already delivered, then listens for new ones. `collab start` creates panes and saves their IDs in `.collab/panes.json`; `collab start` manages the deliverer; a second deliverer is not needed. Terminal delivery is needed only for participants with `delivery: "tmux"`.
+
+## An agent's settings and assignment
+
+An agent has five settings: `role` (`lead`, `worker` or `reviewer`), `topic` (one line: the part of the task it
+answers for), `use_model` (the model its program runs), `context_trim` (its memory, below) and `reports_to`
+(`person` or a participant's id; none — the lead, and the lead the person). The room has a `team` block in
+`.collab.json`: `lead` (one participant's id), `output` (the task's result file, a path inside the project folder),
+`without_person` (what the team may do without the person, of `merge`, `publish`, `send`, `spend`; none by default)
+and `seats` (a scenario's seats, each with an id in `seat` and the same settings).
+
+Each setting goes by layers, each over the one before: the built-in one of the agent's kind, its seat (an agent's
+`"seat": "s1"`), the room (only `context_trim`), the agent's own. Only what was set explicitly is written down; what
+applies is worked out live, so a change of a lower layer reaches every agent that set nothing of its own. A value
+that does not pass its check is skipped — the layer below applies — and named once in the person's chat. `/add` shows
+in one line what applies to the new agent; `collab add --role reviewer --topic "tests" --model sonnet --reports-to lev
+--context-trim 150000:compact` gives it its own (a bad one is refused before anything starts). When what applies to an
+agent changes, the person's chat gets one silent line: who, and to what. A new model applies when the agent's
+program starts: `/restart` it.
+
+An agent the room sets anything for gets its assignment from the room — `Your assignment in this room (version N)`:
+its role, topic, whom it reports to, the lead, the result file, what is not done without the person. It is made
+from the settings alone, never from what was said before, and sent to that agent only: when the agent is first seen,
+when its assignment changes (the next version), when its window runs a new process (`/restart`), and when a Codex
+compacted its context (its session log says so). A Claude gets it into its context after `/compact` and `/clear` by
+its `SessionStart` hook (`collab brief --hook`), for the participant whose session it is — never by the name the hook
+is given. `collab brief --as ID` prints it. Every delivery to an agent with a role reminds it in one word:
+`(you: reviewer · answer: …)`. The assignment is closed with `ack`; it changes no permissions of the agent's tools.
+A room that sets nothing works as before.
 
 ## Talking to other agents
 

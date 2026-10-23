@@ -110,7 +110,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -1082,6 +1082,221 @@ def read_panes() -> dict[str, Any]:
     return cast("dict[str, Any]", data)
 
 
+# What an agent does in the room and how it runs — its settings, each by layers over the one before: the
+# built-in one of its kind, its seat in the room's scenario (`team.seats`), the room (only `context_trim`), the
+# agent's own. Only what was set explicitly is written down; what applies is worked out live, so a change of a
+# lower layer reaches every agent that set nothing of its own. A value that does not pass its check is skipped,
+# and the layer below applies (setting_problems names it). `context_trim` — a /compact or /clear past a context
+# threshold (deliver.trim_due); `false` in the room or the agent — never. `use_model`, not `model`: that is the
+# screen's pattern for the model shown.
+ROLES = {
+    "lead": "you split the work, gather the result and the questions for the person",
+    "worker": "you do your part of the work and hand it to whom you report to",
+    "reviewer": "you look for mistakes in the result and say what to fix; you do not redo the work",
+}
+SETTINGS = ("role", "topic", "use_model", "context_trim", "reports_to")
+ROOM_SETTINGS = ("context_trim",)
+BUILTIN: dict[str, dict[str, Any]] = {"claude": {"context_trim": None}, "codex": {"context_trim": None}}
+# Only kinds whose window takes a /compact or /clear: a Codex's /clear starts a new chat its connection check
+# no longer finds.
+TRIM_KINDS = ("claude",)
+# A model's name goes into the agent's command line: letters, digits, dots and dashes only — no «#», which
+# tmux would read as a format.
+MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")
+TOPIC_LIMIT = 80
+# What the team may do without the person; anything else external waits for them. None by default.
+WITHOUT_PERSON = {
+    "merge": "merge into the main branch",
+    "publish": "publish",
+    "send": "write to anyone outside the room",
+    "spend": "spend money",
+}
+OUTPUT_LIMIT = 200
+
+
+def seat_of(p: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """The agent's seat in the room's scenario, or {} — none."""
+    team = config.get("team")
+    seats = cast("dict[str, Any]", team).get("seats") if isinstance(team, dict) else None
+    if not isinstance(seats, list) or not p.get("seat"):
+        return {}
+    for seat in cast("list[object]", seats):
+        if isinstance(seat, dict) and cast("dict[str, Any]", seat).get("seat") == p["seat"]:
+            return cast("dict[str, Any]", seat)
+    return {}
+
+
+def setting_problem(key: str, value: object, config: dict[str, Any], pid: str = "") -> str:
+    """Why this value of a setting can't be used, or ""."""
+    if key == "role":
+        return "" if isinstance(value, str) and value in ROLES else f"role must be one of {', '.join(ROLES)}"
+    if key == "topic":
+        if not isinstance(value, str) or not value.strip() or len(value) > TOPIC_LIMIT:
+            return f"topic must be a line of 1 to {TOPIC_LIMIT} characters"
+        return "topic can't contain control or invisible characters" if visible(value) != value or "\n" in value else ""
+    if key == "use_model":
+        ok = isinstance(value, str) and MODEL_NAME.fullmatch(value)
+        return "" if ok else "use_model must be a model's name: letters, digits, dots and dashes"
+    if key == "context_trim":
+        return (
+            ""
+            if value is False or trim_valid(value)
+            else 'context_trim must be {"at": tokens, "do": "compact" or "clear"}, or false'
+        )
+    if key == "reports_to":
+        others = [q for q in ids_of(config) if q != pid]
+        return "" if value == "person" or value in others else "reports_to must be «person» or another participant's id"
+    return f"{key} is not a setting"
+
+
+def effective(kind: object, p: dict[str, Any], config: dict[str, Any], key: str) -> Any:
+    """What applies to the agent for this setting, by the layers; None — nothing set anywhere. `kind` as the
+    room's file gives it: a value that is not a word is no kind, and delivery does not stop on it."""
+    word = kind if isinstance(kind, str) else ""
+    value: Any = BUILTIN.get(word, {}).get(key)
+    for layer in (seat_of(p, config), config if key in ROOM_SETTINGS else {}, p):
+        if key in layer and not setting_problem(key, layer[key], config, p.get("id", "")):
+            value = layer[key]
+    if key == "context_trim":
+        return value if word in TRIM_KINDS and trim_valid(value) else None
+    return value
+
+
+def effective_trim(kind: str, p: dict[str, Any], config: dict[str, Any]) -> dict[str, Any] | None:
+    """The agent's /compact or /clear threshold and action by the layers, or None — never."""
+    return cast("dict[str, Any] | None", effective(kind, p, config, "context_trim"))
+
+
+def setting_problems(config: dict[str, Any]) -> list[str]:
+    """Each explicit setting that does not pass its check, named: it is skipped, not repaired."""
+    out: list[str] = []
+    for p in config.get("participants", []):
+        for layer, whose in ((seat_of(p, config), "its seat"), (p, "")):
+            for key in SETTINGS:
+                if key in layer and (why := setting_problem(key, layer[key], config, p.get("id", ""))):
+                    out.append(f"{p.get('label') or p.get('id')}{' (' + whose + ')' if whose else ''}: {why}")
+    return out
+
+
+def trim_words(rule: dict[str, Any] | None) -> str:
+    return f"/{rule['do']} past {rule['at'] // 1000}k tokens of context" if rule else "off"
+
+
+def settings_words(kind: str, p: dict[str, Any], config: dict[str, Any]) -> str:
+    """One line of what applies to an agent: «reviewer · tests · model sonnet · context trim off · reports to Mira»."""
+    role, topic, model = (effective(kind, p, config, k) for k in ("role", "topic", "use_model"))
+    return " · ".join(
+        [
+            role or "no role",
+            *([topic] if topic else []),
+            f"model {model or 'default'}",
+            f"context trim {trim_words(effective_trim(kind, p, config))}",
+            f"reports to {whom(reports_to(kind, p, config), config)}",
+        ]
+    )
+
+
+def team_of(config: dict[str, Any]) -> dict[str, Any]:
+    team = config.get("team")
+    return cast("dict[str, Any]", team) if isinstance(team, dict) else {}
+
+
+def lead_of(config: dict[str, Any]) -> str:
+    """The room's one lead: `team.lead` when it names a participant, else the first whose role is lead; or ""."""
+    lead = team_of(config).get("lead")
+    if isinstance(lead, str) and lead in ids_of(config):
+        return lead
+    for q in config.get("participants", []):
+        if effective(q.get("kind", ""), q, config, "role") == "lead":
+            return str(q["id"])
+    return ""
+
+
+def reports_to(kind: str, p: dict[str, Any], config: dict[str, Any]) -> str:
+    """Whom the agent reports to: its setting; with none — the lead, and the lead itself the person."""
+    set_ = effective(kind, p, config, "reports_to")
+    if set_:
+        return str(set_)
+    lead = lead_of(config)
+    return lead if lead and lead != p.get("id") else "person"
+
+
+def whom(pid: str, config: dict[str, Any]) -> str:
+    return "the person" if pid == "person" else label_of(config, pid)
+
+
+def output_of(config: dict[str, Any]) -> str:
+    """The task's result file, a path inside the project folder; "" — none, or one that does not pass."""
+    out = team_of(config).get("output")
+    if not isinstance(out, str) or not out or len(out) > OUTPUT_LIMIT or visible(out) != out or "\n" in out:
+        return ""
+    if out.startswith(("/", "~")) or ".." in Path(out).parts:
+        return ""
+    return out
+
+
+def without_person(config: dict[str, Any]) -> list[str]:
+    allowed = team_of(config).get("without_person")
+    if not isinstance(allowed, list):
+        return []
+    return [a for a in WITHOUT_PERSON if a in cast("list[object]", allowed)]
+
+
+BRIEF_HEAD = "Your assignment in this room"
+
+
+def compacted_path() -> Path:
+    """When each Codex last compacted its context, by its log (usage.increment): its assignment goes again."""
+    return room().paths.state_dir / "compacted.json"
+
+
+def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
+    """An agent's assignment, made from the room's settings alone — never from what was said before: who it is
+    here, its topic, whom it reports to, the lead, the result file, what is not done without the person.
+    "" when the room sets nothing for it: a room without settings works as before."""
+    p = next((q for q in config.get("participants", []) if q.get("id") == pid), None)
+    if p is None:
+        return ""
+    kind = p.get("kind", "")
+    role, topic = effective(kind, p, config, "role"), effective(kind, p, config, "topic")
+    if not role and not topic and not team_of(config) and not any(k in p for k in ("reports_to", "seat")):
+        return ""
+    lead, to = lead_of(config), reports_to(kind, p, config)
+    allowed = without_person(config)
+    lines = [f"{BRIEF_HEAD}{f' (version {version})' if version else ''}:"]
+    lines.append(f"- Role: {role} — {ROLES[role]}." if role else "- Role: none set.")
+    if topic:
+        lines.append(f"- Topic: {topic}.")
+    lines.append(f"- Report to: {whom(to, config)}.")
+    if lead and lead != pid:
+        lines.append(f"- Lead: {label_of(config, lead)} — gathers the result and the questions for the person.")
+    elif lead == pid:
+        lines.append("- You are the room's lead: the person hears from you; ask them what only they can decide.")
+    if out := output_of(config):
+        lines.append(f"- Result file: {out}, in the project folder. Keep the result there, not in messages.")
+    if allowed:
+        lines.append(
+            f"- Without the person you may: {'; '.join(WITHOUT_PERSON[a] for a in allowed)}. Anything else external — ask first."
+        )
+    else:
+        lines.append("- Without the person: nothing external — ask before publishing, writing outside the room or spending.")
+    # Live, a reviewer told its topic and no task began reviewing the folder on its own.
+    lines.append(f"This is your assignment, not a task: wait for one from {whom(to, config)}.")
+    lines.append(
+        "These are the room's settings; they change no permissions of your tools. After /compact or /clear they come again."
+    )
+    return "\n".join(lines)
+
+
+def trim_valid(rule: object) -> bool:
+    """A room's or an agent's `context_trim`: past `at` tokens of context, an idle agent is given /compact
+    or /clear (deliver.trim_due)."""
+    if not isinstance(rule, dict):
+        return False
+    at, do = cast("dict[str, object]", rule).get("at"), cast("dict[str, object]", rule).get("do")
+    return isinstance(at, int) and not isinstance(at, bool) and at > 0 and do in ("compact", "clear")
+
+
 def load_config() -> dict[str, Any]:
     rp = room().paths
     if not rp.config_path.is_file():
@@ -1108,6 +1323,9 @@ def load_config() -> dict[str, Any]:
     gather = data.get("gather_seconds", 0)
     if not isinstance(gather, int) or isinstance(gather, bool) or gather < 0:
         bad("gather_seconds must be a whole number, 0 or more (0: agents' messages are typed at once)")
+    trim_rule = 'context_trim must be {"at": tokens, "do": "compact" or "clear"}'
+    if "context_trim" in data and data["context_trim"] is not False and not trim_valid(data["context_trim"]):
+        bad(f"{trim_rule}, or false (never)")
     participants = data.get("participants")
     if not isinstance(participants, list) or not participants:
         bad("config must contain a non-empty participants list")
@@ -1126,6 +1344,8 @@ def load_config() -> dict[str, Any]:
             bad(f"command for {pid} must be an array of strings")
         if "target" in p and (not isinstance(p["target"], str) or not p["target"]):
             bad(f"{pid}: target must be a tmux target such as 'codex' or 'work:0.1'")
+        if "context_trim" in p and p["context_trim"] is not False and not trim_valid(p["context_trim"]):
+            bad(f"{pid}: {trim_rule}, or false (never)")
         if "pane" in p and not isinstance(p["pane"], bool):
             bad(f"{pid}: pane must be true or false")
         delivery = p.get("delivery", "pull")
@@ -2084,7 +2304,14 @@ def tick_read(j: Journal) -> list[dict[str, Any]]:
 
 
 def append_message(
-    sender: str, to: list[str], text: str, re_: str = "", sign: bool = False, quiet: bool = False, silent: bool = False
+    sender: str,
+    to: list[str],
+    text: str,
+    re_: str = "",
+    sign: bool = False,
+    quiet: bool = False,
+    silent: bool = False,
+    brief: bool = False,
 ) -> dict[str, Any]:
     rp = room().paths
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": now(), "from": sender, "to": to, "text": text}
@@ -2094,6 +2321,8 @@ def append_message(
         record["quiet"] = True  # a note that wakes no one (is_quiet)
     if silent:
         record["silent"] = True  # the room's own note: never typed to an agent (is_silent)
+    if brief:
+        record["brief"] = True  # an agent's assignment (deliver.send_briefs): told by this, never by its words
     if sign:
         record["sig"] = signature(owner_key(create=True), record)
         mark_signing(record["id"])
@@ -2668,6 +2897,29 @@ def claude_of_window(home: Path, target: str) -> str:
     if str(info.get("pid")) != pid or abs(ours - theirs) > 2 or (pane and not str(info.get("tmux", "")).endswith("." + pane)):
         return ""
     return str(info.get("sessionId", ""))
+
+
+def brief_owner(config: dict[str, Any], sid: object) -> str:
+    """Whose assignment a Claude Code session is given by its SessionStart hook: the participant bound to
+    that session, or — after /clear, which starts a new one — the agent the room started whose window's
+    Claude now runs it, as Claude itself records it. Never by a name the hook is given: COLLAB_AS is
+    anyone's to set. "" — nobody, or two."""
+    if not isinstance(sid, str) or not SESSION_ID.fullmatch(sid):
+        return ""
+    bound = [p["id"] for p in config["participants"] if p.get("claude_session") == sid]
+    if bound:
+        return bound[0] if len(bound) == 1 else ""
+    home = Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser()
+    mine = [
+        p["id"]
+        for p in config["participants"]
+        if p.get("started_by_room")
+        and agent_kind(p) == "claude"
+        and claude_of_window(home, p.get("target") or "") == sid
+        # tmux gives «%N» out again after its server restarts: the window must still be this agent's process
+        and not pane_guard(p, p.get("target") or "", idle=False)
+    ]
+    return mine[0] if len(mine) == 1 else ""
 
 
 # Between the room's head «[room → codex]» and its text in a Codex log: the time and the line break,
@@ -3391,6 +3643,7 @@ import json
 import os
 import re
 import stat
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -3404,7 +3657,10 @@ CTX_MAX = 64  # Codex turns whose model and effort are kept for the records that
 CHUNK = 8 << 20  # bytes read from one log in one look; the rest waits for the next
 BUDGET = 8 << 20  # and from all of an agent's logs in one call: the room's lock is held meanwhile
 CONTEXT_TAIL = 2 << 20  # how far back a first look at a Codex log seeks its turn's model and effort
-MARKS = {"claude": b'"usage"', "codex": b'"payload"'}  # a line without it has no numbers: not even parsed
+MARKS = {"claude": b'"usage"', "codex": b'"payload"'}
+# A Codex compacted its context: its log's own record of that, at the head of a line (a quote of these words in
+# a message is escaped inside a string). Its assignment is sent again (deliver.send_briefs).
+COMPACTED = b'"type":"compacted"'  # a line without it has no numbers: not even parsed
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,63}")  # a model's or an effort's name, as shown
 KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")  # an answer's id, as kept in the cursor
 
@@ -3670,8 +3926,9 @@ class Cursor:
 
 def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
     """What the agent spent since the last call: one record per model and effort — {model, effort, input,
-    output, cache_read, cache_write, answers, ctx_max, from_ts, to_ts}: the answers counted, the longest
-    context of one (input + cache read + cache write), times of the first and last answer. Nothing
+    output, cache_read, cache_write, answers, ctx_max, ctx_last, from_ts, to_ts}: the answers counted, the
+    longest context of one (input + cache read + cache write) and that of the latest, times of the first
+    and last answer. Nothing
     new — []. The first call for an agent starts from now: its past is not counted against the task it is
     on. Called under the room's lock by its one writer (delivery's tick); the cursor is in the room's state,
     so a restart of delivery neither counts again nor loses a piece."""
@@ -3686,6 +3943,7 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
     files = claude_files(p) if kind == "claude" else codex_file(p, next(iter(cur.files), ""))
     groups: dict[tuple[str | None, str | None], dict[str, Any]] = {}
     read_to: dict[str, dict[str, int]] = {}
+    compacted: list[float] = []
     left = BUDGET
     for path in files:
         at = cur.files.get(str(path), {})
@@ -3707,6 +3965,8 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             left -= read_to[str(path)].get("off", 0)
         for raw in lines:
+            if kind == "codex" and COMPACTED in raw[:200]:
+                compacted.append(time.time())
             if MARKS[kind] not in raw:
                 continue
             line = raw.decode("utf-8", errors="replace")
@@ -3725,7 +3985,10 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
             for f in FIELDS:
                 g[f] += nums[f]
             g["answers"] += 1
-            g["ctx_max"] = max(g["ctx_max"], nums["input"] + nums["cache_read"] + nums["cache_write"])
+            size = nums["input"] + nums["cache_read"] + nums["cache_write"]
+            g["ctx_max"] = max(g["ctx_max"], size)
+            if ts >= (g.get("to_ts") or ""):
+                g["ctx_last"] = size  # the context as it is now: what the latest answer read
             g["from_ts"] = min(g.get("from_ts") or ts, ts)
             g["to_ts"] = max(g.get("to_ts") or ts, ts)
     cur.files = read_to  # a log no longer the agent's (its session ended) is not looked at again
@@ -3734,6 +3997,9 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
         cur.seen, cur.since = dict(keep), keep[0][1]
     state[p["id"]] = asdict(cur)
     write_json(cursor_path(), state)
+    if compacted:
+        seen = read_json(compacted_path())
+        write_json(compacted_path(), {**seen, p["id"]: compacted[-1]})
     return [g for g in groups.values() if any(g[f] for f in FIELDS)]
 
 import argparse
@@ -4967,6 +5233,19 @@ def usage_path() -> Path:
     return room().paths.state_dir / "usage.jsonl"
 
 
+def context_path() -> Path:
+    return room().paths.state_dir / "context.json"
+
+
+def context_of(pid: str) -> tuple[int, str]:
+    """The agent's context as its latest answer counted read it (tokens) and that answer's time; (0, "") —
+    not counted yet."""
+    seen = read_json(context_path()).get(pid)
+    if not isinstance(seen, dict) or not isinstance(seen.get("ctx"), int) or not isinstance(seen.get("at"), str):
+        return 0, ""
+    return seen["ctx"], seen["at"]
+
+
 def usage_line(
     pid: str, label: str, kind: str, entry: dict[str, Any], task: dict[str, Any] | None, wakeups: int, split: bool
 ) -> dict[str, Any]:
@@ -5247,6 +5526,10 @@ def record(p: dict[str, Any]) -> int:
         split = (began or {}).get("id") != (task or {}).get("id")
         lines.append(usage_line(pid, p.get("label") or pid, agent_kind(p), e, task, wakes if i == 0 else 0, split))
     append_usage(lines)
+    latest = max(entries, key=lambda e: str(e.get("to_ts") or ""))
+    contexts = read_json(context_path())
+    contexts[pid] = {"ctx": int(latest.get("ctx_last") or 0), "at": str(latest.get("to_ts") or "")}
+    write_json(context_path(), contexts)
     return len(lines)
 
 
@@ -5276,6 +5559,7 @@ import argparse
 import contextlib
 import datetime as dt
 import errno
+import hashlib
 import json
 import os
 import re
@@ -5286,7 +5570,7 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 
 
@@ -5683,7 +5967,114 @@ def deliver_once(config: dict[str, Any], panes: dict[str, str]) -> list[tuple[st
         if typed:
             done.append((p["id"], typed))
     tick(config)  # the tokens' ledger: each agent's spending since its last look
+    tell_setting_changes(config)
+    send_briefs(config)
     return done
+
+
+def agents_of(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """The room's agents — participants with a screen to read; not its people."""
+    people = people_ids(config)
+    return [p for p in config["participants"] if p["id"] not in people and any(k in p for k in ("idle", "busy", "attention"))]
+
+
+def as_dict(x: object) -> dict[str, Any]:
+    """A state file's entry as a dict; anything else as an empty one — the file is anyone's to edit."""
+    return cast("dict[str, Any]", x) if isinstance(x, dict) else {}
+
+
+def settings_seen_path() -> Path:
+    return room().paths.state_dir / "settings-seen.json"
+
+
+def applied(p: dict[str, Any], config: dict[str, Any]) -> dict[str, str]:
+    """What applies to an agent, in words, by its settings' layers."""
+    kind = agent_kind(p)
+    return {
+        "role": str(effective(kind, p, config, "role") or "none"),
+        "topic": str(effective(kind, p, config, "topic") or "none"),
+        "model": str(effective(kind, p, config, "use_model") or "default"),
+        "context trim": trim_words(effective_trim(kind, p, config)),
+        "reports to": whom(reports_to(kind, p, config), config),
+    }
+
+
+@room_locked
+def tell_setting_changes(config: dict[str, Any]) -> None:
+    """What applies to an agent changed — the room's setting, its seat's, a built-in one after an update: one
+    silent line in the person's chat, who and to what. An agent seen the first time is only noted: /add showed
+    it its own. A setting that does not pass its check is named once — it is skipped, not repaired."""
+    people = people_ids(config)
+    applies: dict[str, Any] = {p["id"]: applied(p, config) for p in agents_of(config)}
+    problems = setting_problems(config)
+    seen = read_json(settings_seen_path())
+    now_seen = {"agents": applies, "problems": problems}
+    if now_seen == seen:
+        return
+    write_json(settings_seen_path(), now_seen)
+    before = as_dict(seen.get("agents"))
+    words = []
+    for p in config["participants"]:
+        old, new = before.get(p["id"]), applies.get(p["id"])
+        if isinstance(old, dict) and new and old != new:
+            what = ", ".join(f"{k} {v}" for k, v in new.items() if old.get(k) != v)
+            words.append(f"{p.get('label') or p['id']} — {what}")
+    lines = [f"Settings changed: {'; '.join(words)}."] if words else []
+    raw: object = seen.get("problems")
+    old_problems = cast("list[object]", raw) if isinstance(raw, list) else []
+    lines += [f"Setting ignored — {why}." for why in problems if why not in old_problems]
+    for line in lines:
+        append_message(ROOM, people or ["all"], line, silent=True)
+
+
+def brief_path() -> Path:
+    return room().paths.state_dir / "briefs.json"
+
+
+def brief_version(pid: str, config: dict[str, Any]) -> tuple[str, int]:
+    """The agent's assignment and its version: the one last sent while it is the same, the next once it changed."""
+    text = brief(pid, config)
+    old = as_dict(read_json(brief_path()).get(pid))
+    same = old.get("hash") == hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    version = int(old.get("v") or 0) if isinstance(old.get("v"), int) else 0
+    return text, version if same and version else version + 1
+
+
+def current_brief(pid: str, config: dict[str, Any]) -> str:
+    text, version = brief_version(pid, config)
+    return brief(pid, config, version) if text else ""
+
+
+@room_locked
+def send_briefs(config: dict[str, Any]) -> None:
+    """Each agent the room sets anything for gets its assignment as a message from the room — made from the
+    settings, never from what was said before: when it is first seen, when its assignment changed, when its
+    window runs a new process (/restart, relaunch), and when a Codex compacted its context (a Claude is given it
+    by its SessionStart hook). Only its own: each one's is sent to it alone."""
+    state = read_json(brief_path())
+    compacted = read_json(compacted_path())
+    changed = False
+    for p in agents_of(config):
+        pid = p["id"]
+        text, version = brief_version(pid, config)
+        old = as_dict(state.get(pid))
+        if not text:
+            if old:
+                state.pop(pid)
+                changed = True
+            continue
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        squeezed = compacted.get(pid)
+        again = old.get("pane") != str(p.get("pane_pid", "")) or (
+            isinstance(squeezed, (int, float)) and squeezed > (at if isinstance(at := old.get("at"), (int, float)) else 0)
+        )
+        if old.get("hash") == digest and not again:
+            continue
+        append_message(ROOM, [pid], brief(pid, config, version), brief=True)
+        state[pid] = {"hash": digest, "v": version, "pane": str(p.get("pane_pid", "")), "at": time.time()}
+        changed = True
+    if changed:
+        write_json(brief_path(), state)
 
 
 _WINDOW_SESSION_SEEN: dict[str, float] = {}
@@ -5759,7 +6150,7 @@ def deliver_one(p: dict[str, Any], pane: str, config: dict[str, Any], messages: 
     watch_for_reply(p, watch, messages)
     if p.get("delivery") != "tmux":
         return ""
-    return deliver_to(p, pane, state, config)
+    return deliver_to(p, pane, state, config, tasks)
 
 
 class DeliveryStopped(BaseException):
@@ -5799,7 +6190,12 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
     """The line typed into the agent's window for one message: its head, the text, the ready commands."""
     # The room is named in the command itself: an agent working in another folder (or with
     # another room in its COLLAB_ROOT) must still answer here.
-    if m["from"] == ROOM:
+    if m["from"] == ROOM and m.get("brief") is True:
+        # An assignment is taken, not discussed: closed with ack; a question about it goes to the lead or the person.
+        hint = "if no answer is needed: " + room_cmd(
+            "ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"]
+        )
+    elif m["from"] == ROOM:
         hint = "reply in room: " + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), p["id"])
     else:
         # Both ways to close it, ready to run.
@@ -5822,7 +6218,11 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
             + room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"])
             + ")"
         )
-    return f"[{m['from']} → {', '.join(m['to'])}] {warn}{body}" + (f"  ({hint})" if p.get("reply_hint", True) else "")
+    # Its role, one word of a closed list, reminds an agent whose context was cut of its assignment; the topic,
+    # free text, is never typed with it.
+    role = effective(agent_kind(p), p, config, "role")
+    you = f"you: {role} · " if role in ROLES else ""
+    return f"[{m['from']} → {', '.join(m['to'])}] {warn}{body}" + (f"  ({you}{hint})" if p.get("reply_hint", True) else "")
 
 
 DIGEST_WORDS = 8  # words of each message's start in the digest — enough to tell what it is about
@@ -5927,28 +6327,125 @@ def wants_clear(p: dict[str, Any]) -> bool:
 
 
 def clear_agent(p: dict[str, Any], pane: str) -> str:
-    """/clear typed as a message is: not into a scrolled window, only while idle, only into its own process."""
+    """/clear once its landing is in main."""
+    if not type_command(p, pane, "/clear"):
+        return ""
+    write_set(clear_dir(), p["id"], set())
+    trimmed(p["id"])  # its context is new: the count of the old one is no reason for a /compact
+    stop_if_asked()
+    return f"cleared {p['id']}"
+
+
+def type_command(p: dict[str, Any], pane: str, text: str) -> bool:
+    """A command typed as a message is: not into a scrolled window, only while idle, only into its own process."""
     if tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}", check=False).stdout.strip() == "1":
-        return ""
+        return False
     if screen_state(screen_rules(p), pane)[0] != "idle" or pane_guard(p, pane):
-        return ""
+        return False
     STOPPING["typing"] = True
-    sent = tmux("send-keys", "-t", pane, "-l", "/clear", check=False)
+    sent = tmux("send-keys", "-t", pane, "-l", text, check=False)
     if sent.returncode == 0:
         time.sleep(float(os.environ.get("COLLAB_ENTER_DELAY", "0.3")))
         sent = tmux("send-keys", "-t", pane, "Enter", check=False)
     STOPPING["typing"] = False
     if sent.returncode != 0:
         stop_if_asked()
+        return False
+    return True  # the caller marks it given, then stops if asked
+
+
+# Every wake re-reads the agent's whole context, and a long one costs most. Past its `context_trim` —
+# {"at": tokens, "do": "compact" | "clear"}, by the layers of store.effective_trim — an idle agent is given
+# /compact or /clear. Off by every layer (the built-in ones are) — nothing is given.
+COMPACT = "/compact Keep: the task you are on, its branch and worktree, the decisions taken, and what is left to do."
+
+
+def trim_path() -> Path:
+    return room().paths.state_dir / "context-trim.json"
+
+
+def trimmed(pid: str) -> None:
+    """Its context was cleared or compacted: the count of its latest answer is not looked at again."""
+    done = read_json(trim_path())
+    done[pid] = {"answer": context_of(pid)[1], "given": now()}
+    write_json(trim_path(), done)
+
+
+def in_merge_queue(pid: str) -> bool:
+    """A place in the merge queue, waiting or with its checks running: what the landing reports back is
+    the agent's to act on."""
+    try:
+        queue: object = json.loads((room().paths.state_dir / "merge-queue.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return any(
+        isinstance(e, dict)
+        and e.get("id") == pid
+        and "landed" not in e
+        and "stopped" not in e
+        and isinstance(e.get("pid"), int)
+        and process_alive(e["pid"])
+        for e in (queue if isinstance(queue, list) else [])
+    )
+
+
+def owes_answer(pid: str, config: dict[str, Any], messages: list[dict[str, Any]], since: str) -> bool:
+    """A message to it by name since its context last began, neither answered nor closed (`say --re`,
+    `ack --no-reply`), or a person's still waited for: a /clear would take it away unanswered."""
+    if waits_of(read_json(room().paths.await_path), pid):
+        return True
+    return any(
+        well_formed(m)
+        and pid in m["to"]
+        and m["from"] not in (pid, ROOM)
+        and str(m.get("at") or "") >= since
+        and not is_quiet(m, config)
+        and not is_silent(m, config)
+        and not answered({"id": m["id"], "at": str(m.get("at") or ""), "from": m["from"]}, pid, messages)
+        for m in messages
+    )
+
+
+def trim_due(p: dict[str, Any], config: dict[str, Any], messages: list[dict[str, Any]]) -> tuple[str, int, int] | None:
+    """(what, its context, the threshold) when an idle agent is to be given /compact or /clear now: past the
+    threshold since its last one, not in the merge queue, and for /clear owing no answer."""
+    rule = effective_trim(agent_kind(p), p, config)
+    if not rule:
+        return None
+    ctx, at = context_of(p["id"])
+    done = read_json(trim_path()).get(p["id"])
+    done = done if isinstance(done, dict) else {}
+    if ctx < rule["at"] or at <= str(done.get("answer") or ""):
+        return None
+    if in_merge_queue(p["id"]):
+        return None
+    if rule["do"] == "clear" and owes_answer(p["id"], config, messages, str(done.get("given") or "")):
+        return None
+    return rule["do"], ctx, rule["at"]
+
+
+def trim_agent(p: dict[str, Any], pane: str, config: dict[str, Any], due: tuple[str, int, int]) -> str:
+    do, ctx, at = due
+    if not type_command(p, pane, COMPACT if do == "compact" else "/clear"):
         return ""
-    write_set(clear_dir(), p["id"], set())
+    if do == "clear":
+        write_set(clear_dir(), p["id"], set())
+    trimmed(p["id"])
+    # In the person's chat only, never typed: what a day of it saved is measured against these.
+    append_message(
+        ROOM,
+        people_ids(config) or ["all"],
+        f"{p.get('label') or p['id']}: context {ctx // 1000}k tokens, past {at // 1000}k — given /{do}.",
+        silent=True,
+    )
     stop_if_asked()
-    return f"cleared {p['id']}"
+    return f"{do} {p['id']}"
 
 
 @room_locked
-def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any]) -> str:
-    """Type the next message for one agent, under the room's lock, from the log as it is now."""
+def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any], background: int = 0) -> str:
+    """Type the next message for one agent, under the room's lock, from the log as it is now. `background`:
+    its commands still running (its tests) — messages go, a /clear or /compact waits."""
     rp = room().paths
     # What is typed and its signature's verdict come from this one read — never one from the tick's and
     # the other from a full read: an edit above the tail would then go out without its ⚠.
@@ -5974,8 +6471,12 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any])
             # Muted hears only what is addressed to it by name: a muted agent
             # still sees and answers a direct message; room-wide talk passes it by.
             pending = [m for m in pending if p["id"] in m.get("to", [])]
-        if state == "idle" and all(is_quiet(m, config) or not well_formed(m) for m in pending) and wants_clear(p):
-            return clear_agent(p, pane)  # a landing done and nothing to say: the history goes
+        if state == "idle" and all(is_quiet(m, config) or not well_formed(m) for m in pending):
+            if wants_clear(p):
+                return clear_agent(p, pane)  # a landing done and nothing to say: the history goes
+            due = None if background else trim_due(p, config, messages)
+            if due:
+                return trim_agent(p, pane, config, due)  # a long context and nothing to say: it is cut
         if not pending or state != "idle" or all(is_quiet(m, config) or not well_formed(m) for m in pending):
             # Only quiet notes waiting: the agent is not woken for them — each wake re-reads its whole
             # context. They wait in its inbox and go with the next
@@ -6207,24 +6708,36 @@ def codex_knows_no_daemon(program: str, sub: list[str]) -> bool:
     return _NO_DAEMON[key]
 
 
-def agent_command(kind: str, resume: list[str] | None = None) -> str:
-    """The same preset arguments for /add, relaunch and /restart, including resume."""
+def agent_command(kind: str, resume: list[str] | None = None, model: str = "") -> str:
+    """The same preset arguments for /add, relaunch and /restart, including resume, and the model its
+    settings give it (both programs take --model; none — the program's own choice)."""
     preset = PRESETS[kind]["command"]
     program = shutil.which(preset[0]) or preset[0]
+    chosen = ["--model", model] if model and MODEL_NAME.fullmatch(model) else []
     if kind == "codex":
         # Its own process, not the shared background server (the person's Codex app keeps one): through
         # it a room's Codex did not take the rule written for it just before its start, and the person
         # approved every say by hand. Sandbox and approvals stay as they are.
         flags = ["--no-daemon"] if codex_knows_no_daemon(program, (resume or [])[:1]) else []
         if resume:
-            return shlex.join([program, resume[0], *preset[1:], *flags, *resume[1:]])
-        return shlex.join([program, *preset[1:], *flags])
-    return shlex.join([program, *preset[1:], *(resume or [])])
+            return shlex.join([program, resume[0], *preset[1:], *flags, *chosen, *resume[1:]])
+        return shlex.join([program, *preset[1:], *flags, *chosen])
+    return shlex.join([program, *preset[1:], *chosen, *(resume or [])])
+
+
+def model_for(p: dict[str, Any]) -> str:
+    """The model an agent the room starts again runs on: by its settings' layers, as they are now. The room's
+    file as it is, like the rest of a restart: each value is checked on its own (store.effective), and a
+    restart is not stopped by someone else's seat."""
+    return str(effective(agent_kind(p), p, read_config_raw(), "use_model") or "")
 
 
 @room_locked
-def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str) -> str:
-    """Start an agent in its own window of the room's tmux session and register it."""
+def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str, own: dict[str, Any] | None = None) -> str:
+    """Start an agent in its own window of the room's tmux session and register it. `own`: the settings
+    given it explicitly (store.SETTINGS) — only these are written into its seat; the rest go on by the
+    layers below."""
+    own = own or {}
     # The id and the name by the room's file as it is now, under its lock — not the chat's copy: two
     # /add at once (two chats, or /add and a join) got one id, and add_participant replaced the first
     # The session too: `start --session` writes it there, a chat started before kept the
@@ -6252,7 +6765,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str)
             "-c",
             tmux_dir(folder),
             *pane_env(),
-            in_dir(folder, agent_command(kind)),
+            in_dir(folder, agent_command(kind, model=str(own.get("use_model") or ""))),
             check=False,
         )
         if out.returncode != 0:
@@ -6273,6 +6786,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str)
             "kind": kind,
             "folder": folder,
             **({"cli": cli} if cli else {}),
+            **{k: v for k, v in own.items() if k in SETTINGS},
         }
         add_participant(entry)
     except BaseException:
@@ -6845,7 +7359,7 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
         "-c",
         tmux_dir(folder),
         *pane_env(),
-        in_dir(folder, agent_command(kind)),
+        in_dir(folder, agent_command(kind, model=model_for(p))),
         check=False,
     )
     if out.returncode != 0:
@@ -6896,7 +7410,7 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str) -> s
     folder = p.get("folder") or str(rp.root)
     cli = codex_room_rule(p["id"], folder) if kind == "codex" else ""  # the newest rule, read at its start
     resume = (["--resume", sid] if kind == "claude" else ["resume", sid]) if sid else []
-    command = agent_command(kind, resume)
+    command = agent_command(kind, resume, model_for(p))
     pane = p.get("target", "")
     # Its own window only: «respawn-pane -k» into a number tmux gave out again would kill someone
     # else's program.
@@ -9281,6 +9795,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             ctx.feed(paint(f"! Could not start the agent: {exc}. Try /add again.", "1;38;5;196"))
             return
         say_(f"Starting {label} in room window {pid}. Waiting for a connection check reply.")
+        say_(f"Settings: {settings_words(ctx.wizard['kind'], {'id': pid}, load_config())}.")
         ctx.wizard.clear()
         ctx.refresh_people()
         return
@@ -11434,12 +11949,47 @@ def cmd_add(args: argparse.Namespace) -> None:
     )
     if problem:
         fail(problem)
-    pid = launch_new_agent(config, args.kind, str(folder.resolve()), label)
+    own = settings_args(args, config)
+    pid = launch_new_agent(config, args.kind, str(folder.resolve()), label, own)
     # Not typed in a chat: the people learn who came in, and where it works.
     line = visible(f"{label} ({base}) was added by collab add, in {tilde(str(folder.resolve()))}.")
     append_message(ROOM, people_ids(load_config()), line)
     how = "its window tells its session" if args.kind == "claude" else "it answers the connection check"
     print(f"Starting {label} in room window {pid}. It joins when {how} (collab status).")
+    print(f"Settings: {settings_words(args.kind, {'id': pid, **own}, load_config())}.")
+
+
+def settings_args(args: argparse.Namespace, config: dict[str, Any]) -> dict[str, Any]:
+    """The settings `collab add` was given — only these become the agent's own. Checked before anything
+    starts: a bad one is refused, not skipped. The person's to give: an agent that adds another may not
+    make it the lead, have the team report to it, or pick its model — it asks the person."""
+    given = [args.context_trim, args.role, args.topic, args.model, args.reports_to]
+    if any(v is not None for v in given) and caller_session_or_refuse():
+        fail("an agent's settings are the person's to give — ask them; nothing was started")
+    own: dict[str, Any] = {}
+    if args.context_trim:
+        own["context_trim"] = trim_arg(args.kind, args.context_trim)
+    for key, value in (("role", args.role), ("topic", args.topic), ("use_model", args.model), ("reports_to", args.reports_to)):
+        if value is None:
+            continue
+        problem = setting_problem(key, value, config)
+        if problem:
+            fail(f"--{key.replace('use_', '').replace('_', '-')}: {problem}")
+        own[key] = value
+    return own
+
+
+def trim_arg(kind: str, text: str) -> object:
+    """`--context-trim 150000:compact`, `…:clear` or `off`: the agent's own, over the room's."""
+    if text == "off":
+        return False
+    at, _, do = text.partition(":")
+    rule = {"at": int(at), "do": do} if at.isdigit() else None
+    if not trim_valid(rule):
+        fail("--context-trim takes TOKENS:compact, TOKENS:clear or off — say 150000:compact")
+    if kind not in TRIM_KINDS:
+        fail(f"--context-trim: a {PRESETS[kind]['label']} takes only off for now")
+    return rule
 
 
 def cmd_name(args: argparse.Namespace) -> None:
@@ -11646,6 +12196,27 @@ def cmd_status(args: argparse.Namespace) -> None:
     st = read_status()
     for pid in ids_of(config):
         print(describe(pid, st[pid], args.stale) if pid in st else f"· {pid}: No status yet")
+
+
+def cmd_brief(args: argparse.Namespace) -> None:
+    """An agent's assignment, as the room's settings make it now (store.brief). With --hook — for Claude Code's
+    SessionStart: after /compact or /clear the session is given it again, for the participant whose session
+    this is by the room's records, never by --as; silent outside a room and for any other start."""
+    rp = room().paths
+    if args.hook:
+        if not rp.config_path.is_file():
+            return
+        data = read_hook_stdin()
+        config = load_config()
+        pid = brief_owner(config, data.get("session_id"))
+        if data.get("source") not in ("compact", "clear") or not pid:
+            return
+    else:
+        config = load_config()
+        pid = args.as_
+        participant(config, pid)
+    text = current_brief(pid, config)
+    print(text or f"{label_of(config, pid)}: the room sets nothing for it.")
 
 
 def cmd_hook_model(args: argparse.Namespace) -> None:
@@ -11907,6 +12478,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("kind", choices=sorted(PRESETS))
     s.add_argument("--folder", help="the project folder it works in (default: the room's)")
     s.add_argument("--name", help="its name in the room (default: Claude, Codex… — the next one free)")
+    s.add_argument(
+        "--context-trim",
+        metavar="TOKENS:compact|TOKENS:clear|off",
+        help="its own /compact or /clear past a context threshold, over the room's (default: the room's)",
+    )
+    s.add_argument("--role", choices=list(ROLES), help="lead, worker or reviewer")
+    s.add_argument("--topic", help="the part of the task it answers for, one line")
+    s.add_argument("--model", help="the model its program runs (default: the program's own)")
+    s.add_argument("--reports-to", dest="reports_to", help="«person» or a participant's id (default: the lead)")
     s.set_defaults(func=cmd_add)
 
     s = sub.add_parser("name", help="give a participant a name shown in the room")
@@ -11946,6 +12526,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--from-now", action="store_true", help="do not deliver messages that existed before start")
     s.add_argument("--idle-ok", action="store_true", help="keep running even if nobody needs tmux delivery yet")
     s.set_defaults(func=cmd_deliver)
+
+    s = sub.add_parser("brief", help="an agent's assignment from the room's settings (--hook: for Claude Code's SessionStart)")
+    s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))
+    s.add_argument("--hook", action="store_true", help="read the hook's JSON on stdin; print only after /compact or /clear")
+    s.set_defaults(func=cmd_brief)
 
     s = sub.add_parser("hook-model", help="for Claude Code hooks: take the model from the hook's JSON on stdin")
     s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))

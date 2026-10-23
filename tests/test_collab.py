@@ -1863,6 +1863,120 @@ class RoomTest(Base):
         self.enterContext(seam(mod, "tmuxio.tmux", tmux))
         return mod
 
+    def test_settings_go_by_layers_seat_room_agent_and_a_bad_one_is_skipped(self):
+        # One chain for every setting: built-in by kind, the seat in the room's scenario, the room (only the
+        # context trim), the agent's own. What the person set on the agent is over the scenario's. A value
+        # that does not pass is skipped — the layer below applies — and named.
+        seat = {"seat": "s1", "role": "worker", "topic": "цены", "use_model": "sonnet", "reports_to": "mira"}
+        seat["context_trim"] = {"at": 100000, "do": "compact"}
+        people = [{"id": "owner"}, {"id": "mira", "label": "Мира", "pane": False}]
+
+        def told(**own):
+            a = {"id": "a", "label": "Ann", "kind": "claude", "pane": False, "seat": "s1", **own}
+            cfg = {"version": 2, "session": "test-room", "participants": [*people, a], "team": {"seats": [seat]}}
+            self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+            r = self.run_collab("brief", "--as", "a")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout
+
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+        self.assertIn("Role: worker", told(), "the seat's role")
+        self.assertIn("Topic: цены.", told())
+        self.assertIn("Report to: Мира.", told())
+        mine = told(role="reviewer", topic="отзывы", reports_to="person")
+        for part in ("Role: reviewer", "Topic: отзывы.", "Report to: the person."):
+            self.assertIn(part, mine, "the agent's own over the seat's")
+        for key, bad in (("role", "boss"), ("reports_to", "a"), ("topic", "x\x1b[2J")):
+            self.assertIn("Role: worker" if key == "role" else "Report to: Мира." if key == "reports_to" else "Topic: цены.",
+                          told(**{key: bad}), f"a bad {key} is skipped: the seat's applies")  # fmt: skip
+        mod = _Loader(f"collab_layers_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        eff = mod.effective
+        cfg = {"participants": [{"id": "mira"}, {"id": "a", "seat": "s1"}], "team": {"seats": [seat]}}
+        a = cfg["participants"][1]
+        self.assertEqual(eff("claude", a, cfg, "use_model"), "sonnet", "the seat's model")
+        self.assertEqual(eff("claude", {**a, "use_model": "opus"}, cfg, "use_model"), "opus", "the agent's own")
+        self.assertEqual(eff("claude", {**a, "use_model": "x#(touch y)"}, cfg, "use_model"), "sonnet", "a bad one skipped")
+        self.assertEqual(eff("claude", a, cfg, "context_trim"), seat["context_trim"], "the seat's trim")
+        room = {**cfg, "context_trim": {"at": 50000, "do": "clear"}}
+        self.assertEqual(eff("claude", a, room, "context_trim"), room["context_trim"], "the room's over the seat's")
+        self.assertIsNone(eff("claude", {**a, "context_trim": False}, room, "context_trim"), "the agent's false over all")
+        self.assertIsNone(eff("claude", {"id": "z"}, {**cfg, "role": "lead"}, "role"), "the room has no role layer")
+        problems = mod.setting_problems({"participants": [{"id": "a", "label": "Ann", "use_model": "a b"}]})
+        self.assertEqual(len(problems), 1)
+        self.assertTrue(problems[0].startswith("Ann: use_model"), problems)
+
+    def test_collab_add_gives_only_the_settings_it_was_told_and_starts_the_model(self):
+        self.write_config([{"id": "owner", "label": "Андрей"}, {"id": "mira", "label": "Мира", "pane": False}])
+        mod = _Loader(f"collab_add_settings_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        commands: list[str] = []
+
+        def tmux(*argv, **_):
+            if argv[0] == "new-window":
+                commands.append(argv[-1])
+                return SimpleNamespace(stdout=f"%{len(commands) + 10} 4{len(commands)}\n", returncode=0, stderr="")
+            return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        out = io.StringIO()
+        given = ["--role", "reviewer", "--topic", "тесты", "--model", "sonnet", "--reports-to", "mira"]
+        with mock.patch.object(sys, "argv", ["collab", "add", "claude", "--name", "Rev", *given]):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    mod.main()
+                except SystemExit as exc:
+                    self.fail(f"collab add did not take the settings: {exc}")
+        rev = next(p for p in json.loads(self.cfg.read_text())["participants"] if p["label"] == "Rev")
+        self.assertEqual({k: rev.get(k) for k in ("role", "topic", "use_model", "reports_to")},
+                         {"role": "reviewer", "topic": "тесты", "use_model": "sonnet", "reports_to": "mira"})  # fmt: skip
+        self.assertNotIn("context_trim", rev, "not given: not written")
+        self.assertIn("--model sonnet", commands[0], "its program runs the model it was given")
+        self.assertIn("Settings: reviewer · тесты · model sonnet · context trim off · reports to Мира.", out.getvalue())
+        for bad in (["--model", "x#(touch y)"], ["--reports-to", "nobody"], ["--topic", ""], ["--topic", "a\x1b[2J"]):
+            with mock.patch.object(sys, "argv", ["collab", "add", "claude", *bad]), self.assertRaises(SystemExit):
+                mod.main()
+        self.assertEqual(len(commands), 1, "refused before anything started")
+        self.assertEqual(len(json.loads(self.cfg.read_text())["participants"]), 3)
+        with seam(mod, "screen.caller_claude_session", lambda: "11111111-2222-3333-4444-555555555555"):
+            for own in (["--role", "lead"], ["--reports-to", "mira"], ["--model", "opus"]):
+                with mock.patch.object(sys, "argv", ["collab", "add", "claude", *own]), self.assertRaises(SystemExit):
+                    mod.main()
+        self.assertEqual(len(commands), 1, "an agent gives no settings: the person's to give")
+
+    def test_an_agents_brief_is_made_from_the_rooms_settings_alone(self):
+        people = [
+            {"id": "owner", "label": "Андрей"},
+            {"id": "mira", "label": "Мира", "kind": "claude", "pane": False, "role": "lead"},
+            {"id": "a", "label": "Ann", "kind": "claude", "pane": False, "role": "reviewer", "topic": "безопасность"},
+        ]
+
+        def brief(pid, team):
+            self.cfg.write_text(
+                json.dumps({"version": 2, "session": "t", "participants": people, "team": team}), encoding="utf-8"
+            )
+            r = self.run_collab("brief", "--as", pid)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout
+
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+        team = {"output": "research.md", "without_person": ["merge", "anything"]}
+        text = brief("a", team)
+        for part in ("(version 1)", "Role: reviewer", "Topic: безопасность.", "Report to: Мира.", "Lead: Мира",
+                     "Result file: research.md", "you may: merge into the main branch. Anything else",
+                     "not a task: wait for one from Мира."):  # fmt: skip
+            self.assertIn(part, text)
+        lead = brief("mira", team)
+        self.assertIn("You are the room's lead", lead)
+        self.assertIn("Report to: the person.", lead)
+        self.assertIn("Without the person: nothing external", brief("a", {}))
+        for outside in ("../x.md", "/etc/x", "~/x"):
+            self.assertNotIn("Result file", brief("a", {"output": outside}), outside)
+        del people[2]["role"], people[2]["topic"], people[1]["role"]
+        self.cfg.write_text(json.dumps({"version": 2, "session": "t", "participants": people}), encoding="utf-8")
+        self.assertIn(
+            "the room sets nothing for it", self.run_collab("brief", "--as", "a").stdout, "a room without settings: as before"
+        )
+
     def test_add_takes_the_id_by_the_rooms_file_now_not_the_chats_copy(self):
         # /add chose the id by the chat's copy of the room; one that
         # joined meanwhile had that id, and add_participant silently replaced it.
@@ -1904,6 +2018,44 @@ class RoomTest(Base):
         with mock.patch.object(sys, "argv", ["collab", "add", "codex", "--name", "Коди"]), self.assertRaises(SystemExit):
             mod.main()  # the same name twice: refused, as in /add
         self.assertEqual(len(json.loads(self.cfg.read_text())["participants"]), 3)
+
+    def test_context_trim_goes_by_three_layers_and_an_added_agent_keeps_only_what_was_given_it(self):
+        # Built-in by kind, then the room's, then the agent's own. A seat records only what was given it:
+        # a copy of the room's would stay the same when the room's changes.
+        mod = _Loader(f"collab_trim_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        compact, clear = {"at": 150000, "do": "compact"}, {"at": 90000, "do": "clear"}
+        self.enterContext(mock.patch.dict(mod.BUILTIN, {"claude": {"context_trim": clear}}))
+        eff = mod.effective_trim
+        self.assertEqual(eff("claude", {}, {}), clear, "built-in")
+        self.assertEqual(eff("claude", {}, {"context_trim": compact}), compact, "the room's over it")
+        self.assertIsNone(eff("claude", {}, {"context_trim": False}), "the room's false: never")
+        self.assertEqual(eff("claude", {"context_trim": clear}, {"context_trim": False}), clear, "the agent's over all")
+        self.assertIsNone(eff("claude", {"context_trim": False}, {"context_trim": compact}))
+        self.assertIsNone(eff("codex", {"context_trim": compact}, {"context_trim": compact}), "a Codex: off for now")
+        self.enterContext(mock.patch.dict(mod.BUILTIN, {"claude": {"context_trim": None}}))
+        self.assertIsNone(eff("claude", {}, {}), "no setting anywhere: off")
+
+        self.write_config([{"id": "owner", "label": "Андрей"}])
+        mod = self._launch_mod("collab_add_trim", [])
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["collab", "add", "claude", "--name", "Own", "--context-trim", "120000:clear"]):
+            with contextlib.redirect_stdout(out):
+                mod.main()
+        with mock.patch.object(sys, "argv", ["collab", "add", "claude", "--name", "Plain"]):
+            with contextlib.redirect_stdout(out):
+                mod.main()
+        cfg = {p["label"]: p for p in json.loads(self.cfg.read_text())["participants"]}
+        self.assertEqual(cfg["Own"]["context_trim"], {"at": 120000, "do": "clear"})
+        self.assertNotIn("context_trim", cfg["Plain"], "nothing given: nothing recorded, the layers apply live")
+        self.assertIn(
+            "Settings: no role · model default · context trim /clear past 120k tokens of context · reports to the person.",
+            out.getvalue(),
+        )
+        self.assertIn("Settings: no role · model default · context trim off · reports to the person.", out.getvalue())
+        for bad in (["claude", "--context-trim", "lots"], ["codex", "--context-trim", "150000:compact"]):
+            with mock.patch.object(sys, "argv", ["collab", "add", *bad]), self.assertRaises(SystemExit):
+                mod.main()
+        self.assertEqual(len(json.loads(self.cfg.read_text())["participants"]), 3, "refused before anything started")
 
     def test_collab_add_needs_the_room_running(self):
         self.write_config([{"id": "owner", "label": "Андрей"}], session=f"collab-test-none-{uuid.uuid4().hex[:6]}")
@@ -2135,6 +2287,15 @@ class RoomTest(Base):
         self.run_collab("status", "--as", "claude", "working", "--if-room", "--hook", stdin='{"session_id":"any"}')
         self.assertEqual(state(), "working", "an unbound participant works as before")
 
+    def test_the_claude_plugin_carries_the_programs_version(self):
+        # Claude updates an installed plugin only when its version changes: kept at 0.1.0, a new hook in
+        # hooks.json never reached the agents. Each release raises both.
+        base = Path(__file__).resolve().parents[1]
+        plugin = json.loads((base / "integrations/claude-code/.claude-plugin/plugin.json").read_text(encoding="utf-8"))
+        program = re.search(r'^VERSION = "([^"]+)"$', (base / "src/collab/boot.py").read_text(encoding="utf-8"), re.M)
+        self.assertIsNotNone(program)
+        self.assertEqual(plugin["version"], program.group(1))
+
     def test_notes_the_claude_hooks_put_on_the_status_are_english(self):
         # The permission hook's --note «вопрос о разрешении» was the detail of
         # «Needs your input» in the person's chat and in `collab status` — the interface is English.
@@ -2143,6 +2304,41 @@ class RoomTest(Base):
         self.assertTrue(notes, "the hooks put no note: this test would prove nothing")
         for note in notes:
             self.assertTrue(note.isascii(), note)
+
+    def test_a_claude_is_given_its_brief_after_compact_or_clear_by_its_session_never_by_its_word(self):
+        # SessionStart (source compact or clear) prints the assignment into the session's context. Whose — by the
+        # session bound to a participant, or after /clear (a new session) by the room's window that runs it;
+        # never by --as or COLLAB_AS, anyone's to give.
+        sid, new = "11111111-2222-3333-4444-555555555555", "66666666-7777-8888-9999-000000000000"
+        self.write_config(
+            [
+                {"id": "owner"},
+                {"id": "a", "label": "Ann", "kind": "claude", "pane": False, "role": "reviewer", "claude_session": sid},
+                {"id": "b", "label": "Bob", "kind": "claude", "pane": False, "role": "worker", "topic": "цены"},
+            ]
+        )
+        hook = lambda source, s, *extra: self.run_collab(
+            "brief", "--hook", *extra, stdin=json.dumps({"session_id": s, "source": source})
+        )
+        for source in ("compact", "clear"):
+            r = hook(source, sid)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("Role: reviewer", r.stdout, source)
+            self.assertNotIn("цены", r.stdout, "only its own")
+        self.assertEqual(hook("startup", sid).stdout, "", "a start gets it as a message from the room")
+        self.assertEqual(hook("compact", new, "--as", "b").stdout, "", "a session no one has: nothing, whatever --as says")
+        self.cfg.unlink()
+        r = hook("compact", sid)
+        self.assertEqual((r.returncode, r.stdout), (0, ""), "outside a room: silent")
+        mod = _Loader(f"collab_brief_owner_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        seats = [{"id": "a", "kind": "claude", "started_by_room": True, "target": "%5", "claude_session": sid},
+                 {"id": "b", "kind": "claude", "started_by_room": True, "target": "%6"}]  # fmt: skip
+        with seam(mod, "screen.claude_of_window", lambda home, target: new if target == "%5" else ""):
+            with seam(mod, "screen.pane_guard", lambda p, pane, idle=True, **_: ""):
+                self.assertEqual(mod.brief_owner({"participants": seats}, new), "a", "after /clear: by its window")
+            self.assertEqual(mod.brief_owner({"participants": seats}, "not-a-session"), "")
+            with seam(mod, "screen.pane_guard", lambda p, pane, idle=True, **_: "another program in it"):
+                self.assertEqual(mod.brief_owner({"participants": seats}, new), "", "a window number given out again")
 
     def test_hooks_of_a_second_claude_report_for_the_participant_bound_to_its_session(self):
         # A second Claude joined as claude2, its hooks still spoke as `claude` and were dropped —
@@ -4597,7 +4793,7 @@ for i in range(400):
         self.enterContext(seam(mod, "deliver.remember_window_session", lambda *a, **k: None))
         self.enterContext(seam(mod, "deliver.hold_for_limit", lambda *a, **k: False))
         self.enterContext(seam(mod, "deliver.watch_for_reply", lambda p, state, messages: seen.update(watch=state)))
-        self.enterContext(seam(mod, "deliver.deliver_to", lambda p, pane, state, config: seen.update(deliver=state) or ""))
+        self.enterContext(seam(mod, "deliver.deliver_to", lambda p, pane, state, config, *_: seen.update(deliver=state) or ""))
         for tail, status, deliver in (("1 shell", ("idle", "background 1"), "idle"), ("1 monitor", ("idle", ""), "idle")):
             screen = foot(tail)
             self.enterContext(seam(mod, "tmuxio.tmux", lambda *a, screen=screen, **k: shown(a, screen)))
@@ -6575,6 +6771,146 @@ class DeliveryTest(Base):
         self.assertNotIn("cleared", self.run_collab("deliver", "--once").stdout, "once per landing")
         self.assertEqual(typed("agent").count("got:/clear"), 1)
         self.assertNotIn("got:", typed("cx"), "a Codex keeps its conversation")
+
+    def test_past_its_context_threshold_an_idle_agent_is_given_compact_or_clear_and_otherwise_nothing(self):
+        # Every wake re-reads the whole context. Past the room's threshold, a free agent is given /compact
+        # (or /clear, its own setting); below it, busy, in the merge queue, owing an answer or with no
+        # setting — nothing. The person's chat gets a silent line of each.
+        agent, busy = self.root / "agent.sh", self.root / "busy.sh"
+        busy.write_text('#!/bin/sh\necho WORKING\nwhile read l; do echo "got:$l"; done\n', encoding="utf-8")
+        busy.chmod(0o755)
+        seat = lambda pid, sh=agent, **more: {
+            "id": pid, "kind": "claude", "command": [str(sh)], "delivery": "tmux", "idle": r"^READY$", **more
+        }  # fmt: skip
+        ids = ("big", "small", "busy", "queued", "off", "ceo")
+        seats = [{"id": "owner"}, seat("big"), seat("small"), seat("busy", busy), seat("queued"), seat("off", context_trim=False)]
+        seats.append(seat("ceo", context_trim={"at": 150000, "do": "clear"}))
+        room = lambda **more: self.cfg.write_text(
+            json.dumps({"version": 2, "session": self.session, "participants": seats, **more}), encoding="utf-8"
+        )
+        room(context_trim={"at": 150000, "do": "compact"})
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        panes = json.loads((self.state / "panes.json").read_text())["panes"]
+        for pid in ids:
+            self.assertTrue(self.wait_for(panes[pid], "WORKING" if pid == "busy" else "READY"))
+        typed = lambda pid: (
+            subprocess.run(
+                ["tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", panes[pid]], capture_output=True, text=True
+            ).stdout
+        )
+        contexts = lambda at: (self.state / "context.json").write_text(
+            json.dumps({pid: {"ctx": 2000 if pid == "small" else 160000, "at": at} for pid in ids}), encoding="utf-8"
+        )
+        contexts("2099-01-01T10:00:00+00:00")
+        (self.state / "merge-queue.json").write_text(
+            json.dumps([{"id": "queued", "pid": os.getpid(), "start": "now"}]), encoding="utf-8"
+        )
+        self.note("owner", ["ceo"], "are you on it?")  # owed an answer: no /clear
+        self.run_collab("ack", "--for", "ceo", "--all")  # read, not answered
+        out = self.run_collab("deliver", "--once").stdout
+        self.assertIn("compact big", out)
+        self.assertTrue(self.until(lambda: "got:/compact Keep: the task" in typed("big")), typed("big"))
+        for pid in ("small", "busy", "queued", "off", "ceo"):
+            self.assertNotIn(f" {pid}", out.replace("compact big", ""))
+        self.assertTrue(self.until(lambda: typed("big").rstrip().endswith("READY")))
+        self.assertNotIn("compact", self.run_collab("deliver", "--once").stdout, "once per answer counted")
+        said = [m for m in self.messages() if m["from"] == "room" and "given /" in m["text"]]
+        self.assertEqual([(m["to"], m["text"], m.get("silent")) for m in said],
+                         [(["owner"], "big: context 160k tokens, past 150k — given /compact.", True)])  # fmt: skip
+        last = [m for m in self.messages() if m["to"] == ["ceo"]][-1]
+        self.assertEqual(self.run_collab("ack", "--for", "ceo", "--no-reply", "--id", last["id"]).returncode, 0)
+        self.assertIn("clear ceo", self.run_collab("deliver", "--once").stdout, "nothing owed: now /clear")
+        self.assertTrue(self.until(lambda: "got:/clear" in typed("ceo")), typed("ceo"))
+        room()  # the setting gone, as a room without it: a new answer past the threshold gives nothing
+        contexts("2099-01-02T10:00:00+00:00")
+        (self.state / "merge-queue.json").unlink()
+        time.sleep(0.3)
+        self.assertNotIn("compact", self.run_collab("deliver", "--once").stdout)
+        for pid in ("small", "busy", "queued", "off"):
+            self.assertNotIn("got:/", typed(pid), pid)
+
+    def test_each_agent_gets_its_brief_when_seen_changed_restarted_or_compacted_and_only_its_own(self):
+        mod = _Loader(f"collab_briefs_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        seats = [{"id": "owner"}, {"id": "a", "label": "Ann", "kind": "codex", "idle": "x", "role": "worker", "pane_pid": "41"},
+                 {"id": "b", "label": "Bob", "kind": "claude", "idle": "x", "pane_pid": "42"}]  # fmt: skip
+        cfg = {"participants": seats}
+        briefs = lambda: [(m["to"], m["text"]) for m in self.messages() if m["text"].startswith("Your assignment in this room")]
+        tick = lambda: mod.deliver_once(cfg, {})
+        tick()
+        tick()
+        self.assertEqual([to for to, _ in briefs()], [["a"]], "once, to it alone; none to one the room sets nothing for")
+        self.assertTrue(all(m.get("brief") is True for m in self.messages() if m["text"].startswith("Your assignment")))
+        self.assertIn("(version 1)", briefs()[0][1])
+        seats[1]["topic"] = "цены"
+        tick()
+        self.assertIn("(version 2)", briefs()[-1][1])
+        self.assertIn("Topic: цены.", briefs()[-1][1], "made from the settings as they are now")
+        seats[1]["pane_pid"] = "51"  # /restart: a new process in its window
+        tick()
+        self.assertEqual(len(briefs()), 3)
+        self.assertIn("(version 2)", briefs()[-1][1], "the same assignment: the same version")
+        (self.state / "compacted.json").write_text(json.dumps({"a": time.time()}))  # its log says it compacted
+        tick()
+        tick()
+        self.assertEqual(len(briefs()), 4, "once after a compaction")
+        (self.state / "briefs.json").write_text(json.dumps({"a": {"hash": "x", "v": 2, "pane": "51", "at": "soon"}}))
+        tick()
+        self.assertEqual(len(briefs()), 5, "a broken state file does not stop the briefs")
+        del seats[1]["role"], seats[1]["topic"]
+        tick()
+        self.assertEqual(len(briefs()), 5, "nothing set any more: nothing sent")
+
+    def test_a_brief_is_closed_with_ack_and_the_role_word_goes_with_every_delivery(self):
+        mod = _Loader(f"collab_brief_hint_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        p = {"id": "a", "kind": "claude", "role": "reviewer", "topic": "x$(touch y)", "idle": "x"}
+        cfg = {"participants": [{"id": "owner"}, p]}
+        text = "Your assignment in this room (version 1):\n- Role: reviewer — you look for mistakes in the result."
+        brief = {"id": "m1", "from": "room", "to": ["a"], "text": text, "brief": True}
+        typed = mod.delivery_text(p, brief, cfg, {})
+        hint = typed[typed.rindex("  (") :]
+        self.assertIn("ack", hint)
+        self.assertNotIn(" say ", hint, "an assignment is taken, not discussed in the room")
+        # The room's own line that begins with an agent's name («<name> disconnected»): its words are not a brief.
+        named = mod.delivery_text(p, {**brief, "brief": None, "to": ["all"]}, cfg, {})
+        self.assertIn(" say ", named[named.rindex("  (") :], "a brief is told by its mark, not by its words")
+        self.assertIn("answer", mod.delivery_text({**p, "kind": []}, {**brief, "from": "owner"}, cfg, {}), "a kind not a word")
+        typed = mod.delivery_text(p, {"id": "m2", "from": "owner", "to": ["a"], "text": "hi"}, cfg, {})
+        self.assertIn("(you: reviewer · answer: ", typed)
+        self.assertNotIn("touch", typed, "the topic is never typed with the hint")
+        self.assertNotIn(
+            "you:", mod.delivery_text({**p, "role": "boss"}, {"id": "m3", "from": "owner", "to": ["a"], "text": "hi"}, cfg, {})
+        )
+
+    def test_when_what_applies_to_an_agent_changes_the_persons_chat_gets_one_line(self):
+        # The room's setting changed, its seat's, or a built-in one with an update: who, and to what. An agent
+        # seen the first time is not announced — /add showed its own. A bad value is named once, and skipped.
+        mod = _Loader(f"collab_trim_seen_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        seats = [{"id": "owner"}, {"id": "a", "label": "Клод", "kind": "claude", "idle": "x", "seat": "s1"},
+                 {"id": "b", "label": "Ann", "kind": "claude", "idle": "x", "context_trim": False},
+                 {"id": "c", "label": "Коди", "kind": "codex", "idle": "x"}]  # fmt: skip
+        said = lambda: [(m["to"], m["text"], m.get("silent")) for m in self.messages() if "Setting" in m["text"]]
+        mod.deliver_once({"participants": seats}, {})
+        mod.deliver_once({"participants": seats}, {})
+        self.assertEqual(said(), [], "first seen, then unchanged: nothing")
+        mod.deliver_once({"participants": seats, "context_trim": {"at": 150000, "do": "compact"}}, {})
+        self.assertEqual(
+            said(), [(["owner"], "Settings changed: Клод — context trim /compact past 150k tokens of context.", True)]
+        )
+        self.enterContext(mock.patch.dict(mod.BUILTIN, {"claude": {"context_trim": {"at": 90000, "do": "clear"}}}))
+        mod.deliver_once({"participants": seats}, {})
+        self.assertEqual(
+            said()[-1][1], "Settings changed: Клод — context trim /clear past 90k tokens of context.", "a built-in one"
+        )
+        team = {"seats": [{"seat": "s1", "role": "reviewer", "use_model": "sonnet"}]}
+        mod.deliver_once({"participants": seats, "team": team}, {})
+        self.assertEqual(said()[-1][1], "Settings changed: Клод — role reviewer, model sonnet.", "its seat's")
+        seats[3]["role"] = "boss"
+        mod.deliver_once({"participants": seats, "team": team}, {})
+        mod.deliver_once({"participants": seats, "team": team}, {})
+        self.assertEqual(said()[-1][1], "Setting ignored — Коди: role must be one of lead, worker, reviewer.")
+        self.assertEqual(len(said()), 4, "named once")
 
     def test_a_quiet_note_in_the_persons_name_still_wakes_the_agent(self):
         # A person's letter is never left waiting, marked or not — signed, or in their name unsigned (it then
@@ -10769,6 +11105,7 @@ class DeliveryTest(Base):
             subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
             time.sleep(0.6)
         self.assertTrue(self.wait_for(pane, "Starting Newbie"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "context trim off"), "the wizard shows what applies to it")
         cfg = json.loads((self.cfg).read_text())
         newbie = next(p for p in cfg["participants"] if p["id"] == "newbie")
         self.assertEqual(newbie["joined"], "pending")
@@ -13828,6 +14165,7 @@ class UsageTest(Base):
         )  # fmt: skip
         (rec,) = self.mod.increment(self.agent)
         self.assertEqual((rec["answers"], rec["ctx_max"]), (3, 5604))
+        self.assertEqual(rec["ctx_last"], 3002, "the context now: the latest answer's")
 
     def test_a_claude_of_inits_example_has_its_session_kept_and_its_spending_read(self):
         # `init`'s example seats every installed agent and `start` opens their windows: no /add marked them
@@ -13922,6 +14260,28 @@ class UsageTest(Base):
         self.log().unlink(missing_ok=True)
         self.log().symlink_to(other)
         self.assertEqual(self.mod.increment(self.agent), [])
+
+    def test_a_codexs_compaction_in_its_log_is_noted_for_its_brief(self):
+        # Codex has no hook after it compacts its context: its log says so, and its assignment goes again.
+        # A message quoting those words is not a compaction.
+        sid = "aaaaaaaa-2222-3333-4444-555555555555"
+        path = self.codex / "sessions" / "2026" / "10" / "19" / f"rollout-2026-10-19T10-00-00-{sid}.jsonl"
+        agent = {"id": "kodi", "kind": "codex", "folder": str(self.root)}
+        tight = lambda d: json.dumps(d, separators=(",", ":")) + "\n"
+        self.write(path, tight({"type": "session_meta", "payload": {"cwd": str(self.root)}}))
+        with seam(self.mod, "screen.agent_session", lambda p: sid):
+            self.mod.increment(agent)
+            quote = {"timestamp": "2099-01-01T10:00:00Z", "type": "response_item", "payload": {"text": '"type":"compacted"'}}
+            self.write(path, tight(quote))
+            self.mod.increment(agent)
+            compacted = lambda: (
+                json.loads((self.state / "compacted.json").read_text()) if (self.state / "compacted.json").exists() else {}
+            )
+            self.assertEqual(compacted(), {}, "a quote is not a compaction")
+            before = time.time()
+            self.write(path, tight({"timestamp": "2099-01-01T10:00:01Z", "type": "compacted", "payload": {"message": ""}}))
+            self.mod.increment(agent)
+        self.assertGreaterEqual(compacted().get("kodi", 0), before)
 
     def test_codex_by_its_records_with_the_cache_out_of_the_input(self):
         sid = "aaaaaaaa-2222-3333-4444-555555555555"
