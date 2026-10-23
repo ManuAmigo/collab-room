@@ -411,6 +411,9 @@ def deliver_once(config: dict[str, Any], panes: dict[str, str]) -> list[tuple[st
         if typed:
             done.append((p["id"], typed))
     m_ledger.tick(config)  # the tokens' ledger: each agent's spending since its last look
+    with contextlib.suppress(m_store.OperationFailed):
+        handle_proposals(config, m_log.read_log_tick())
+    tell_outside_changes(config)
     tell_setting_changes(config)
     send_briefs(config)
     return done
@@ -441,6 +444,69 @@ def applied(p: dict[str, Any], config: dict[str, Any]) -> dict[str, str]:
         "context trim": m_store.trim_words(m_store.effective_trim(kind, p, config)),
         "reports to": m_store.whom(m_store.reports_to(kind, p, config), config),
     }
+
+
+def tell_outside_changes(config: dict[str, Any]) -> None:
+    """Settings changed past the program — the room's file edited by hand or by an agent: they apply, the person's
+    chat gets one line, and /team → Changes can undo them. A label, not a lock: whoever can write the file can."""
+    try:
+        rec = m_store.record_outside()
+    except SystemExit:
+        return  # the room's file unreadable for now: load_config says why; the tick goes on
+    if rec:
+        line = f"⚠ Settings changed outside the chat: {m_store.change_words(config, rec)}. /team → Changes can undo it."
+        m_log.append_message(m_text.ROOM, m_store.people_ids(config) or ["all"], line, silent=True)
+
+
+@m_store.room_locked
+def handle_proposals(config: dict[str, Any], recent: list[dict[str, Any]]) -> None:
+    """Each new proposal is looked at once. Only the lead proposes (or a command line, through the room). One that
+    only narrows — topic, memory, whom one reports to, a cheaper model, rarer rounds — asked for by the person in a
+    signed message to the lead, is applied at once: one line, and /team → Changes undoes it. Any other waits for the
+    person's Enter in the chat."""
+    states = m_store.proposal_state()
+    new = [m for m in recent if isinstance(m.get("proposal"), dict) and m["id"] not in states]
+    if not new:
+        return
+    messages = m_log.read_messages()  # the request may be older than this tick
+    people = m_store.people_ids(config) or ["all"]
+    for m in new:
+        prop = m["proposal"]
+        if m.get("from") not in (m_store.lead_of(config), m_text.ROOM):
+            m_store.set_proposal_state(m["id"], "refused")  # not the lead: a proposal it could not have made
+            continue
+        try:
+            problem = m_store.proposal_problem(config, prop, list(m_screen.PRESETS))
+        except Exception:  # noqa: BLE001 — a record anyone could write: whatever it holds, it stops nothing
+            problem = "not a proposal"
+        if problem:
+            m_store.set_proposal_state(m["id"], "refused")
+            continue
+        req = m_log.request_of(m, config, messages)
+        changes = prop.get("changes") or []
+        lead = next((q for q in config["participants"] if q["id"] == m.get("from")), {})
+        own_session = bool(prop.get("session")) and prop.get("session") == lead.get("claude_session")
+        narrow = (
+            req is not None
+            and own_session
+            and not prop.get("add")
+            and not prop.get("team")
+            and isinstance(changes, list)
+            and bool(changes)
+            and all(isinstance(c, dict) and m_store.narrows(config, c) for c in changes)
+        )
+        if not narrow:
+            m_store.set_proposal_state(m["id"], "pending")
+            continue
+        try:
+            rec, _ = m_store.apply_changes(changes, str(m["from"]), str(m.get("re") or ""))
+        except (ValueError, KeyError, TypeError):
+            m_store.set_proposal_state(m["id"], "pending")
+            continue
+        m_store.set_proposal_state(m["id"], "applied")
+        who = m_store.label_of(config, str(m["from"]))
+        line = f"By your request, {who} changed: {m_store.change_words(m_store.load_config(), rec)}. /team → Changes can undo it."
+        m_log.append_message(m_text.ROOM, people, line, silent=True)
 
 
 @m_store.room_locked
@@ -487,6 +553,44 @@ def brief_version(pid: str, config: dict[str, Any]) -> tuple[str, int]:
 def current_brief(pid: str, config: dict[str, Any]) -> str:
     text, version = brief_version(pid, config)
     return m_store.brief(pid, config, version) if text else ""
+
+
+def assignment_state(pid: str, config: dict[str, Any], messages: list[dict[str, Any]]) -> str:
+    """Where an agent is with its assignment: its latest brief closed with ack — acknowledged (it got it; that
+    is not a promise to keep it), answered with say --re — it said something about it, the person reads it."""
+    p = next((q for q in config["participants"] if q["id"] == pid), {})
+    if p.get("joined") == "pending":
+        return "Starting"
+    if not m_store.brief(pid, config):
+        return ""
+    sent = [m for m in messages if m.get("from") == m_text.ROOM and m.get("brief") is True and m.get("to") == [pid]]
+    if not sent:
+        return "Getting its assignment"
+    last = sent[-1]["id"]
+    if any(m.get("from") == pid and m.get("re") == last for m in messages):
+        return "Replied to its assignment — read it"
+    if last in m_log.read_set(m_store.room().paths.noreply_dir, pid):
+        return "Assignment acknowledged"
+    return "Getting its assignment"
+
+
+def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[str]:
+    """The room's team as it is: the scenario, the result file, what is done without the person, and one row per
+    agent — what applies to it and where it is with its assignment."""
+    team = m_store.team_of(config)
+    name = team.get("scenario")
+    title = m_store.SCENARIOS[name]["title"] if isinstance(name, str) and name in m_store.SCENARIOS else "No scenario"
+    allowed = m_store.without_person(config)
+    lines = [
+        f"Team: {title} · result: {m_store.output_of(config) or 'in the chat'} · without you: "
+        + ("; ".join(m_store.WITHOUT_PERSON[a] for a in allowed) if allowed else "nothing external")
+    ]
+    for p in agents_of(config):
+        state = assignment_state(p["id"], config, messages)
+        lines.append(
+            f"  {m_text.visible(m_store.seat_line(m_screen.agent_kind(p), p, config))}" + (f" — {state}" if state else "")
+        )
+    return lines if len(lines) > 1 else [*lines, "  No agents yet: /team picks a ready team, /add adds one agent."]
 
 
 @m_store.room_locked
@@ -969,7 +1073,7 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
                 # The fold was not sent yet. Only once, and only into the same process: a
                 # window reused since the look is not pressed. Still there after that, it reads as a
                 # draft — the room shows it and types nothing more there.
-                if m_screen.fold_left(rules, pane) and not m_screen.pane_guard(p, pane):
+                if m_screen.fold_left(rules, pane, text) and not m_screen.pane_guard(p, pane):
                     sent = m_tmuxio.tmux("send-keys", "-t", pane, "Enter", check=False)
         if sent.returncode != 0:
             # The window went away, or tmux refused: these messages wait, the others go on.

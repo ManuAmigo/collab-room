@@ -177,6 +177,7 @@ def append_message(
     quiet: bool = False,
     silent: bool = False,
     brief: bool = False,
+    proposal: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     rp = m_store.room().paths
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": m_store.now(), "from": sender, "to": to, "text": text}
@@ -188,6 +189,8 @@ def append_message(
         record["silent"] = True  # the room's own note: never typed to an agent (is_silent)
     if brief:
         record["brief"] = True  # an agent's assignment (deliver.send_briefs): told by this, never by its words
+    if proposal is not None:
+        record["proposal"] = proposal  # a change of the team the person applies (store.proposal_card)
     if sign:
         record["sig"] = signature(owner_key(create=True), record)
         mark_signing(record["id"])
@@ -442,6 +445,30 @@ def unsigned_person(m: dict[str, Any], config: dict[str, Any]) -> bool:
         return False
     key = owner_key()
     return not key or not hmac.compare_digest(str(m.get("sig", "")), signature(key, m))
+
+
+# A request the lead may answer with a narrowing applied at once: young, and used once.
+REQUEST_AGE = 6 * 3600
+
+
+def request_of(m: dict[str, Any], config: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The person's own request a proposal answers: the message it names with --re — from a person, signed by that
+    person's chat (checked here, also in a room that never signed before), to the proposer alone, not older than
+    REQUEST_AGE, not itself an answer to a proposal (a «Declined»), and not used by another proposal. Anything else
+    is no request: the proposal waits for Enter."""
+    req = next((x for x in messages if x.get("id") == m.get("re")), None)
+    if req is None or req.get("from") not in m_store.people_ids(config) or req.get("to") != [m.get("from")]:
+        return None
+    key = owner_key()
+    if not key or not hmac.compare_digest(str(req.get("sig", "")), signature(key, req)):
+        return None
+    if time.time() - m_text.at_time(str(req.get("at") or "")) > REQUEST_AGE:
+        return None
+    if any(isinstance(x.get("proposal"), dict) and x.get("id") == req.get("re") for x in messages):
+        return None
+    if any(x.get("re") == req["id"] and isinstance(x.get("proposal"), dict) and x["id"] != m["id"] for x in messages):
+        return None  # used by another proposal
+    return req
 
 
 def held_count() -> int:

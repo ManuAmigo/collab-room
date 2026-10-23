@@ -107,6 +107,7 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None) -> str:
             ("", "Green with a spinner and a number: ready for messages, background tasks still run"),
             ("Status layout", "More agents wrap to another row; none are hidden"),
             ("/add", "Start a new agent: choose its kind, its folder, its name"),
+            ("/team", "See the team and where each agent is with its assignment; in a new room, start a ready team"),
             ("/remove", "Disconnect a participant; the agent keeps running in its window"),
             # A muted agent still gets what is addressed to it by name — the text said all.
             ("/mute · /unmute", "Stop / resume room-wide messages to an agent; messages to it by name still arrive"),

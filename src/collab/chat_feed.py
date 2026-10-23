@@ -289,6 +289,27 @@ def chat_pump(ctx: ChatFeedContext) -> None:
                             ctx.feed(ctx.show(m))
                     except Exception as exc:  # noqa: BLE001
                         trouble(f"! Could not show message {m_text.visible(m['id'])}: {exc!r}")
+            # A proposal for the team waiting for the person: its card opens by itself when no question is open —
+            # one Enter applies it. Each once: «Later» leaves it to /team. By the room's record of proposals, which
+            # delivery fills — not by the tick's messages, which may come before it is judged.
+            if ctx.tty and not ctx.wizard() and not ctx.ui.popup and ctx.args.as_ in m_store.people_ids(ctx.config):
+                try:
+                    shown = ctx.ui.proposals_shown
+                    waiting = [k for k, v in m_store.proposal_state().items() if v == "pending" and k not in shown]
+                    if waiting:
+                        shown.add(waiting[0])  # the rest open one by one, each when no question is open
+                        everything = m_log.read_messages()
+                        m = next(
+                            (x for x in everything if x.get("id") == waiting[0] and isinstance(x.get("proposal"), dict)), None
+                        )
+                        if m is not None:
+                            cfg = m_store.load_config()
+                            req = m_log.request_of(m, cfg, everything) or {}  # only the person's own request is shown as one
+                            ctx.feed(m_text.paint(m_store.proposal_words(cfg, m["proposal"]), "38;5;252") + "\n" * 5)
+                            ctx.wizard().update(m_store.proposal_card(m, cfg, str(req.get("text") or "")))
+                            ctx.ui.redraw_input()
+                except Exception as exc:  # noqa: BLE001
+                    trouble(f"! Could not show a proposal: {exc!r}")
             while sink := m_store.chat_mode().sink:
                 ctx.feed(m_text.paint(sink.pop(0), "38;5;245"))
             if ctx.ui.viewing:

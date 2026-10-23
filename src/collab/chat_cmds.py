@@ -41,6 +41,8 @@ def chat_wizard_back(ctx: m_chat_wizard.ChatCommandContext) -> None:
         m_agents.mark_welcomed()  # Esc is «Skip for now»: the welcome does not come back
         ctx.wizard.clear()
         ctx.feed(m_text.paint("You can open the guide any time: type /help.", "38;5;252"))
+        if m_chat_wizard.offer_team(m_store.load_config()):
+            m_chat_wizard.open_scenarios(ctx)  # as «Skip for now» does: a new room's question comes next
         return
     ctx.wizard.clear()
     if back:
@@ -122,6 +124,7 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
         or line
         in (
             "/add",
+            "/team",
             "/remove",
             "/stop",
             "/clear",

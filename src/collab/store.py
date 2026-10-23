@@ -2,6 +2,7 @@ from __future__ import annotations
 import contextlib
 import datetime as dt
 import errno
+import hashlib
 import json
 import os
 import re
@@ -244,7 +245,7 @@ def effective_trim(kind: str, p: dict[str, Any], config: dict[str, Any]) -> dict
 
 def setting_problems(config: dict[str, Any]) -> list[str]:
     """Each explicit setting that does not pass its check, named: it is skipped, not repaired."""
-    out: list[str] = []
+    out: list[str] = list(team_problems(config))
     for p in config.get("participants", []):
         for layer, whose in ((seat_of(p, config), "its seat"), (p, "")):
             for key in SETTINGS:
@@ -310,6 +311,36 @@ def output_of(config: dict[str, Any]) -> str:
     return out
 
 
+GOAL_LIMIT = 200
+
+
+def goal_of(config: dict[str, Any]) -> str:
+    """The room's goal, one or two lines the lead answers for; "" — none, or one that does not pass."""
+    goal = team_of(config).get("goal")
+    if not isinstance(goal, str) or not goal.strip() or len(goal) > GOAL_LIMIT or m_text.visible(goal) != goal:
+        return ""
+    return goal
+
+
+def round_of(config: dict[str, Any]) -> int | None:
+    """Minutes between the lead's rounds (team.round); None — off. Not given — 30."""
+    value = team_of(config).get("round", 30)
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 24 * 60 else None
+
+
+def team_problems(config: dict[str, Any]) -> list[str]:
+    """What in the room's team block does not pass: named, and left out as if not set."""
+    team = team_of(config)
+    out: list[str] = []
+    if "goal" in team and not goal_of(config):
+        out.append(f"the room's goal must be text of 1 to {GOAL_LIMIT} characters without control characters")
+    if "round" in team and team["round"] is not False and round_of(config) is None:
+        out.append("the lead's round must be minutes from 1 to 1440, or false")
+    if team.get("output") and not output_of(config):
+        out.append("the result file must be a path inside the project folder")
+    return out
+
+
 def without_person(config: dict[str, Any]) -> list[str]:
     allowed = team_of(config).get("without_person")
     if not isinstance(allowed, list):
@@ -317,7 +348,169 @@ def without_person(config: dict[str, Any]) -> list[str]:
     return [a for a in WITHOUT_PERSON if a in cast("list[object]", allowed)]
 
 
+# The memory a seat is given: «compact» folds a long conversation into a summary, «clear» starts it anew once it has
+# grown, «keep» leaves it to the agent's program. The thresholds are a first guess, to be set by what the ledger shows.
+MEMORY: dict[str, object] = {
+    "compact": {"at": 150000, "do": "compact"},
+    "clear": {"at": 100000, "do": "clear"},
+    "keep": False,
+}
+
+
+def _seat(seat: str, kind: str, label: str, role: str, topic: str, model: str, memory: str) -> dict[str, Any]:
+    return {
+        "seat": seat,
+        "kind": kind,
+        "label": label,
+        "role": role,
+        "topic": topic,
+        **({"use_model": model} if model else {}),
+        "context_trim": MEMORY[memory],
+    }
+
+
+# The ready teams a room starts from. A seat names the program, the agent's name, and its settings; whom it
+# reports to is left to the defaults: the lead to the person, everyone else to the lead. Applying one copies it
+# into the room's file (team.seats): a later change here does not reach a room already started.
+SCENARIOS: dict[str, dict[str, Any]] = {
+    "development": {
+        "title": "Development",
+        "hint": "Split the work, check the changes, get code",
+        "output": "",
+        "seats": [
+            _seat("lead", "claude", "Lead", "lead", "coordination", "opus", "clear"),
+            _seat("frontend", "claude", "Frontend", "worker", "frontend", "opus", "compact"),
+            _seat("backend", "claude", "Backend", "worker", "backend", "opus", "compact"),
+            _seat("review", "codex", "Reviewer", "reviewer", "tests and security", "", "keep"),
+        ],
+    },
+    "research": {
+        "title": "Research",
+        "hint": "Gather facts, check them, get a conclusion with sources",
+        "output": "research.md",
+        "seats": [
+            _seat("lead", "claude", "Lead", "lead", "summary", "opus", "compact"),
+            _seat("prices", "claude", "Prices", "worker", "prices and terms", "sonnet", "clear"),
+            _seat("risks", "claude", "Reviews", "worker", "reviews and risks", "sonnet", "clear"),
+            _seat("facts", "claude", "Fact-checker", "reviewer", "fact checking", "opus", "clear"),
+        ],
+    },
+    "text": {
+        "title": "Text",
+        "hint": "Write a text and have it checked",
+        "output": "text.md",
+        "seats": [
+            _seat("lead", "claude", "Author", "lead", "author", "opus", "compact"),
+            _seat("editor", "claude", "Editor", "reviewer", "editing and tone", "sonnet", "clear"),
+        ],
+    },
+    "decision": {
+        "title": "Decision",
+        "hint": "Compare the options, see the arguments and where they disagree",
+        "output": "decision.md",
+        "seats": [
+            _seat("lead", "claude", "Lead", "lead", "recommendation", "opus", "compact"),
+            _seat("money", "claude", "Money", "worker", "money", "sonnet", "clear"),
+            _seat("risks", "claude", "Risks", "worker", "risks", "sonnet", "clear"),
+            _seat("customers", "claude", "Customers", "worker", "customers", "sonnet", "clear"),
+            _seat("critic", "claude", "Critic", "reviewer", "devil's advocate", "opus", "clear"),
+        ],
+    },
+    "long": {
+        "title": "Long work",
+        "hint": "Run a project and keep its state between your visits",
+        "output": "project-state.md",
+        "seats": [
+            _seat("lead", "claude", "Lead", "lead", "running the project", "opus", "compact"),
+            _seat("worker", "claude", "Worker", "worker", "the project's topic", "sonnet", "compact"),
+        ],
+    },
+    "assistant": {
+        "title": "One assistant",
+        "hint": "Work with one agent directly",
+        "output": "",
+        "seats": [_seat("lead", "claude", "Assistant", "lead", "everything", "opus", "compact")],
+    },
+}
+
+
+def scenario_problems(scenario: dict[str, Any], kinds: list[str]) -> list[str]:
+    """What does not pass in a scenario: each seat's settings by the same checks as an agent's, one lead, ids
+    and names that are words, a program the room knows."""
+    out: list[str] = []
+    seats = scenario.get("seats")
+    if not isinstance(seats, list) or not seats:
+        return ["a scenario needs seats"]
+    ids: list[object] = []
+    for seat in cast("list[object]", seats):
+        if not isinstance(seat, dict):
+            out.append("a seat must be an object")
+            continue
+        seat_ = cast("dict[str, Any]", seat)
+        name = seat_.get("seat")
+        if not isinstance(name, str) or not WORD.fullmatch(name) or name in ids:
+            out.append(f"seat ids must be distinct words: {name!r}")
+        ids.append(name)
+        label = seat_.get("label")
+        if not isinstance(label, str) or m_text.name_problem(label):
+            out.append(f"{name}: a name that can't be used: {label!r}")
+        if seat_.get("kind") not in kinds:
+            out.append(f"{name}: kind must be one of {', '.join(kinds)}")
+        for key in SETTINGS:
+            if key in seat_ and key != "reports_to" and (why := setting_problem(key, seat_[key], {"participants": []})):
+                out.append(f"{name}: {why}")
+    if sum(1 for q in cast("list[Any]", seats) if isinstance(q, dict) and cast("dict[str, Any]", q).get("role") == "lead") != 1:
+        out.append("a scenario has one lead")
+    output = scenario.get("output", "")
+    if output and not output_of({"team": {"output": output}}):
+        out.append(f"output must be a path inside the project folder: {output!r}")
+    return out
+
+
+def memory_words(rule: object) -> str:
+    if not trim_valid(rule):
+        return "keep"
+    r = cast("dict[str, Any]", rule)
+    return f"{r['do']} past {r['at'] // 1000}k"
+
+
+def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any]) -> str:
+    """One row of a team: name · role · topic · model · memory · reports to — what applies, by the layers."""
+    role, topic, model = (effective(kind, p, config, k) for k in ("role", "topic", "use_model"))
+    trim = effective(kind, p, config, "context_trim") if kind in TRIM_KINDS else None
+    return " · ".join(
+        [
+            str(p.get("label") or p.get("id") or ""),
+            role or "no role",
+            topic or "—",
+            model or "default model",
+            memory_words(trim) if kind in TRIM_KINDS else "keep",
+            f"reports to {whom(reports_to(kind, p, config), config)}",
+        ]
+    )
+
+
+def scenario_preview(name: str) -> list[str]:
+    """What a scenario would start, before anything starts: its team as rows, the result file, the bounds."""
+    scenario = SCENARIOS[name]
+    seats = [
+        {"id": seat["seat"], "label": seat["label"], "kind": seat["kind"], "seat": seat["seat"]} for seat in scenario["seats"]
+    ]
+    config: dict[str, Any] = {"participants": seats, "team": scenario}
+    rows = [seat_line(p["kind"], p, config) for p in seats]
+    return [
+        f"{scenario['title']} — {scenario['hint']}. This is a starting team: change it with /team once it runs.",
+        *(f"  {row}" for row in rows),
+        f"  Result: {scenario['output'] or 'in the chat'}. Without you: nothing external.",
+    ]
+
+
 BRIEF_HEAD = "Your assignment in this room"
+
+
+def offer_team_path() -> Path:
+    """A room just created by start: its first chat opens on «What will we do?», once."""
+    return room().paths.state_dir / "offer-team"
 
 
 def compacted_path() -> Path:
@@ -347,6 +540,24 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
         lines.append(f"- Lead: {label_of(config, lead)} — gathers the result and the questions for the person.")
     elif lead == pid:
         lines.append("- You are the room's lead: the person hears from you; ask them what only they can decide.")
+        # Live, a lead with three workers and a reviewer did a whole research alone: its team, by name.
+        people = people_ids(config)
+        team = [
+            q
+            for q in config.get("participants", [])
+            if q.get("id") not in (pid, *people) and reports_to(q.get("kind", ""), q, config) == pid
+        ]
+        if team:
+            parts = "; ".join(
+                f"{label_of(config, q['id'])} — {effective(q.get('kind', ''), q, config, 'role') or 'agent'}"
+                + (f", {t}" if (t := effective(q.get("kind", ""), q, config, "topic")) else "")
+                for q in team
+            )
+            lines.append(
+                f"- Your team: {parts}. Give each its part, have the result checked, gather it — do not do their parts yourself."
+            )
+        if goal := goal_of(config):
+            lines.append(f"- Goal: {goal} You answer for reaching it.")
     if out := output_of(config):
         lines.append(f"- Result file: {out}, in the project folder. Keep the result there, not in messages.")
     if allowed:
@@ -813,6 +1024,312 @@ def write_room(sample: dict[str, Any], ask: bool) -> None:
 
 
 @room_locked
+def set_team(team: dict[str, Any]) -> None:
+    """The room's `team` block, replaced whole under the room's lock."""
+    data = read_config_raw()
+    data["team"] = team
+    write_config(data)
+    note_settings(data)
+
+
+# What the person changes in a running team (/team), and what the lead changes for them later: each a record
+# of the room's history, «who · what · before → after», under the room's lock. «None» after: the explicit value
+# goes, and the layer below applies again (its seat's, the room's, the built-in one).
+ROOM_KEYS = ("lead", "goal", "round", "output", "without_person")
+
+
+def changes_path() -> Path:
+    return room().paths.state_dir / "team-changes.jsonl"
+
+
+def explicit_value(data: dict[str, Any], who: str, key: str) -> Any:
+    """What is set explicitly — the agent's own or the room's — or None."""
+    if who == "room":
+        return team_of(data).get(key)
+    p = next((q for q in data.get("participants", []) if q.get("id") == who), None)
+    return None if p is None else p.get(key)
+
+
+def change_problem(data: dict[str, Any], who: str, key: str, after: object) -> str:
+    """Why this change can't be made, or ""; None after (back to the layer below) is always one."""
+    if who == "room":
+        if key not in ROOM_KEYS:
+            return f"{key} is not a setting of the room"
+        if after is None:
+            return ""
+        if key == "lead":
+            people = people_ids(data)
+            return "" if after in ids_of(data) and after not in people else "the lead must be one of the room's agents"
+        probe = {"team": {key: after}, "participants": data.get("participants", [])}
+        if key == "without_person":
+            ok = isinstance(after, list) and all(a in WITHOUT_PERSON for a in cast("list[object]", after))
+            return "" if ok else f"without_person takes only {', '.join(WITHOUT_PERSON)}"
+        return next(iter(team_problems(probe)), "")
+    if who not in ids_of(data) or who in people_ids(data):
+        return f"{who} is not one of the room's agents"
+    if key == "seat":
+        seats = [q.get("seat") for q in as_list(team_of(data).get("seats"))]
+        return "" if after is None or after in seats else "seat must be one of the room's scenario seats"
+    if key not in SETTINGS:
+        return f"{key} is not a setting"
+    return "" if after is None else setting_problem(key, after, data, who)
+
+
+def read_changes() -> list[dict[str, Any]]:
+    """The room's history of team changes, oldest first; a line that is not one is skipped."""
+    out: list[dict[str, Any]] = []
+    try:
+        text = read_state_text(changes_path(), "strict")
+    except (OSError, ValueError):
+        return out
+    for line in text.splitlines():
+        with contextlib.suppress(ValueError):
+            rec = json.loads(line)
+            if isinstance(rec, dict) and change_record_ok(cast("dict[str, Any]", rec)):
+                out.append(cast("dict[str, Any]", rec))
+    return out
+
+
+def change_record_ok(rec: dict[str, Any]) -> bool:
+    """A record the program could have written: an id that is a word, changes of known keys of a word id or the
+    room. The file is in the room's home, and a same-user agent can write it: anything else is not shown or undone."""
+    changes: object = rec.get("changes")
+    if not isinstance(rec.get("id"), str) or not WORD.fullmatch(rec["id"]) or not isinstance(changes, list):
+        return False
+    for c in cast("list[object]", changes):
+        if not isinstance(c, dict):
+            return False
+        c_ = cast("dict[str, Any]", c)
+        who, key = c_.get("who"), c_.get("key")
+        if not isinstance(who, str) or not WORD.fullmatch(who):
+            return False
+        if key not in (ROOM_KEYS if who == "room" else (*SETTINGS, "seat")):
+            return False
+    return True
+
+
+@room_locked
+def apply_changes(changes: list[dict[str, Any]], by: str, re_: str = "", undo_of: str = "") -> tuple[dict[str, Any], list[str]]:
+    """Make these changes — [{"who": an agent's id or "room", "key", "after", and "expect" for an undo: the value
+    it must still have}] — in one write, and keep them as one record of the history. A change that does not pass
+    is refused whole, before anything is written; an undo's field changed since is left as it is and named.
+    (the record, the fields left)."""
+    data = read_config_raw()
+    for c in changes:
+        why = change_problem(data, c["who"], c["key"], c.get("after"))
+        if why:
+            raise ValueError(why)
+    done: list[dict[str, Any]] = []
+    left: list[str] = []
+    for c in changes:
+        who, key, after = c["who"], c["key"], c.get("after")
+        before = explicit_value(data, who, key)
+        if "expect" in c and before != c["expect"]:
+            left.append(f"{label_of(data, who) if who != 'room' else 'the room'} — {key}: changed since")
+            continue
+        if who == "room":
+            team = dict(team_of(data))
+            if after is None:
+                team.pop(key, None)
+            else:
+                team[key] = after
+            data["team"] = team
+        else:
+            p = next(q for q in data["participants"] if q.get("id") == who)
+            if after is None:
+                p.pop(key, None)
+            else:
+                p[key] = after
+        done.append({"who": who, "key": key, "before": before, "after": after})
+    record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": now(), "by": by, "changes": done}
+    record.update({"re": re_} if re_ else {})
+    record.update({"undo_of": undo_of} if undo_of else {})
+    if done:
+        write_config(data)
+        private_dir(room().paths.state_dir)
+        note_settings(data)
+        write_state(changes_path(), json.dumps(record, ensure_ascii=False) + "\n", append=True)
+    return record, left
+
+
+def undo_changes(record_id: str, by: str) -> tuple[dict[str, Any], list[str]]:
+    """The reverse of one record of the history: each field back to what it was, if it still holds what that
+    record made it — a field changed since is left, and named."""
+    rec = next((r for r in read_changes() if r.get("id") == record_id), None)
+    if rec is None:
+        raise ValueError("no such change in this room's history")
+    back = [
+        {"who": c["who"], "key": c["key"], "after": c.get("before"), "expect": c.get("after")} for c in reversed(rec["changes"])
+    ]
+    data = read_config_raw()
+    if any(c["key"] in ("lead", "role") for c in back) and any(
+        explicit_value(data, c["who"], c["key"]) != c["expect"] for c in back
+    ):
+        # Half a lead change back would leave two leads, or none.
+        raise ValueError("the lead changed again since: undo the later change first")
+    return apply_changes(back, by, undo_of=record_id)
+
+
+def change_words(data: dict[str, Any], rec: dict[str, Any]) -> str:
+    """«Ann — model sonnet → opus; the room — goal none → …»: what one record changed, for the person."""
+
+    def shown(v: object) -> str:
+        if v is None:
+            return "the default"
+        if isinstance(v, list):
+            return ", ".join(str(x) for x in cast("list[object]", v)) or "nothing"
+        return memory_words(cast("object", v)) if isinstance(v, dict) or v is False else str(v)
+
+    parts: list[str] = []
+    for c in rec.get("changes", []):
+        who = "the room" if c.get("who") == "room" else label_of(data, str(c.get("who")))
+        key = {"use_model": "model", "context_trim": "memory", "reports_to": "reports to"}.get(
+            str(c.get("key")), str(c.get("key"))
+        )
+        named = c.get("key") in ("lead", "reports_to")  # an id: shown by its name
+        before, after = (
+            m_text.clean_field(whom(str(v), data) if named and v is not None else shown(v), GOAL_LIMIT)
+            for v in (c.get("before"), c.get("after"))
+        )
+        parts.append(f"{who} — {key} {before} → {after}")
+    return m_text.visible("; ".join(parts))
+
+
+# What the lead — or a command line — asks to change in the team: a message with a `proposal`, which changes nothing
+# itself. The person applies it with one Enter in the chat; a narrowing one, asked for by the person in a signed
+# message to the lead, is applied at once and can be undone. A model's price, by name, within one kind of program:
+# a model not in the list, or of another kind, is not «cheaper».
+MODEL_ORDER = {"claude": ["haiku", "sonnet", "opus"]}
+# One proposal is read whole on its card before Enter: so many changes, so many agents, and words that fit.
+PROPOSAL_CHANGES, PROPOSAL_ADDS, PROPOSAL_WORDS = 8, 4, 400
+
+
+def proposals_path() -> Path:
+    return room().paths.state_dir / "proposals.json"
+
+
+def narrows(data: dict[str, Any], c: dict[str, Any]) -> bool:
+    """Does this change only lower spending or rights — so the lead may make it at the person's word: whom an agent
+    reports to (not the person), compacting its memory, a cheaper model of the same program, rarer rounds. Not a
+    topic: free text that goes into another agent's assignment is the person's to read first."""
+    who, key, after = c["who"], c["key"], c.get("after")
+    if who == "room":
+        now_ = round_of(data)
+        return key == "round" and (after is False or (isinstance(after, int) and now_ is not None and after > now_))
+    p = next((q for q in data.get("participants", []) if q.get("id") == who), None)
+    if p is None:
+        return False
+    kind = str(p.get("kind") or "")
+    if key == "context_trim":
+        # Only compacting, and not too soon: «clear» wipes the conversation over and over, «keep» spends more.
+        rule = cast("dict[str, Any]", after) if isinstance(after, dict) else {}
+        return rule.get("do") == "compact" and isinstance(rule.get("at"), int) and rule["at"] >= 50000
+    if key == "reports_to":
+        return after not in (None, "person")
+    if key == "use_model":
+        order = MODEL_ORDER.get(kind, [])
+        cur = effective(kind, p, data, "use_model")
+        return after in order and cur in order and order.index(after) < order.index(cur)
+    return False
+
+
+def as_list(x: object) -> list[dict[str, Any]]:
+    """A list of objects from a record anyone could have written; anything else — none of it."""
+    if not isinstance(x, list):
+        return []
+    return [cast("dict[str, Any]", v) for v in cast("list[object]", x) if isinstance(v, dict)]
+
+
+def proposal_problem(data: dict[str, Any], prop: dict[str, Any], kinds: list[str]) -> str:
+    """Why a proposal can't be made, or "": each change by the checks of /team, each agent to add by those of
+    collab add, a team only to a room without one."""
+    raw_changes: object = prop.get("changes") or []
+    raw_adds: object = prop.get("add") or []
+    team: object = prop.get("team")
+    changes, adds = as_list(raw_changes), as_list(raw_adds)
+    whole = isinstance(raw_changes, list) and isinstance(raw_adds, list)
+    if not whole or len(changes) != len(cast("list[object]", raw_changes)) or len(adds) != len(cast("list[object]", raw_adds)):
+        return "a proposal needs a change, an agent to add or a team to start"
+    if not (changes or adds or team):
+        return "a proposal needs a change, an agent to add or a team to start"
+    for c in changes:
+        who, key = c.get("who"), c.get("key")
+        if not isinstance(who, str) or not isinstance(key, str):
+            return "a change is who, key and the value after"
+        if why := change_problem(data, who, key, c.get("after")):
+            return why
+    for a in adds:
+        if a.get("kind") not in kinds:
+            return f"an agent to add needs its program: {', '.join(kinds)}"
+        label: object = a.get("label")
+        if not isinstance(label, str) or m_text.name_problem(label) or label_taken(data, "", label):
+            return f"a name that can't be used: {label!r}"
+        for key in SETTINGS:
+            if key in a and (why := setting_problem(key, a[key], data)):
+                return why
+    if team is not None and (not isinstance(team, str) or team not in SCENARIOS or team_of(data).get("scenario")):
+        return "a team only from the ready ones, and only to a room without one"
+    if len(changes) > PROPOSAL_CHANGES or len(adds) > PROPOSAL_ADDS:
+        return f"one proposal holds up to {PROPOSAL_CHANGES} changes and {PROPOSAL_ADDS} agents: split it"
+    if len(proposal_words(data, prop, whole=True)) > PROPOSAL_WORDS:
+        return "too long to be read whole on its card: split it"
+    return ""
+
+
+def proposal_words(data: dict[str, Any], prop: dict[str, Any], whole: bool = False) -> str:
+    """What a proposal would do, for the person: the changes, before → after, and what it starts."""
+    parts: list[str] = []
+    changes = as_list(prop.get("changes"))
+    if changes:
+        before = [{**c, "before": explicit_value(data, str(c.get("who")), str(c.get("key")))} for c in changes]
+        parts.append(change_words(data, {"changes": before}))
+    for a in as_list(prop.get("add")):
+        what = [str(a[k]) for k in ("role", "topic", "use_model") if a.get(k)]
+        what += [f"memory {memory_words(a['context_trim'])}"] if "context_trim" in a else []
+        what += [f"reports to {whom(str(a['reports_to']), data)}"] if a.get("reports_to") else []
+        what += [f"in {m_text.tilde(str(a['folder']))}"] if a.get("folder") else []
+        parts.append(f"+ {a.get('label')} ({a.get('kind')}{', ' + ' · '.join(what) if what else ''})")
+    team = prop.get("team")
+    if isinstance(team, str) and team in SCENARIOS:
+        parts.append(f"start the {SCENARIOS[team]['title']} team ({len(SCENARIOS[team]['seats'])} agents)")
+    words = "; ".join(parts)
+    # Never cut: a proposal longer than its card is refused (proposal_problem), not shown in part.
+    return words if whole else m_text.clean_field(words, PROPOSAL_WORDS)
+
+
+def proposal_state() -> dict[str, Any]:
+    return read_json(proposals_path())
+
+
+@room_locked
+def set_proposal_state(mid: str, state: str) -> None:
+    write_json(proposals_path(), {**read_json(proposals_path()), mid: state})
+
+
+def pending_proposals(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    states = proposal_state()
+    return [m for m in messages if isinstance(m.get("proposal"), dict) and states.get(m["id"]) == "pending"]
+
+
+def proposal_digest(prop: object) -> str:
+    return hashlib.sha256(json.dumps(prop, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def proposal_card(m: dict[str, Any], data: dict[str, Any], request: str = "") -> dict[str, Any]:
+    """The chat's question for one proposal: what it does, at whose word, Apply or Decline — one Enter. Bound to what
+    was shown: an edit of the log after it is not applied."""
+    who = "A command line" if m.get("from") == m_text.ROOM else label_of(data, str(m.get("from")))
+    asked = f" (your request: «{m_text.clean_field(request, 120)}»)" if request else ""
+    return {
+        "step": "proposal",
+        "proposal": m["id"],
+        "digest": proposal_digest(m.get("proposal")),
+        "prompt": f"{who} proposes{asked} — apply?",
+        "options": [("Apply", "go"), ("Decline", "decline"), ("Later — /team shows it", "later")],
+    }
+
+
+@room_locked
 def record_room_root() -> None:
     """The room's project, written into its .collab.json in the room's home: the home is named only
     by a hash of it, and the check of the copies could not tell where a room's Codex works when the
@@ -908,6 +1425,67 @@ def write_config(data: dict[str, Any]) -> None:
     rp = room().paths
     # Through the link-refusing writer too: a link at the temporary name was followed.
     replace_state(rp.config_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def note_settings(data: dict[str, Any]) -> None:
+    """What the room's own setting writers — the chat's changes, a team started, an agent added with its settings
+    — wrote: a setting the file holds and this does not was changed past them. Only they note it: any other
+    write of the file (a session bound, a name) would take in a change made past them unseen."""
+    if room().paths.state_dir.is_dir():
+        replace_state(settings_known_path(), json.dumps(settings_of(data), ensure_ascii=False) + "\n")
+
+
+def settings_known_path() -> Path:
+    return room().paths.state_dir / "settings-known.json"
+
+
+def settings_of(data: dict[str, Any]) -> dict[str, Any]:
+    """The explicit settings in a room's file: the room's team block and each participant's own, by id."""
+    out: dict[str, Any] = {"room": {k: v for k, v in team_of(data).items() if k in ROOM_KEYS}}
+    for q in cast("list[object]", data.get("participants", [])):
+        p = cast("dict[str, Any]", q) if isinstance(q, dict) else {}
+        if isinstance(p.get("id"), str):
+            out[p["id"]] = {k: p[k] for k in (*SETTINGS, "seat") if k in p}
+    return out
+
+
+def changes_outside(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """The settings changed past the program — by hand, or by an agent writing the room's file: each who · key ·
+    before → after, against what the program last wrote. Nothing known yet — nothing (a room before this)."""
+    known = read_json(settings_known_path())
+    if not known:
+        return []
+    now_ = settings_of(data)
+    out: list[dict[str, Any]] = []
+    for who, keys in now_.items():
+        if who not in known or not isinstance(known[who], dict):
+            continue
+        before = cast("dict[str, Any]", known[who])
+        for key in sorted(set(before) | set(cast("dict[str, Any]", keys))):
+            if before.get(key) != keys.get(key):
+                out.append({"who": who, "key": key, "before": before.get(key), "after": keys.get(key)})
+    return out
+
+
+@room_locked
+def record_outside() -> dict[str, Any] | None:
+    """A change past the program goes into the history as made «outside» — it applies, and /team can undo it. The
+    room's file read under the lock: the chat's own change, written meanwhile, is not taken for one. Nothing noted
+    yet — what is there now is the start."""
+    data = read_config_raw()
+    known = read_json(settings_known_path())
+    if not known:
+        note_settings(data)
+        return None
+    changes = changes_outside(data)
+    if not changes:
+        if settings_of(data).keys() != known.keys():
+            note_settings(data)  # agents joined or left, nothing changed: the start moves on with them
+        return None
+    record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": now(), "by": "outside", "changes": changes}
+    write_state(changes_path(), json.dumps(record, ensure_ascii=False) + "\n", append=True)
+    note_settings(data)
+    return record
 
 
 def label_taken(config: dict[str, Any], pid: str, label: str) -> str:

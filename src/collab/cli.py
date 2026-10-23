@@ -86,6 +86,12 @@ def cmd_add(args: argparse.Namespace) -> None:
     if problem:
         m_store.fail(problem)
     own = settings_args(args, config)
+    if own:
+        # An agent's settings are the person's to give: from a command line they are a proposal, applied with Enter
+        # in the chat — whoever runs this, a person or an agent.
+        add = {"kind": args.kind, "label": label, "folder": str(folder.resolve()), **own}
+        propose(m_text.ROOM, "", {"add": [add]}, config)
+        return
     pid = m_agents.launch_new_agent(config, args.kind, str(folder.resolve()), label, own)
     # Not typed in a chat: the people learn who came in, and where it works.
     line = m_text.visible(f"{label} ({base}) was added by collab add, in {m_text.tilde(str(folder.resolve()))}.")
@@ -99,9 +105,6 @@ def settings_args(args: argparse.Namespace, config: dict[str, Any]) -> dict[str,
     """The settings `collab add` was given — only these become the agent's own. Checked before anything
     starts: a bad one is refused, not skipped. The person's to give: an agent that adds another may not
     make it the lead, have the team report to it, or pick its model — it asks the person."""
-    given = [args.context_trim, args.role, args.topic, args.model, args.reports_to]
-    if any(v is not None for v in given) and m_screen.caller_session_or_refuse():
-        m_store.fail("an agent's settings are the person's to give — ask them; nothing was started")
     own: dict[str, Any] = {}
     if args.context_trim:
         own["context_trim"] = trim_arg(args.kind, args.context_trim)
@@ -332,6 +335,95 @@ def cmd_status(args: argparse.Namespace) -> None:
     st = m_screen.read_status()
     for pid in m_store.ids_of(config):
         print(m_screen.describe(pid, st[pid], args.stale) if pid in st else f"· {pid}: No status yet")
+
+
+def cmd_team(args: argparse.Namespace) -> None:
+    """`collab team`: the room's team as it is. `collab team scenarios`: the ready teams. `collab team start
+    NAME`: start one — the person's to do, like /team in the chat; an agent asks them."""
+    config = m_store.load_config()
+    if args.action == "scenarios":
+        for name, scenario in m_store.SCENARIOS.items():
+            print(f"{name}: {scenario['title']} — {scenario['hint']}")
+        return
+    if args.action == "start":
+        if args.scenario not in m_store.SCENARIOS:
+            m_store.fail(f"collab team start takes one of: {', '.join(m_store.SCENARIOS)}")
+        if m_store.team_of(config).get("scenario"):
+            m_store.fail("this room has a team already: collab team shows it")
+        session = config.get("session", "collab-room")
+        if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
+            m_store.fail("the room is not running — collab start first, then collab team start")
+        missing = m_agents.scenario_unavailable(m_store.SCENARIOS[args.scenario])
+        if missing:
+            m_store.fail("not started: " + "; ".join(missing))
+        print("\n".join(m_store.scenario_preview(args.scenario)))
+        propose(m_text.ROOM, "", {"team": args.scenario}, config)
+        return
+    print("\n".join(m_deliver.team_view(config, m_log.read_messages())))
+
+
+def propose(sender: str, re_: str, prop: dict[str, Any], config: dict[str, Any]) -> None:
+    """A proposal into the room's log — it changes nothing itself: the person applies it with Enter in the chat."""
+    problem = m_store.proposal_problem(config, prop, list(m_screen.PRESETS))
+    if problem:
+        m_store.fail(f"not proposed: {problem}")
+    who = "A command line" if sender == m_text.ROOM else m_store.label_of(config, sender)
+    text = f"{who} proposes: {m_store.proposal_words(config, prop)}."
+    rec = m_log.append_message(sender, m_store.people_ids(config) or ["all"], text, re_, proposal=prop)
+    print(f"Proposed {rec['id']}: {m_store.proposal_words(config, prop)}. The person applies it with Enter in the chat.")
+
+
+def proposal_value(key: str, text: str) -> object:
+    """A value as typed after `=`: «default» takes the explicit one away; memory as compact, clear, keep or
+    TOKENS:compact; rounds as minutes or off; what is done without the person as a comma list."""
+    if text == "default":
+        return None
+    if key == "context_trim":
+        if text in m_store.MEMORY:
+            return m_store.MEMORY[text]
+        at, _, do = text.partition(":")
+        return {"at": int(at), "do": do} if at.isdigit() else text
+    if key == "round":
+        return False if text == "off" else int(text) if text.isdigit() else text
+    if key == "without_person":
+        return [x for x in text.split(",") if x]
+    return text
+
+
+def cmd_propose(args: argparse.Namespace) -> None:
+    """`collab propose`: the lead proposes a change of the team — it changes nothing itself. Asked for by the person
+    (--re: their message) and only narrowing, it is applied at once with an undo; anything else waits for their
+    Enter in the chat."""
+    config = m_store.load_config()
+    if args.sender not in m_store.ids_of(config):
+        m_store.fail(f"unknown sender {args.sender!r}")
+    if args.sender != m_store.lead_of(config):
+        m_store.fail("only the room's lead proposes changes of the team; others ask the lead")
+    m_screen.check_name_is_mine(args.sender, config)
+    if args.re and not any(m["id"] == args.re for m in m_log.read_messages()):
+        m_store.fail(f"no message {args.re} to answer")
+    changes = []
+    for item in args.set or []:
+        target, eq, value = item.partition("=")
+        who, dot, key = target.rpartition(".")
+        if not eq or not dot:
+            m_store.fail(f"--set takes ID.KEY=VALUE (or room.KEY=VALUE): {item!r}")
+        key = {"model": "use_model", "memory": "context_trim"}.get(key) or key
+        changes.append({"who": who, "key": key, "after": proposal_value(key, value)})
+    adds = []
+    for item in args.add or []:
+        kind, _, rest = item.partition(":")
+        label, _, rest = rest.partition(":")
+        role, _, topic = rest.partition(":")
+        adds.append({"kind": kind, "label": label, **({"role": role} if role else {}), **({"topic": topic} if topic else {})})
+    prop: dict[str, Any] = {k: v for k, v in (("changes", changes), ("add", adds)) if v}
+    # From the lead's own Claude session — the one the room bound to it — a narrowing it was asked for may apply at
+    # once; from anywhere else it waits for the person's Enter: a name given with --from proves nothing.
+    sid = m_screen.caller_session_or_refuse()
+    bound = next((p.get("claude_session") for p in config["participants"] if p["id"] == args.sender), None)
+    if sid and sid == bound:
+        prop["session"] = sid
+    propose(args.sender, args.re or "", prop, config)
 
 
 def cmd_brief(args: argparse.Namespace) -> None:
@@ -662,6 +754,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--from-now", action="store_true", help="do not deliver messages that existed before start")
     s.add_argument("--idle-ok", action="store_true", help="keep running even if nobody needs tmux delivery yet")
     s.set_defaults(func=m_deliver.cmd_deliver)
+
+    s = sub.add_parser("team", help="the room's team: show it, list the ready teams, start one")
+    s.add_argument("action", nargs="?", choices=["show", "scenarios", "start"], default="show")
+    s.add_argument("scenario", nargs="?", help="with start: one of collab team scenarios")
+    s.set_defaults(func=cmd_team)
+
+    s = sub.add_parser("propose", help="the lead proposes a change of the team; the person applies it")
+    s.add_argument("--from", dest="sender", required=True)
+    s.add_argument("--re", help="the person's message it answers")
+    s.add_argument(
+        "--set", action="append", metavar="ID.KEY=VALUE", help="role, topic, model, memory, reports_to; room.lead, goal, round…"
+    )
+    s.add_argument("--add", action="append", metavar="KIND:NAME[:ROLE[:TOPIC]]", help="a new agent")
+    s.set_defaults(func=cmd_propose)
 
     s = sub.add_parser("brief", help="an agent's assignment from the room's settings (--hook: for Claude Code's SessionStart)")
     s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))

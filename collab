@@ -110,7 +110,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -927,6 +927,7 @@ def pick(intro: list[str], rows: list[tuple[str, Any]], outro: list[str], erase:
 import contextlib
 import datetime as dt
 import errno
+import hashlib
 import json
 import os
 import re
@@ -1169,7 +1170,7 @@ def effective_trim(kind: str, p: dict[str, Any], config: dict[str, Any]) -> dict
 
 def setting_problems(config: dict[str, Any]) -> list[str]:
     """Each explicit setting that does not pass its check, named: it is skipped, not repaired."""
-    out: list[str] = []
+    out: list[str] = list(team_problems(config))
     for p in config.get("participants", []):
         for layer, whose in ((seat_of(p, config), "its seat"), (p, "")):
             for key in SETTINGS:
@@ -1235,6 +1236,36 @@ def output_of(config: dict[str, Any]) -> str:
     return out
 
 
+GOAL_LIMIT = 200
+
+
+def goal_of(config: dict[str, Any]) -> str:
+    """The room's goal, one or two lines the lead answers for; "" — none, or one that does not pass."""
+    goal = team_of(config).get("goal")
+    if not isinstance(goal, str) or not goal.strip() or len(goal) > GOAL_LIMIT or visible(goal) != goal:
+        return ""
+    return goal
+
+
+def round_of(config: dict[str, Any]) -> int | None:
+    """Minutes between the lead's rounds (team.round); None — off. Not given — 30."""
+    value = team_of(config).get("round", 30)
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 24 * 60 else None
+
+
+def team_problems(config: dict[str, Any]) -> list[str]:
+    """What in the room's team block does not pass: named, and left out as if not set."""
+    team = team_of(config)
+    out: list[str] = []
+    if "goal" in team and not goal_of(config):
+        out.append(f"the room's goal must be text of 1 to {GOAL_LIMIT} characters without control characters")
+    if "round" in team and team["round"] is not False and round_of(config) is None:
+        out.append("the lead's round must be minutes from 1 to 1440, or false")
+    if team.get("output") and not output_of(config):
+        out.append("the result file must be a path inside the project folder")
+    return out
+
+
 def without_person(config: dict[str, Any]) -> list[str]:
     allowed = team_of(config).get("without_person")
     if not isinstance(allowed, list):
@@ -1242,7 +1273,169 @@ def without_person(config: dict[str, Any]) -> list[str]:
     return [a for a in WITHOUT_PERSON if a in cast("list[object]", allowed)]
 
 
+# The memory a seat is given: «compact» folds a long conversation into a summary, «clear» starts it anew once it has
+# grown, «keep» leaves it to the agent's program. The thresholds are a first guess, to be set by what the ledger shows.
+MEMORY: dict[str, object] = {
+    "compact": {"at": 150000, "do": "compact"},
+    "clear": {"at": 100000, "do": "clear"},
+    "keep": False,
+}
+
+
+def _seat(seat: str, kind: str, label: str, role: str, topic: str, model: str, memory: str) -> dict[str, Any]:
+    return {
+        "seat": seat,
+        "kind": kind,
+        "label": label,
+        "role": role,
+        "topic": topic,
+        **({"use_model": model} if model else {}),
+        "context_trim": MEMORY[memory],
+    }
+
+
+# The ready teams a room starts from. A seat names the program, the agent's name, and its settings; whom it
+# reports to is left to the defaults: the lead to the person, everyone else to the lead. Applying one copies it
+# into the room's file (team.seats): a later change here does not reach a room already started.
+SCENARIOS: dict[str, dict[str, Any]] = {
+    "development": {
+        "title": "Development",
+        "hint": "Split the work, check the changes, get code",
+        "output": "",
+        "seats": [
+            _seat("lead", "claude", "Lead", "lead", "coordination", "opus", "clear"),
+            _seat("frontend", "claude", "Frontend", "worker", "frontend", "opus", "compact"),
+            _seat("backend", "claude", "Backend", "worker", "backend", "opus", "compact"),
+            _seat("review", "codex", "Reviewer", "reviewer", "tests and security", "", "keep"),
+        ],
+    },
+    "research": {
+        "title": "Research",
+        "hint": "Gather facts, check them, get a conclusion with sources",
+        "output": "research.md",
+        "seats": [
+            _seat("lead", "claude", "Lead", "lead", "summary", "opus", "compact"),
+            _seat("prices", "claude", "Prices", "worker", "prices and terms", "sonnet", "clear"),
+            _seat("risks", "claude", "Reviews", "worker", "reviews and risks", "sonnet", "clear"),
+            _seat("facts", "claude", "Fact-checker", "reviewer", "fact checking", "opus", "clear"),
+        ],
+    },
+    "text": {
+        "title": "Text",
+        "hint": "Write a text and have it checked",
+        "output": "text.md",
+        "seats": [
+            _seat("lead", "claude", "Author", "lead", "author", "opus", "compact"),
+            _seat("editor", "claude", "Editor", "reviewer", "editing and tone", "sonnet", "clear"),
+        ],
+    },
+    "decision": {
+        "title": "Decision",
+        "hint": "Compare the options, see the arguments and where they disagree",
+        "output": "decision.md",
+        "seats": [
+            _seat("lead", "claude", "Lead", "lead", "recommendation", "opus", "compact"),
+            _seat("money", "claude", "Money", "worker", "money", "sonnet", "clear"),
+            _seat("risks", "claude", "Risks", "worker", "risks", "sonnet", "clear"),
+            _seat("customers", "claude", "Customers", "worker", "customers", "sonnet", "clear"),
+            _seat("critic", "claude", "Critic", "reviewer", "devil's advocate", "opus", "clear"),
+        ],
+    },
+    "long": {
+        "title": "Long work",
+        "hint": "Run a project and keep its state between your visits",
+        "output": "project-state.md",
+        "seats": [
+            _seat("lead", "claude", "Lead", "lead", "running the project", "opus", "compact"),
+            _seat("worker", "claude", "Worker", "worker", "the project's topic", "sonnet", "compact"),
+        ],
+    },
+    "assistant": {
+        "title": "One assistant",
+        "hint": "Work with one agent directly",
+        "output": "",
+        "seats": [_seat("lead", "claude", "Assistant", "lead", "everything", "opus", "compact")],
+    },
+}
+
+
+def scenario_problems(scenario: dict[str, Any], kinds: list[str]) -> list[str]:
+    """What does not pass in a scenario: each seat's settings by the same checks as an agent's, one lead, ids
+    and names that are words, a program the room knows."""
+    out: list[str] = []
+    seats = scenario.get("seats")
+    if not isinstance(seats, list) or not seats:
+        return ["a scenario needs seats"]
+    ids: list[object] = []
+    for seat in cast("list[object]", seats):
+        if not isinstance(seat, dict):
+            out.append("a seat must be an object")
+            continue
+        seat_ = cast("dict[str, Any]", seat)
+        name = seat_.get("seat")
+        if not isinstance(name, str) or not WORD.fullmatch(name) or name in ids:
+            out.append(f"seat ids must be distinct words: {name!r}")
+        ids.append(name)
+        label = seat_.get("label")
+        if not isinstance(label, str) or name_problem(label):
+            out.append(f"{name}: a name that can't be used: {label!r}")
+        if seat_.get("kind") not in kinds:
+            out.append(f"{name}: kind must be one of {', '.join(kinds)}")
+        for key in SETTINGS:
+            if key in seat_ and key != "reports_to" and (why := setting_problem(key, seat_[key], {"participants": []})):
+                out.append(f"{name}: {why}")
+    if sum(1 for q in cast("list[Any]", seats) if isinstance(q, dict) and cast("dict[str, Any]", q).get("role") == "lead") != 1:
+        out.append("a scenario has one lead")
+    output = scenario.get("output", "")
+    if output and not output_of({"team": {"output": output}}):
+        out.append(f"output must be a path inside the project folder: {output!r}")
+    return out
+
+
+def memory_words(rule: object) -> str:
+    if not trim_valid(rule):
+        return "keep"
+    r = cast("dict[str, Any]", rule)
+    return f"{r['do']} past {r['at'] // 1000}k"
+
+
+def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any]) -> str:
+    """One row of a team: name · role · topic · model · memory · reports to — what applies, by the layers."""
+    role, topic, model = (effective(kind, p, config, k) for k in ("role", "topic", "use_model"))
+    trim = effective(kind, p, config, "context_trim") if kind in TRIM_KINDS else None
+    return " · ".join(
+        [
+            str(p.get("label") or p.get("id") or ""),
+            role or "no role",
+            topic or "—",
+            model or "default model",
+            memory_words(trim) if kind in TRIM_KINDS else "keep",
+            f"reports to {whom(reports_to(kind, p, config), config)}",
+        ]
+    )
+
+
+def scenario_preview(name: str) -> list[str]:
+    """What a scenario would start, before anything starts: its team as rows, the result file, the bounds."""
+    scenario = SCENARIOS[name]
+    seats = [
+        {"id": seat["seat"], "label": seat["label"], "kind": seat["kind"], "seat": seat["seat"]} for seat in scenario["seats"]
+    ]
+    config: dict[str, Any] = {"participants": seats, "team": scenario}
+    rows = [seat_line(p["kind"], p, config) for p in seats]
+    return [
+        f"{scenario['title']} — {scenario['hint']}. This is a starting team: change it with /team once it runs.",
+        *(f"  {row}" for row in rows),
+        f"  Result: {scenario['output'] or 'in the chat'}. Without you: nothing external.",
+    ]
+
+
 BRIEF_HEAD = "Your assignment in this room"
+
+
+def offer_team_path() -> Path:
+    """A room just created by start: its first chat opens on «What will we do?», once."""
+    return room().paths.state_dir / "offer-team"
 
 
 def compacted_path() -> Path:
@@ -1272,6 +1465,24 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
         lines.append(f"- Lead: {label_of(config, lead)} — gathers the result and the questions for the person.")
     elif lead == pid:
         lines.append("- You are the room's lead: the person hears from you; ask them what only they can decide.")
+        # Live, a lead with three workers and a reviewer did a whole research alone: its team, by name.
+        people = people_ids(config)
+        team = [
+            q
+            for q in config.get("participants", [])
+            if q.get("id") not in (pid, *people) and reports_to(q.get("kind", ""), q, config) == pid
+        ]
+        if team:
+            parts = "; ".join(
+                f"{label_of(config, q['id'])} — {effective(q.get('kind', ''), q, config, 'role') or 'agent'}"
+                + (f", {t}" if (t := effective(q.get("kind", ""), q, config, "topic")) else "")
+                for q in team
+            )
+            lines.append(
+                f"- Your team: {parts}. Give each its part, have the result checked, gather it — do not do their parts yourself."
+            )
+        if goal := goal_of(config):
+            lines.append(f"- Goal: {goal} You answer for reaching it.")
     if out := output_of(config):
         lines.append(f"- Result file: {out}, in the project folder. Keep the result there, not in messages.")
     if allowed:
@@ -1738,6 +1949,312 @@ def write_room(sample: dict[str, Any], ask: bool) -> None:
 
 
 @room_locked
+def set_team(team: dict[str, Any]) -> None:
+    """The room's `team` block, replaced whole under the room's lock."""
+    data = read_config_raw()
+    data["team"] = team
+    write_config(data)
+    note_settings(data)
+
+
+# What the person changes in a running team (/team), and what the lead changes for them later: each a record
+# of the room's history, «who · what · before → after», under the room's lock. «None» after: the explicit value
+# goes, and the layer below applies again (its seat's, the room's, the built-in one).
+ROOM_KEYS = ("lead", "goal", "round", "output", "without_person")
+
+
+def changes_path() -> Path:
+    return room().paths.state_dir / "team-changes.jsonl"
+
+
+def explicit_value(data: dict[str, Any], who: str, key: str) -> Any:
+    """What is set explicitly — the agent's own or the room's — or None."""
+    if who == "room":
+        return team_of(data).get(key)
+    p = next((q for q in data.get("participants", []) if q.get("id") == who), None)
+    return None if p is None else p.get(key)
+
+
+def change_problem(data: dict[str, Any], who: str, key: str, after: object) -> str:
+    """Why this change can't be made, or ""; None after (back to the layer below) is always one."""
+    if who == "room":
+        if key not in ROOM_KEYS:
+            return f"{key} is not a setting of the room"
+        if after is None:
+            return ""
+        if key == "lead":
+            people = people_ids(data)
+            return "" if after in ids_of(data) and after not in people else "the lead must be one of the room's agents"
+        probe = {"team": {key: after}, "participants": data.get("participants", [])}
+        if key == "without_person":
+            ok = isinstance(after, list) and all(a in WITHOUT_PERSON for a in cast("list[object]", after))
+            return "" if ok else f"without_person takes only {', '.join(WITHOUT_PERSON)}"
+        return next(iter(team_problems(probe)), "")
+    if who not in ids_of(data) or who in people_ids(data):
+        return f"{who} is not one of the room's agents"
+    if key == "seat":
+        seats = [q.get("seat") for q in as_list(team_of(data).get("seats"))]
+        return "" if after is None or after in seats else "seat must be one of the room's scenario seats"
+    if key not in SETTINGS:
+        return f"{key} is not a setting"
+    return "" if after is None else setting_problem(key, after, data, who)
+
+
+def read_changes() -> list[dict[str, Any]]:
+    """The room's history of team changes, oldest first; a line that is not one is skipped."""
+    out: list[dict[str, Any]] = []
+    try:
+        text = read_state_text(changes_path(), "strict")
+    except (OSError, ValueError):
+        return out
+    for line in text.splitlines():
+        with contextlib.suppress(ValueError):
+            rec = json.loads(line)
+            if isinstance(rec, dict) and change_record_ok(cast("dict[str, Any]", rec)):
+                out.append(cast("dict[str, Any]", rec))
+    return out
+
+
+def change_record_ok(rec: dict[str, Any]) -> bool:
+    """A record the program could have written: an id that is a word, changes of known keys of a word id or the
+    room. The file is in the room's home, and a same-user agent can write it: anything else is not shown or undone."""
+    changes: object = rec.get("changes")
+    if not isinstance(rec.get("id"), str) or not WORD.fullmatch(rec["id"]) or not isinstance(changes, list):
+        return False
+    for c in cast("list[object]", changes):
+        if not isinstance(c, dict):
+            return False
+        c_ = cast("dict[str, Any]", c)
+        who, key = c_.get("who"), c_.get("key")
+        if not isinstance(who, str) or not WORD.fullmatch(who):
+            return False
+        if key not in (ROOM_KEYS if who == "room" else (*SETTINGS, "seat")):
+            return False
+    return True
+
+
+@room_locked
+def apply_changes(changes: list[dict[str, Any]], by: str, re_: str = "", undo_of: str = "") -> tuple[dict[str, Any], list[str]]:
+    """Make these changes — [{"who": an agent's id or "room", "key", "after", and "expect" for an undo: the value
+    it must still have}] — in one write, and keep them as one record of the history. A change that does not pass
+    is refused whole, before anything is written; an undo's field changed since is left as it is and named.
+    (the record, the fields left)."""
+    data = read_config_raw()
+    for c in changes:
+        why = change_problem(data, c["who"], c["key"], c.get("after"))
+        if why:
+            raise ValueError(why)
+    done: list[dict[str, Any]] = []
+    left: list[str] = []
+    for c in changes:
+        who, key, after = c["who"], c["key"], c.get("after")
+        before = explicit_value(data, who, key)
+        if "expect" in c and before != c["expect"]:
+            left.append(f"{label_of(data, who) if who != 'room' else 'the room'} — {key}: changed since")
+            continue
+        if who == "room":
+            team = dict(team_of(data))
+            if after is None:
+                team.pop(key, None)
+            else:
+                team[key] = after
+            data["team"] = team
+        else:
+            p = next(q for q in data["participants"] if q.get("id") == who)
+            if after is None:
+                p.pop(key, None)
+            else:
+                p[key] = after
+        done.append({"who": who, "key": key, "before": before, "after": after})
+    record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": now(), "by": by, "changes": done}
+    record.update({"re": re_} if re_ else {})
+    record.update({"undo_of": undo_of} if undo_of else {})
+    if done:
+        write_config(data)
+        private_dir(room().paths.state_dir)
+        note_settings(data)
+        write_state(changes_path(), json.dumps(record, ensure_ascii=False) + "\n", append=True)
+    return record, left
+
+
+def undo_changes(record_id: str, by: str) -> tuple[dict[str, Any], list[str]]:
+    """The reverse of one record of the history: each field back to what it was, if it still holds what that
+    record made it — a field changed since is left, and named."""
+    rec = next((r for r in read_changes() if r.get("id") == record_id), None)
+    if rec is None:
+        raise ValueError("no such change in this room's history")
+    back = [
+        {"who": c["who"], "key": c["key"], "after": c.get("before"), "expect": c.get("after")} for c in reversed(rec["changes"])
+    ]
+    data = read_config_raw()
+    if any(c["key"] in ("lead", "role") for c in back) and any(
+        explicit_value(data, c["who"], c["key"]) != c["expect"] for c in back
+    ):
+        # Half a lead change back would leave two leads, or none.
+        raise ValueError("the lead changed again since: undo the later change first")
+    return apply_changes(back, by, undo_of=record_id)
+
+
+def change_words(data: dict[str, Any], rec: dict[str, Any]) -> str:
+    """«Ann — model sonnet → opus; the room — goal none → …»: what one record changed, for the person."""
+
+    def shown(v: object) -> str:
+        if v is None:
+            return "the default"
+        if isinstance(v, list):
+            return ", ".join(str(x) for x in cast("list[object]", v)) or "nothing"
+        return memory_words(cast("object", v)) if isinstance(v, dict) or v is False else str(v)
+
+    parts: list[str] = []
+    for c in rec.get("changes", []):
+        who = "the room" if c.get("who") == "room" else label_of(data, str(c.get("who")))
+        key = {"use_model": "model", "context_trim": "memory", "reports_to": "reports to"}.get(
+            str(c.get("key")), str(c.get("key"))
+        )
+        named = c.get("key") in ("lead", "reports_to")  # an id: shown by its name
+        before, after = (
+            clean_field(whom(str(v), data) if named and v is not None else shown(v), GOAL_LIMIT)
+            for v in (c.get("before"), c.get("after"))
+        )
+        parts.append(f"{who} — {key} {before} → {after}")
+    return visible("; ".join(parts))
+
+
+# What the lead — or a command line — asks to change in the team: a message with a `proposal`, which changes nothing
+# itself. The person applies it with one Enter in the chat; a narrowing one, asked for by the person in a signed
+# message to the lead, is applied at once and can be undone. A model's price, by name, within one kind of program:
+# a model not in the list, or of another kind, is not «cheaper».
+MODEL_ORDER = {"claude": ["haiku", "sonnet", "opus"]}
+# One proposal is read whole on its card before Enter: so many changes, so many agents, and words that fit.
+PROPOSAL_CHANGES, PROPOSAL_ADDS, PROPOSAL_WORDS = 8, 4, 400
+
+
+def proposals_path() -> Path:
+    return room().paths.state_dir / "proposals.json"
+
+
+def narrows(data: dict[str, Any], c: dict[str, Any]) -> bool:
+    """Does this change only lower spending or rights — so the lead may make it at the person's word: whom an agent
+    reports to (not the person), compacting its memory, a cheaper model of the same program, rarer rounds. Not a
+    topic: free text that goes into another agent's assignment is the person's to read first."""
+    who, key, after = c["who"], c["key"], c.get("after")
+    if who == "room":
+        now_ = round_of(data)
+        return key == "round" and (after is False or (isinstance(after, int) and now_ is not None and after > now_))
+    p = next((q for q in data.get("participants", []) if q.get("id") == who), None)
+    if p is None:
+        return False
+    kind = str(p.get("kind") or "")
+    if key == "context_trim":
+        # Only compacting, and not too soon: «clear» wipes the conversation over and over, «keep» spends more.
+        rule = cast("dict[str, Any]", after) if isinstance(after, dict) else {}
+        return rule.get("do") == "compact" and isinstance(rule.get("at"), int) and rule["at"] >= 50000
+    if key == "reports_to":
+        return after not in (None, "person")
+    if key == "use_model":
+        order = MODEL_ORDER.get(kind, [])
+        cur = effective(kind, p, data, "use_model")
+        return after in order and cur in order and order.index(after) < order.index(cur)
+    return False
+
+
+def as_list(x: object) -> list[dict[str, Any]]:
+    """A list of objects from a record anyone could have written; anything else — none of it."""
+    if not isinstance(x, list):
+        return []
+    return [cast("dict[str, Any]", v) for v in cast("list[object]", x) if isinstance(v, dict)]
+
+
+def proposal_problem(data: dict[str, Any], prop: dict[str, Any], kinds: list[str]) -> str:
+    """Why a proposal can't be made, or "": each change by the checks of /team, each agent to add by those of
+    collab add, a team only to a room without one."""
+    raw_changes: object = prop.get("changes") or []
+    raw_adds: object = prop.get("add") or []
+    team: object = prop.get("team")
+    changes, adds = as_list(raw_changes), as_list(raw_adds)
+    whole = isinstance(raw_changes, list) and isinstance(raw_adds, list)
+    if not whole or len(changes) != len(cast("list[object]", raw_changes)) or len(adds) != len(cast("list[object]", raw_adds)):
+        return "a proposal needs a change, an agent to add or a team to start"
+    if not (changes or adds or team):
+        return "a proposal needs a change, an agent to add or a team to start"
+    for c in changes:
+        who, key = c.get("who"), c.get("key")
+        if not isinstance(who, str) or not isinstance(key, str):
+            return "a change is who, key and the value after"
+        if why := change_problem(data, who, key, c.get("after")):
+            return why
+    for a in adds:
+        if a.get("kind") not in kinds:
+            return f"an agent to add needs its program: {', '.join(kinds)}"
+        label: object = a.get("label")
+        if not isinstance(label, str) or name_problem(label) or label_taken(data, "", label):
+            return f"a name that can't be used: {label!r}"
+        for key in SETTINGS:
+            if key in a and (why := setting_problem(key, a[key], data)):
+                return why
+    if team is not None and (not isinstance(team, str) or team not in SCENARIOS or team_of(data).get("scenario")):
+        return "a team only from the ready ones, and only to a room without one"
+    if len(changes) > PROPOSAL_CHANGES or len(adds) > PROPOSAL_ADDS:
+        return f"one proposal holds up to {PROPOSAL_CHANGES} changes and {PROPOSAL_ADDS} agents: split it"
+    if len(proposal_words(data, prop, whole=True)) > PROPOSAL_WORDS:
+        return "too long to be read whole on its card: split it"
+    return ""
+
+
+def proposal_words(data: dict[str, Any], prop: dict[str, Any], whole: bool = False) -> str:
+    """What a proposal would do, for the person: the changes, before → after, and what it starts."""
+    parts: list[str] = []
+    changes = as_list(prop.get("changes"))
+    if changes:
+        before = [{**c, "before": explicit_value(data, str(c.get("who")), str(c.get("key")))} for c in changes]
+        parts.append(change_words(data, {"changes": before}))
+    for a in as_list(prop.get("add")):
+        what = [str(a[k]) for k in ("role", "topic", "use_model") if a.get(k)]
+        what += [f"memory {memory_words(a['context_trim'])}"] if "context_trim" in a else []
+        what += [f"reports to {whom(str(a['reports_to']), data)}"] if a.get("reports_to") else []
+        what += [f"in {tilde(str(a['folder']))}"] if a.get("folder") else []
+        parts.append(f"+ {a.get('label')} ({a.get('kind')}{', ' + ' · '.join(what) if what else ''})")
+    team = prop.get("team")
+    if isinstance(team, str) and team in SCENARIOS:
+        parts.append(f"start the {SCENARIOS[team]['title']} team ({len(SCENARIOS[team]['seats'])} agents)")
+    words = "; ".join(parts)
+    # Never cut: a proposal longer than its card is refused (proposal_problem), not shown in part.
+    return words if whole else clean_field(words, PROPOSAL_WORDS)
+
+
+def proposal_state() -> dict[str, Any]:
+    return read_json(proposals_path())
+
+
+@room_locked
+def set_proposal_state(mid: str, state: str) -> None:
+    write_json(proposals_path(), {**read_json(proposals_path()), mid: state})
+
+
+def pending_proposals(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    states = proposal_state()
+    return [m for m in messages if isinstance(m.get("proposal"), dict) and states.get(m["id"]) == "pending"]
+
+
+def proposal_digest(prop: object) -> str:
+    return hashlib.sha256(json.dumps(prop, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
+
+
+def proposal_card(m: dict[str, Any], data: dict[str, Any], request: str = "") -> dict[str, Any]:
+    """The chat's question for one proposal: what it does, at whose word, Apply or Decline — one Enter. Bound to what
+    was shown: an edit of the log after it is not applied."""
+    who = "A command line" if m.get("from") == ROOM else label_of(data, str(m.get("from")))
+    asked = f" (your request: «{clean_field(request, 120)}»)" if request else ""
+    return {
+        "step": "proposal",
+        "proposal": m["id"],
+        "digest": proposal_digest(m.get("proposal")),
+        "prompt": f"{who} proposes{asked} — apply?",
+        "options": [("Apply", "go"), ("Decline", "decline"), ("Later — /team shows it", "later")],
+    }
+
+
+@room_locked
 def record_room_root() -> None:
     """The room's project, written into its .collab.json in the room's home: the home is named only
     by a hash of it, and the check of the copies could not tell where a room's Codex works when the
@@ -1833,6 +2350,67 @@ def write_config(data: dict[str, Any]) -> None:
     rp = room().paths
     # Through the link-refusing writer too: a link at the temporary name was followed.
     replace_state(rp.config_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+
+def note_settings(data: dict[str, Any]) -> None:
+    """What the room's own setting writers — the chat's changes, a team started, an agent added with its settings
+    — wrote: a setting the file holds and this does not was changed past them. Only they note it: any other
+    write of the file (a session bound, a name) would take in a change made past them unseen."""
+    if room().paths.state_dir.is_dir():
+        replace_state(settings_known_path(), json.dumps(settings_of(data), ensure_ascii=False) + "\n")
+
+
+def settings_known_path() -> Path:
+    return room().paths.state_dir / "settings-known.json"
+
+
+def settings_of(data: dict[str, Any]) -> dict[str, Any]:
+    """The explicit settings in a room's file: the room's team block and each participant's own, by id."""
+    out: dict[str, Any] = {"room": {k: v for k, v in team_of(data).items() if k in ROOM_KEYS}}
+    for q in cast("list[object]", data.get("participants", [])):
+        p = cast("dict[str, Any]", q) if isinstance(q, dict) else {}
+        if isinstance(p.get("id"), str):
+            out[p["id"]] = {k: p[k] for k in (*SETTINGS, "seat") if k in p}
+    return out
+
+
+def changes_outside(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """The settings changed past the program — by hand, or by an agent writing the room's file: each who · key ·
+    before → after, against what the program last wrote. Nothing known yet — nothing (a room before this)."""
+    known = read_json(settings_known_path())
+    if not known:
+        return []
+    now_ = settings_of(data)
+    out: list[dict[str, Any]] = []
+    for who, keys in now_.items():
+        if who not in known or not isinstance(known[who], dict):
+            continue
+        before = cast("dict[str, Any]", known[who])
+        for key in sorted(set(before) | set(cast("dict[str, Any]", keys))):
+            if before.get(key) != keys.get(key):
+                out.append({"who": who, "key": key, "before": before.get(key), "after": keys.get(key)})
+    return out
+
+
+@room_locked
+def record_outside() -> dict[str, Any] | None:
+    """A change past the program goes into the history as made «outside» — it applies, and /team can undo it. The
+    room's file read under the lock: the chat's own change, written meanwhile, is not taken for one. Nothing noted
+    yet — what is there now is the start."""
+    data = read_config_raw()
+    known = read_json(settings_known_path())
+    if not known:
+        note_settings(data)
+        return None
+    changes = changes_outside(data)
+    if not changes:
+        if settings_of(data).keys() != known.keys():
+            note_settings(data)  # agents joined or left, nothing changed: the start moves on with them
+        return None
+    record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": now(), "by": "outside", "changes": changes}
+    write_state(changes_path(), json.dumps(record, ensure_ascii=False) + "\n", append=True)
+    note_settings(data)
+    return record
 
 
 def label_taken(config: dict[str, Any], pid: str, label: str) -> str:
@@ -2312,6 +2890,7 @@ def append_message(
     quiet: bool = False,
     silent: bool = False,
     brief: bool = False,
+    proposal: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     rp = room().paths
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": now(), "from": sender, "to": to, "text": text}
@@ -2323,6 +2902,8 @@ def append_message(
         record["silent"] = True  # the room's own note: never typed to an agent (is_silent)
     if brief:
         record["brief"] = True  # an agent's assignment (deliver.send_briefs): told by this, never by its words
+    if proposal is not None:
+        record["proposal"] = proposal  # a change of the team the person applies (store.proposal_card)
     if sign:
         record["sig"] = signature(owner_key(create=True), record)
         mark_signing(record["id"])
@@ -2577,6 +3158,30 @@ def unsigned_person(m: dict[str, Any], config: dict[str, Any]) -> bool:
         return False
     key = owner_key()
     return not key or not hmac.compare_digest(str(m.get("sig", "")), signature(key, m))
+
+
+# A request the lead may answer with a narrowing applied at once: young, and used once.
+REQUEST_AGE = 6 * 3600
+
+
+def request_of(m: dict[str, Any], config: dict[str, Any], messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The person's own request a proposal answers: the message it names with --re — from a person, signed by that
+    person's chat (checked here, also in a room that never signed before), to the proposer alone, not older than
+    REQUEST_AGE, not itself an answer to a proposal (a «Declined»), and not used by another proposal. Anything else
+    is no request: the proposal waits for Enter."""
+    req = next((x for x in messages if x.get("id") == m.get("re")), None)
+    if req is None or req.get("from") not in people_ids(config) or req.get("to") != [m.get("from")]:
+        return None
+    key = owner_key()
+    if not key or not hmac.compare_digest(str(req.get("sig", "")), signature(key, req)):
+        return None
+    if time.time() - at_time(str(req.get("at") or "")) > REQUEST_AGE:
+        return None
+    if any(isinstance(x.get("proposal"), dict) and x.get("id") == req.get("re") for x in messages):
+        return None
+    if any(x.get("re") == req["id"] and isinstance(x.get("proposal"), dict) and x["id"] != m["id"] for x in messages):
+        return None  # used by another proposal
+    return req
 
 
 def held_count() -> int:
@@ -2847,6 +3452,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "attention_title": "(Do you want to [^?\\n]+\\?|Is this a project you created[^?\\n]*\\?"
         "|Choose the text style that looks best with your terminal|Select login method)",
         "draft": '^❯[ \u00a0]+(?!Try ")\\S',
+        # Typed fast, a long text is taken for a paste and folded — «❯ [Pasted text #1]», sometimes with the rest of it
+        # after — and the Enter right after did not send it: four briefs stood as drafts, delivery stopped for all.
+        "paste_fold": "^❯[ \u00a0]+\\[Pasted text #\\d+(?: \\+\\d+ lines)?\\]",
         "model_from": "claude-session",
         "dim_is_hint": True,
         # A command it left running in the background: its turn is over, the work is not
@@ -3159,7 +3767,7 @@ def screen_state(p: dict[str, Any], pane: str, shot: Shot | None = None) -> tupl
     return "unknown", ""
 
 
-def fold_left(rules: dict[str, Any], pane: str) -> bool:
+def fold_left(rules: dict[str, Any], pane: str, typed: str = "") -> bool:
     """Our own text folded in the input line and still not sent — and nothing else on screen that an
     Enter would answer (a question, a menu): one more Enter must press no one else's button.
 
@@ -3172,8 +3780,19 @@ def fold_left(rules: dict[str, Any], pane: str) -> bool:
     if shown.returncode != 0:
         return False
     tail = "\n".join(line.rstrip() for line in (shown.stdout or "").rstrip("\n").splitlines()[-args_tail() :])
-    inputs = [line for line in tail.splitlines() if line.startswith("›")]
-    if not inputs or not re.fullmatch(rules["paste_fold"].lstrip("^").rstrip("$") + r"\s*", inputs[-1]):
+    prompt = rules["paste_fold"].lstrip("^")[:1]  # «›» Codex, «❯» Claude: the input line's first sign
+    lines = tail.splitlines()
+    at = max((i for i, line in enumerate(lines) if line.startswith(prompt)), default=-1)
+    fold = re.match(rules["paste_fold"].lstrip("^").rstrip("$"), lines[at]) if at >= 0 else None
+    if fold is None:
+        return False
+    # After the fold, only what we typed ourselves — the rest of it, and in Claude's input box (between its «─»
+    # bars) its wrapped lines: a word of anyone else's there, and an Enter would send theirs. Below an input line
+    # with no box (Codex) is its status, not the input.
+    box = next((i for i in range(at + 1, len(lines)) if lines[i].lstrip().startswith("─")), None)
+    rest = [lines[at][fold.end() :]] + (lines[at + 1 : box] if box is not None else [])
+    left = "".join("".join(rest).split())
+    if left and left not in "".join(typed.split()):
         return False
     return not any(
         rules.get(key) and re.search(rules[key], tail, re.MULTILINE) for key in ("attention", "attention_title", "busy")
@@ -5967,6 +6586,9 @@ def deliver_once(config: dict[str, Any], panes: dict[str, str]) -> list[tuple[st
         if typed:
             done.append((p["id"], typed))
     tick(config)  # the tokens' ledger: each agent's spending since its last look
+    with contextlib.suppress(OperationFailed):
+        handle_proposals(config, read_log_tick())
+    tell_outside_changes(config)
     tell_setting_changes(config)
     send_briefs(config)
     return done
@@ -5997,6 +6619,69 @@ def applied(p: dict[str, Any], config: dict[str, Any]) -> dict[str, str]:
         "context trim": trim_words(effective_trim(kind, p, config)),
         "reports to": whom(reports_to(kind, p, config), config),
     }
+
+
+def tell_outside_changes(config: dict[str, Any]) -> None:
+    """Settings changed past the program — the room's file edited by hand or by an agent: they apply, the person's
+    chat gets one line, and /team → Changes can undo them. A label, not a lock: whoever can write the file can."""
+    try:
+        rec = record_outside()
+    except SystemExit:
+        return  # the room's file unreadable for now: load_config says why; the tick goes on
+    if rec:
+        line = f"⚠ Settings changed outside the chat: {change_words(config, rec)}. /team → Changes can undo it."
+        append_message(ROOM, people_ids(config) or ["all"], line, silent=True)
+
+
+@room_locked
+def handle_proposals(config: dict[str, Any], recent: list[dict[str, Any]]) -> None:
+    """Each new proposal is looked at once. Only the lead proposes (or a command line, through the room). One that
+    only narrows — topic, memory, whom one reports to, a cheaper model, rarer rounds — asked for by the person in a
+    signed message to the lead, is applied at once: one line, and /team → Changes undoes it. Any other waits for the
+    person's Enter in the chat."""
+    states = proposal_state()
+    new = [m for m in recent if isinstance(m.get("proposal"), dict) and m["id"] not in states]
+    if not new:
+        return
+    messages = read_messages()  # the request may be older than this tick
+    people = people_ids(config) or ["all"]
+    for m in new:
+        prop = m["proposal"]
+        if m.get("from") not in (lead_of(config), ROOM):
+            set_proposal_state(m["id"], "refused")  # not the lead: a proposal it could not have made
+            continue
+        try:
+            problem = proposal_problem(config, prop, list(PRESETS))
+        except Exception:  # noqa: BLE001 — a record anyone could write: whatever it holds, it stops nothing
+            problem = "not a proposal"
+        if problem:
+            set_proposal_state(m["id"], "refused")
+            continue
+        req = request_of(m, config, messages)
+        changes = prop.get("changes") or []
+        lead = next((q for q in config["participants"] if q["id"] == m.get("from")), {})
+        own_session = bool(prop.get("session")) and prop.get("session") == lead.get("claude_session")
+        narrow = (
+            req is not None
+            and own_session
+            and not prop.get("add")
+            and not prop.get("team")
+            and isinstance(changes, list)
+            and bool(changes)
+            and all(isinstance(c, dict) and narrows(config, c) for c in changes)
+        )
+        if not narrow:
+            set_proposal_state(m["id"], "pending")
+            continue
+        try:
+            rec, _ = apply_changes(changes, str(m["from"]), str(m.get("re") or ""))
+        except (ValueError, KeyError, TypeError):
+            set_proposal_state(m["id"], "pending")
+            continue
+        set_proposal_state(m["id"], "applied")
+        who = label_of(config, str(m["from"]))
+        line = f"By your request, {who} changed: {change_words(load_config(), rec)}. /team → Changes can undo it."
+        append_message(ROOM, people, line, silent=True)
 
 
 @room_locked
@@ -6043,6 +6728,44 @@ def brief_version(pid: str, config: dict[str, Any]) -> tuple[str, int]:
 def current_brief(pid: str, config: dict[str, Any]) -> str:
     text, version = brief_version(pid, config)
     return brief(pid, config, version) if text else ""
+
+
+def assignment_state(pid: str, config: dict[str, Any], messages: list[dict[str, Any]]) -> str:
+    """Where an agent is with its assignment: its latest brief closed with ack — acknowledged (it got it; that
+    is not a promise to keep it), answered with say --re — it said something about it, the person reads it."""
+    p = next((q for q in config["participants"] if q["id"] == pid), {})
+    if p.get("joined") == "pending":
+        return "Starting"
+    if not brief(pid, config):
+        return ""
+    sent = [m for m in messages if m.get("from") == ROOM and m.get("brief") is True and m.get("to") == [pid]]
+    if not sent:
+        return "Getting its assignment"
+    last = sent[-1]["id"]
+    if any(m.get("from") == pid and m.get("re") == last for m in messages):
+        return "Replied to its assignment — read it"
+    if last in read_set(room().paths.noreply_dir, pid):
+        return "Assignment acknowledged"
+    return "Getting its assignment"
+
+
+def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[str]:
+    """The room's team as it is: the scenario, the result file, what is done without the person, and one row per
+    agent — what applies to it and where it is with its assignment."""
+    team = team_of(config)
+    name = team.get("scenario")
+    title = SCENARIOS[name]["title"] if isinstance(name, str) and name in SCENARIOS else "No scenario"
+    allowed = without_person(config)
+    lines = [
+        f"Team: {title} · result: {output_of(config) or 'in the chat'} · without you: "
+        + ("; ".join(WITHOUT_PERSON[a] for a in allowed) if allowed else "nothing external")
+    ]
+    for p in agents_of(config):
+        state = assignment_state(p["id"], config, messages)
+        lines.append(
+            f"  {visible(seat_line(agent_kind(p), p, config))}" + (f" — {state}" if state else "")
+        )
+    return lines if len(lines) > 1 else [*lines, "  No agents yet: /team picks a ready team, /add adds one agent."]
 
 
 @room_locked
@@ -6525,7 +7248,7 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
                 # The fold was not sent yet. Only once, and only into the same process: a
                 # window reused since the look is not pressed. Still there after that, it reads as a
                 # draft — the room shows it and types nothing more there.
-                if fold_left(rules, pane) and not pane_guard(p, pane):
+                if fold_left(rules, pane, text) and not pane_guard(p, pane):
                     sent = tmux("send-keys", "-t", pane, "Enter", check=False)
         if sent.returncode != 0:
             # The window went away, or tmux refused: these messages wait, the others go on.
@@ -6647,6 +7370,7 @@ def cmd_deliver(args: argparse.Namespace) -> None:
 
 import argparse
 import os
+import json
 import shlex
 import shutil
 import subprocess
@@ -6733,10 +7457,12 @@ def model_for(p: dict[str, Any]) -> str:
 
 
 @room_locked
-def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str, own: dict[str, Any] | None = None) -> str:
+def launch_new_agent(
+    config: dict[str, Any], kind: str, folder: str, label: str, own: dict[str, Any] | None = None, seat: str = ""
+) -> str:
     """Start an agent in its own window of the room's tmux session and register it. `own`: the settings
     given it explicitly (store.SETTINGS) — only these are written into its seat; the rest go on by the
-    layers below."""
+    layers below. `seat`: its seat in the room's scenario, whose settings it takes."""
     own = own or {}
     # The id and the name by the room's file as it is now, under its lock — not the chat's copy: two
     # /add at once (two chats, or /add and a join) got one id, and add_participant replaced the first
@@ -6747,6 +7473,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str,
     if label_taken(fresh, "", label):
         raise SystemExit("that is already someone else's name here")
     pid = slug(label, ids_of(fresh), kind)
+    model = str(effective(kind, {"id": pid, **({"seat": seat} if seat else {}), **own}, fresh, "use_model") or "")
     cli = (
         codex_room_rule(pid, folder, label) if kind == "codex" else ""
     )  # before it starts: Codex reads rules at start
@@ -6765,7 +7492,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str,
             "-c",
             tmux_dir(folder),
             *pane_env(),
-            in_dir(folder, agent_command(kind, model=str(own.get("use_model") or ""))),
+            in_dir(folder, agent_command(kind, model=model)),
             check=False,
         )
         if out.returncode != 0:
@@ -6787,6 +7514,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str,
             "folder": folder,
             **({"cli": cli} if cli else {}),
             **{k: v for k, v in own.items() if k in SETTINGS},
+            **({"seat": seat} if seat else {}),
         }
         add_participant(entry)
     except BaseException:
@@ -7377,6 +8105,85 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
     if kind != "claude":  # a Claude tells its session itself (confirm_joins); a Codex is asked
         append_message(ROOM, [p["id"]], ping_text(code))
     return pane
+
+
+def scenario_unavailable(scenario: dict[str, Any]) -> list[str]:
+    """The seats whose program is not on this machine, named: the team is not started without them, and no
+    other program is put in their place unasked."""
+    return [
+        f"{seat['label']}: {PRESETS[seat['kind']]['label']} is not installed"
+        for seat in scenario["seats"]
+        if not shutil.which(PRESETS[seat["kind"]]["command"][0])
+    ]
+
+
+def start_scenario(name: str, folder: str) -> tuple[list[str], list[str]]:
+    """A ready team: the scenario is copied into the room's file, then each seat's agent is started the way /add
+    starts one, with only its seat recorded — its settings go by the seat. (started ids, «name: why» of those
+    that did not start). One that failed does not stop the rest."""
+    scenario = SCENARIOS[name]
+    seats = json.loads(json.dumps(scenario["seats"]))
+    team = {"scenario": name, "seats": seats, "output": scenario["output"], "without_person": []}
+    set_team(team)
+    started: list[str] = []
+    failed: list[str] = []
+    for seat in seats:
+        config = load_config()
+        label = next(
+            n for n in [seat["label"]] + [f"{seat['label']} {i}" for i in range(2, 100)] if not label_taken(config, "", n)
+        )
+        try:
+            pid = launch_new_agent(config, seat["kind"], folder, label, seat=seat["seat"])
+        except SystemExit as exc:
+            failed.append(f"{label}: {exc.code if isinstance(exc.code, str) else 'it did not start'}")
+            continue
+        started.append(pid)
+        if seat["role"] == "lead":
+            set_team({**team_of(load_config()), "lead": pid})
+    return started, failed
+
+
+def team_started(config: dict[str, Any], started: list[str], failed: list[str]) -> str:
+    """One line for a team started: how many of how many, who leads — and each that did not start, with why.
+    Not «all started» when some did not."""
+    lead = lead_of(config)
+    head = f"Team started: {len(started)} of {len(started) + len(failed)} agents." + (
+        f" Lead — {label_of(config, lead)}." if lead else " No lead started: /add one, or start the team again."
+    )
+    return "\n".join([head, *(f"  ! {visible(why)}" for why in failed)])
+
+
+def apply_proposal(mid: str, by: str, digest: str = "") -> list[str]:
+    """The person's Enter on a proposal: its changes as one record of the history, its agents started the way /add
+    starts them, its team started — what each did, in words. Checked again first: the room may have changed."""
+    m = next((x for x in read_messages() if x.get("id") == mid and isinstance(x.get("proposal"), dict)), None)
+    if m is None or proposal_state().get(mid) != "pending":
+        raise ValueError("no such proposal waiting")
+    if digest and proposal_digest(m["proposal"]) != digest:
+        raise ValueError("it changed after it was shown — look at it again in /team")
+    prop, data = m["proposal"], load_config()
+    problem = proposal_problem(data, prop, list(PRESETS))
+    if problem:
+        set_proposal_state(mid, "refused")  # no longer applies: it does not wait on for ever
+        raise ValueError(problem)
+    root = str(room().paths.root)
+    lines = []
+    if prop.get("changes"):
+        rec, _ = apply_changes(prop["changes"], str(m.get("from")), str(m.get("re") or ""))
+        lines.append(f"Saved: {change_words(load_config(), rec)}.")
+    for a in prop.get("add") or []:
+        folder = str(a.get("folder") or root)
+        if why := folder_problem(Path(folder)):
+            lines.append(f"! {a['label']}: {why}")
+            continue
+        own = {k: a[k] for k in SETTINGS if k in a}
+        pid = launch_new_agent(load_config(), a["kind"], str(Path(folder).resolve()), a["label"], own)
+        lines.append(f"Starting {a['label']} in room window {pid}.")
+    if prop.get("team"):
+        started, failed = start_scenario(prop["team"], root)
+        lines.append(team_started(load_config(), started, failed))
+    set_proposal_state(mid, "applied")
+    return lines
 
 
 def agent_window_alive(q: dict[str, Any]) -> bool:
@@ -8192,7 +8999,8 @@ def cmd_start(args: argparse.Namespace) -> None:
         team = default_team()
         team["participants"] = team["participants"][:1]
         write_room(team, sys.stdin.isatty())
-        print(f"Room created for {team['participants'][0]['label']}. Add agents in the chat with /add.")
+        replace_state(offer_team_path(), now() + "\n")  # «What will we do?» at its first chat
+        print(f"Room created for {team['participants'][0]['label']}. Pick a ready team or add agents in the chat.")
     if rp.base == rp.root:
         move_room_home(args)
         rp = room().paths
@@ -8305,7 +9113,7 @@ import os
 import shlex
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 
@@ -8431,6 +9239,7 @@ class ChatState:
     and set as x[0]. Each field's meaning is noted where cmd_chat sets it."""
 
     mine_count: int = 0
+    proposals_shown: set[str] = field(default_factory=lambda: set[str]())  # a proposal's card opens by itself once
     bar: str = ""
     menu_line: str = ""
     extra_rows: int = 0
@@ -8755,6 +9564,7 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None) -> str:
             ("", "Green with a spinner and a number: ready for messages, background tasks still run"),
             ("Status layout", "More agents wrap to another row; none are hidden"),
             ("/add", "Start a new agent: choose its kind, its folder, its name"),
+            ("/team", "See the team and where each agent is with its assignment; in a new room, start a ready team"),
             ("/remove", "Disconnect a participant; the agent keeps running in its window"),
             # A muted agent still gets what is addressed to it by name — the text said all.
             ("/mute · /unmute", "Stop / resume room-wide messages to an agent; messages to it by name still arrive"),
@@ -9075,7 +9885,7 @@ import argparse
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, cast
 
 
 
@@ -9133,6 +9943,266 @@ class ChatCommandContext:
     whole_line: str
     wizard: dict[str, Any]
     wizard_back: Callable[..., Any]
+
+
+def open_scenarios(ctx: ChatCommandContext) -> None:
+    open_scenarios_into(ctx.wizard)
+
+
+def open_scenarios_into(wizard: dict[str, Any]) -> None:
+    """«What will we do?»: the ready teams, and no team at all. Nothing starts before «Launch the team»."""
+    wizard.update(
+        step="scenario_pick",
+        from_cmd="/team",
+        prompt="What will we do?",
+        # First, and taken by Enter: a room as before — nothing automatic.
+        options=[("No template — nothing automatic, add agents with /add", "none")]
+        + [(f"{sc['title']} — {sc['hint']}", name) for name, sc in SCENARIOS.items()],
+    )
+
+
+def agents_words(n: int) -> str:
+    return f"{n} agent" if n == 1 else f"{n} agents"
+
+
+def offer_team(config: dict[str, Any]) -> bool:
+    """A room start has just created, still without agents or a team: «What will we do?» comes first — once; a
+    room made before, or left empty on purpose, opens as ever."""
+    path = offer_team_path()
+    if not path.exists():
+        return False
+    path.unlink(missing_ok=True)
+    people = people_ids(config)
+    return not team_of(config) and all(p["id"] in people for p in config["participants"])
+
+
+def room_is_empty(config: dict[str, Any]) -> bool:
+    people = people_ids(config)
+    return all(p["id"] in people for p in config["participants"])
+
+
+AGENT_FIELDS = {"role": "Role", "topic": "Topic", "use_model": "Model", "context_trim": "Memory", "reports_to": "Reports to"}
+ROOM_FIELDS = {"lead": "Lead", "goal": "Goal", "round": "Lead's rounds", "output": "Result file", "without_person": "Without you"}
+MODELS = {"claude": ["opus", "sonnet", "haiku"], "codex": []}
+
+
+def open_team_menu(ctx: ChatCommandContext, cfg: dict[str, Any]) -> None:
+    """/team on a running team: change an agent, the room's settings, or look back and undo."""
+    agents = agents_of(cfg)
+    waiting = pending_proposals(read_messages())
+    ctx.wizard.update(
+        step="team_menu",
+        from_cmd="/team",
+        prompt="Change the team?",
+        options=[(f"Proposal: {proposal_words(cfg, m['proposal'])}", f"proposal:{m['id']}") for m in waiting]
+        + [(f"Change {visible(p.get('label') or p['id'])}…", f"agent:{p['id']}") for p in agents]
+        + [("The room: lead, goal, result file, what is done without you…", "room"), ("Changes — look back, undo…", "history")],
+    )
+
+
+def setting_shown(key: str, value: object, cfg: dict[str, Any]) -> str:
+    if value is None:
+        return "default"
+    if key == "context_trim":
+        return memory_words(value)
+    if key in ("reports_to", "lead"):
+        return whom(str(value), cfg)
+    if key == "without_person":
+        return "; ".join(WITHOUT_PERSON[a] for a in cast("list[str]", value)) or "nothing external"
+    return visible(str(value))
+
+
+def when_words(cfg: dict[str, Any], who: str, key: str) -> str:
+    """When a change starts to act — said before it is saved."""
+    if who == "room":
+        return "The agents get it with their next assignment."
+    if key == "use_model":
+        # Not /model: Claude saves it as the person's own default for every new session.
+        return f"A model takes effect when the program starts: /restart {label_of(cfg, who)} — its conversation goes on."
+    if key == "context_trim":
+        return "From its next free minute; what it remembers now is not cut by this."
+    return "It gets its new assignment after its current task."
+
+
+def field_options(cfg: dict[str, Any], who: str, key: str) -> list[tuple[str, str]]:
+    """The values to choose from for one field; «the default» takes the explicit one away."""
+    if who == "room":
+        if key == "lead":
+            return [(visible(p.get("label") or p["id"]), p["id"]) for p in agents_of(cfg)]
+        if key == "round":
+            return [("Every 15 minutes", "15"), ("Every 30 minutes", "30"), ("Every hour", "60"), ("Off", "off")]
+        if key == "without_person":
+            on = without_person(cfg)
+            return [(f"{'✓' if a in on else '·'} {words}", f"toggle:{a}") for a, words in WITHOUT_PERSON.items()]
+        return [("Type it…", "type"), ("None", "default")]
+    p = next(q for q in cfg["participants"] if q["id"] == who)
+    kind = agent_kind(p)
+    if key == "role":
+        rows = [(f"{r} — {words}", r) for r, words in ROLES.items()]
+    elif key == "use_model":
+        rows = [(name, name) for name in MODELS.get(kind, [])] + [("Another model — type its name…", "type")]
+    elif key == "context_trim":
+        rows = [("Compact past 150k", "compact"), ("Clear past 100k", "clear"), ("Keep — leave it to the program", "keep")]
+    elif key == "reports_to":
+        rows = [("The person", "person")] + [
+            (visible(q.get("label") or q["id"]), q["id"]) for q in agents_of(cfg) if q["id"] != who
+        ]
+    else:
+        rows = [("Type it…", "type")]
+    return rows + [("The default — the scenario's, or the room's", "default")]
+
+
+def chosen_value(key: str, value: str, cfg: dict[str, Any]) -> object:
+    if value == "default":
+        return None
+    if key == "context_trim":
+        return MEMORY[value]
+    if key == "round":
+        return False if value == "off" else int(value)
+    if key == "without_person":
+        on = without_person(cfg)
+        a = value.partition(":")[2]
+        return [x for x in WITHOUT_PERSON if (x in on) != (x == a)]
+    return value
+
+
+def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -> None:
+    """/team's steps: an agent or the room → a field → a value → «before → after» and when it acts → Save."""
+    step_ = ctx.wizard.get("step")
+    cfg = load_config()
+    if step_ == "team_menu":
+        if line.startswith("proposal:"):
+            m = next((x for x in read_messages() if x.get("id") == line.partition(":")[2]), None)
+            if m is not None:
+                ctx.wizard.clear()
+                ctx.wizard.update(proposal_card(m, cfg))
+            return
+        if line == "history":
+            records = read_changes()[-10:]
+            if not records:
+                say_("No changes yet.")
+                return
+            ctx.wizard.update(
+                step="team_history",
+                prompt="Undo a change?",
+                options=[
+                    (f"{local_hm(r.get('at', ''))} · {change_words(cfg, r)}", f"undo:{r['id']}")
+                    for r in reversed(records)
+                ],
+            )
+            return
+        who = "room" if line == "room" else line.partition(":")[2]
+        fields = ROOM_FIELDS if who == "room" else AGENT_FIELDS
+        if who != "room" and who not in ids_of(cfg):
+            return
+        rows = []
+        for key, title in fields.items():
+            if who == "room":
+                value: object = lead_of(cfg) if key == "lead" else team_of(cfg).get(key)
+            else:
+                p = next(q for q in cfg["participants"] if q["id"] == who)
+                value = effective(agent_kind(p), p, cfg, key)
+                if key == "reports_to":
+                    value = reports_to(agent_kind(p), p, cfg)
+            own = who == "room" or key in next(q for q in cfg["participants"] if q["id"] == who)
+            rows.append((f"{title}: {setting_shown(key, value, cfg)}{'' if own else ' (the scenario’s)'}", f"field:{key}"))
+        name = "the room" if who == "room" else label_of(cfg, who)
+        ctx.wizard.update(step="team_card", who=who, prompt=f"Change {name}: which?", options=rows)
+        return
+    if step_ == "team_history":
+        rec_id = line.partition(":")[2]
+        rec = next((r for r in read_changes() if r.get("id") == rec_id), None)
+        if rec is None:
+            return
+        ctx.wizard.update(
+            step="team_undo",
+            record=rec_id,
+            prompt="Undo it?",
+            options=[("Undo", "go"), ("Cancel", "back")],
+        )
+        say_(
+            f"Undo: {change_words(cfg, rec)}. Work done and money spent stay; history cleared from an agent "
+            "does not come back." + "\n" * 4
+        )
+        return
+    if step_ == "team_undo":
+        if line != "go":
+            ctx.wizard_back()
+            return
+        rec_id = ctx.wizard["record"]
+        ctx.wizard.clear()
+        try:
+            rec, left = undo_changes(rec_id, ctx.args.as_)
+        except ValueError as exc:
+            say_(f"! Not undone: {clean_field(str(exc), 200)}.")
+            return
+        if rec["changes"]:
+            say_(f"Undone: {change_words(load_config(), rec)}.")
+        for why in left:
+            say_(f"! Left as it is: {why}.")
+        return
+    if step_ == "team_card":
+        key = line.partition(":")[2]
+        ctx.wizard.update(
+            step="team_field",
+            key=key,
+            prompt=f"{(ROOM_FIELDS | AGENT_FIELDS)[key]}:",
+            options=field_options(cfg, ctx.wizard["who"], key),
+        )
+        return
+    if step_ in ("team_field", "team_typed"):
+        who, key = ctx.wizard["who"], ctx.wizard["key"]
+        if step_ == "team_field" and line == "type":
+            ctx.wizard.update(step="team_typed", options=None, prompt=f"{(ROOM_FIELDS | AGENT_FIELDS)[key]} (Esc to go back):")
+            say_(ctx.wizard["prompt"])
+            return
+        after = line if step_ == "team_typed" else chosen_value(key, line, cfg)
+        if who != "room" and key == "role" and (after == "lead") != (who == lead_of(cfg)):
+            # One lead: who leads changes in the room's card, where the one before is given another role.
+            say_(
+                "! The room has one lead: change who leads in /team → The room → Lead."
+                + "\n" * (len(ctx.wizard.get("options") or []) + 2)
+            )
+            return
+        why = change_problem(cfg, who, key, after)
+        if why:
+            say_(f"! {why}. Try again." + "\n" * (len(ctx.wizard.get("options") or []) + 2))  # above the menu still open
+            return
+        before = explicit_value(cfg, who, key)
+        if who == "room" and key == "lead":
+            before = lead_of(cfg) or None  # who leads now, set or found by role
+        elif who != "room":
+            # What acts now, its own or its seat's — «default» said sonnet was nothing.
+            p = next(q for q in cfg["participants"] if q["id"] == who)
+            kind = agent_kind(p)
+            before = reports_to(kind, p, cfg) if key == "reports_to" else effective(kind, p, cfg, key)
+        changes = [{"who": who, "key": key, "after": after}]
+        if who == "room" and key == "lead":
+            # One lead: the new one takes the role, the one before becomes a worker — in one record.
+            old = lead_of(cfg)
+            changes += [{"who": str(after), "key": "role", "after": "lead"}]
+            changes += [{"who": old, "key": "role", "after": "worker"}] if old and old != after else []
+        ctx.wizard.update(step="team_confirm", changes=changes, prompt="Save it?", options=[("Save", "go"), ("Cancel", "back")])
+        name = "the room" if who == "room" else label_of(cfg, who)
+        say_(
+            f"{name} — {(ROOM_FIELDS | AGENT_FIELDS)[key].lower()}: {setting_shown(key, before, cfg)} → {setting_shown(key, after, cfg)}. "
+            + when_words(cfg, who, key)
+            + "\n" * 4  # room for the choice under it
+        )
+        return
+    if step_ == "team_confirm":
+        if line != "go":
+            ctx.wizard_back()
+            return
+        changes = ctx.wizard["changes"]
+        ctx.wizard.clear()
+        try:
+            rec, _ = apply_changes(changes, ctx.args.as_)
+        except ValueError as exc:
+            say_(f"! Not saved: {exc}.")
+            return
+        say_(f"Saved: {change_words(load_config(), rec)}.")
+        return
 
 
 def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
@@ -9360,6 +10430,87 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         )
         say_("Stop the room? " + describe_stop(closing, staying))
         return
+    if line == "/team":
+        ctx.wizard.clear()
+        cfg = load_config()
+        waiting = pending_proposals(read_messages())
+        if team_of(cfg).get("scenario") or not room_is_empty(cfg) or waiting:
+            open_team_menu(ctx, cfg)
+            # Room under the rows for the choice: the menu is drawn over the feed's bottom lines.
+            ctx.feed("\n".join(team_view(cfg, read_messages())) + "\n" * (len(ctx.wizard["options"]) + 2))
+            return
+        open_scenarios(ctx)
+        return
+    if ctx.wizard.get("step", "").startswith("team_"):
+        team_step(ctx, line, say_)
+        return
+    if ctx.wizard.get("step") == "proposal":
+        mid, digest = ctx.wizard["proposal"], ctx.wizard.get("digest", "")
+        ctx.wizard.clear()
+        if line not in ("go", "decline", "later"):
+            # A draft typed while the card opened: it is a message, never a yes.
+            say_("The proposal waits: /team shows it.")
+            if line.strip():
+                ctx.submit(line)
+            return
+        if line == "later":
+            say_("It waits: /team shows it.")
+            return
+        if line == "decline":
+            set_proposal_state(mid, "declined")
+            m = next((x for x in read_messages() if x.get("id") == mid), {})
+            if m.get("from") in ids_of(load_config()):
+                # Unsigned and quiet: not a request a next proposal could name.
+                append_message(ROOM, [m["from"]], "Your proposal is declined.", mid)
+            say_("Declined.")
+            return
+        try:
+            lines = apply_proposal(mid, ctx.args.as_, digest)
+        except Exception as exc:  # noqa: BLE001 — a record anyone could write: said, and the chat stays
+            say_(f"! Not applied: {clean_field(str(exc), 200)}.")
+            return
+        except SystemExit as exc:
+            say_(f"! Not applied: {clean_field(str(exc.code), 200)}.")
+            return
+        for text in lines:
+            say_(text)
+        ctx.refresh_people()
+        return
+    if ctx.wizard.get("step") == "scenario_pick":
+        if line == "none":
+            ctx.wizard.clear()
+            say_("No template: nothing automatic — /add adds an agent, /team picks a ready team later.")
+            return
+        if line not in SCENARIOS:
+            return
+        missing = scenario_unavailable(SCENARIOS[line])
+        ctx.wizard.update(
+            step="scenario_go",
+            scenario=line,
+            prompt="Not available: " + "; ".join(missing) if missing else "Launch this team?",
+            options=[("Back", "back")]
+            if missing
+            else [(f"Launch the team — {agents_words(len(SCENARIOS[line]['seats']))}", "go"), ("Back", "back")],
+        )
+        # Room under the rows for the choice: the menu is drawn over the feed's bottom lines.
+        say_("\n".join(scenario_preview(line)) + "\n" * 4)
+        return
+    if ctx.wizard.get("step") == "scenario_go":
+        if line == "back":
+            ctx.wizard_back()
+            return
+        if line != "go":
+            return
+        name = ctx.wizard["scenario"]
+        ctx.wizard.clear()
+        if team_of(load_config()).get("scenario"):
+            say_("This room has a team already: /team shows it.")
+            return
+        say_(f"Starting the {SCENARIOS[name]['title']} team…")
+        started, failed = start_scenario(name, str(rp.root))
+        ctx.feed(paint(team_started(load_config(), started, failed), "38;5;252"))
+        ctx.refresh_people()
+        return
     if line == "/add":
         # Only agents the room starts itself: a session already running somewhere
         # lives in its own folder, its status never reached the room.
@@ -9550,6 +10701,8 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             ctx.run_wizard_step("/help")
         else:
             say_("You can open the guide any time: type /help.")
+            if offer_team(load_config()):
+                open_scenarios(ctx)
         return
     if step_ == "help_pick":
         task = next((t for t in ctx.help_tasks if t[0] == line), None)
@@ -9842,6 +10995,8 @@ def chat_wizard_back(ctx: ChatCommandContext) -> None:
         mark_welcomed()  # Esc is «Skip for now»: the welcome does not come back
         ctx.wizard.clear()
         ctx.feed(paint("You can open the guide any time: type /help.", "38;5;252"))
+        if offer_team(load_config()):
+            open_scenarios(ctx)  # as «Skip for now» does: a new room's question comes next
         return
     ctx.wizard.clear()
     if back:
@@ -9923,6 +11078,7 @@ def chat_handle(ctx: ChatCommandContext, line: str) -> None:
         or line
         in (
             "/add",
+            "/team",
             "/remove",
             "/stop",
             "/clear",
@@ -10426,6 +11582,27 @@ def chat_pump(ctx: ChatFeedContext) -> None:
                             ctx.feed(ctx.show(m))
                     except Exception as exc:  # noqa: BLE001
                         trouble(f"! Could not show message {visible(m['id'])}: {exc!r}")
+            # A proposal for the team waiting for the person: its card opens by itself when no question is open —
+            # one Enter applies it. Each once: «Later» leaves it to /team. By the room's record of proposals, which
+            # delivery fills — not by the tick's messages, which may come before it is judged.
+            if ctx.tty and not ctx.wizard() and not ctx.ui.popup and ctx.args.as_ in people_ids(ctx.config):
+                try:
+                    shown = ctx.ui.proposals_shown
+                    waiting = [k for k, v in proposal_state().items() if v == "pending" and k not in shown]
+                    if waiting:
+                        shown.add(waiting[0])  # the rest open one by one, each when no question is open
+                        everything = read_messages()
+                        m = next(
+                            (x for x in everything if x.get("id") == waiting[0] and isinstance(x.get("proposal"), dict)), None
+                        )
+                        if m is not None:
+                            cfg = load_config()
+                            req = request_of(m, cfg, everything) or {}  # only the person's own request is shown as one
+                            ctx.feed(paint(proposal_words(cfg, m["proposal"]), "38;5;252") + "\n" * 5)
+                            ctx.wizard().update(proposal_card(m, cfg, str(req.get("text") or "")))
+                            ctx.ui.redraw_input()
+                except Exception as exc:  # noqa: BLE001
+                    trouble(f"! Could not show a proposal: {exc!r}")
             while sink := chat_mode().sink:
                 ctx.feed(paint(sink.pop(0), "38;5;245"))
             if ctx.ui.viewing:
@@ -11219,6 +12396,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
         wizard.update(
             step="welcome", prompt="Welcome to your room", options=[("Show me around", "tour"), ("Skip for now", "skip")]
         )
+    if tty and not welcome and args.as_ in people_ids(config) and offer_team(config):
+        # A new room: «What will we do?» first — a ready team, or none (Esc, or «No ready team»).
+        open_scenarios_into(wizard)
     if tty and args.as_ in people_ids(config) and name_asked(args.as_):
         # Named after the computer's account («Andreynaumov»): asked before anything else, the welcome after.
         mine = label_of(config, args.as_)
@@ -11371,6 +12551,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         ("/mine", "what is for you: unread messages, agents waiting for you"),
         ("/dm", "talk privately with an agent in a panel beside the chat"),
         ("/restart", "restart an agent, its conversation continues"),
+        ("/team", "the team: see it, or start a ready one"),
         ("/stop", "stop the room: close its windows and agents"),
         ("/exit", "close this chat panel"),
     ]
@@ -11950,6 +13131,12 @@ def cmd_add(args: argparse.Namespace) -> None:
     if problem:
         fail(problem)
     own = settings_args(args, config)
+    if own:
+        # An agent's settings are the person's to give: from a command line they are a proposal, applied with Enter
+        # in the chat — whoever runs this, a person or an agent.
+        add = {"kind": args.kind, "label": label, "folder": str(folder.resolve()), **own}
+        propose(ROOM, "", {"add": [add]}, config)
+        return
     pid = launch_new_agent(config, args.kind, str(folder.resolve()), label, own)
     # Not typed in a chat: the people learn who came in, and where it works.
     line = visible(f"{label} ({base}) was added by collab add, in {tilde(str(folder.resolve()))}.")
@@ -11963,9 +13150,6 @@ def settings_args(args: argparse.Namespace, config: dict[str, Any]) -> dict[str,
     """The settings `collab add` was given — only these become the agent's own. Checked before anything
     starts: a bad one is refused, not skipped. The person's to give: an agent that adds another may not
     make it the lead, have the team report to it, or pick its model — it asks the person."""
-    given = [args.context_trim, args.role, args.topic, args.model, args.reports_to]
-    if any(v is not None for v in given) and caller_session_or_refuse():
-        fail("an agent's settings are the person's to give — ask them; nothing was started")
     own: dict[str, Any] = {}
     if args.context_trim:
         own["context_trim"] = trim_arg(args.kind, args.context_trim)
@@ -12196,6 +13380,95 @@ def cmd_status(args: argparse.Namespace) -> None:
     st = read_status()
     for pid in ids_of(config):
         print(describe(pid, st[pid], args.stale) if pid in st else f"· {pid}: No status yet")
+
+
+def cmd_team(args: argparse.Namespace) -> None:
+    """`collab team`: the room's team as it is. `collab team scenarios`: the ready teams. `collab team start
+    NAME`: start one — the person's to do, like /team in the chat; an agent asks them."""
+    config = load_config()
+    if args.action == "scenarios":
+        for name, scenario in SCENARIOS.items():
+            print(f"{name}: {scenario['title']} — {scenario['hint']}")
+        return
+    if args.action == "start":
+        if args.scenario not in SCENARIOS:
+            fail(f"collab team start takes one of: {', '.join(SCENARIOS)}")
+        if team_of(config).get("scenario"):
+            fail("this room has a team already: collab team shows it")
+        session = config.get("session", "collab-room")
+        if tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
+            fail("the room is not running — collab start first, then collab team start")
+        missing = scenario_unavailable(SCENARIOS[args.scenario])
+        if missing:
+            fail("not started: " + "; ".join(missing))
+        print("\n".join(scenario_preview(args.scenario)))
+        propose(ROOM, "", {"team": args.scenario}, config)
+        return
+    print("\n".join(team_view(config, read_messages())))
+
+
+def propose(sender: str, re_: str, prop: dict[str, Any], config: dict[str, Any]) -> None:
+    """A proposal into the room's log — it changes nothing itself: the person applies it with Enter in the chat."""
+    problem = proposal_problem(config, prop, list(PRESETS))
+    if problem:
+        fail(f"not proposed: {problem}")
+    who = "A command line" if sender == ROOM else label_of(config, sender)
+    text = f"{who} proposes: {proposal_words(config, prop)}."
+    rec = append_message(sender, people_ids(config) or ["all"], text, re_, proposal=prop)
+    print(f"Proposed {rec['id']}: {proposal_words(config, prop)}. The person applies it with Enter in the chat.")
+
+
+def proposal_value(key: str, text: str) -> object:
+    """A value as typed after `=`: «default» takes the explicit one away; memory as compact, clear, keep or
+    TOKENS:compact; rounds as minutes or off; what is done without the person as a comma list."""
+    if text == "default":
+        return None
+    if key == "context_trim":
+        if text in MEMORY:
+            return MEMORY[text]
+        at, _, do = text.partition(":")
+        return {"at": int(at), "do": do} if at.isdigit() else text
+    if key == "round":
+        return False if text == "off" else int(text) if text.isdigit() else text
+    if key == "without_person":
+        return [x for x in text.split(",") if x]
+    return text
+
+
+def cmd_propose(args: argparse.Namespace) -> None:
+    """`collab propose`: the lead proposes a change of the team — it changes nothing itself. Asked for by the person
+    (--re: their message) and only narrowing, it is applied at once with an undo; anything else waits for their
+    Enter in the chat."""
+    config = load_config()
+    if args.sender not in ids_of(config):
+        fail(f"unknown sender {args.sender!r}")
+    if args.sender != lead_of(config):
+        fail("only the room's lead proposes changes of the team; others ask the lead")
+    check_name_is_mine(args.sender, config)
+    if args.re and not any(m["id"] == args.re for m in read_messages()):
+        fail(f"no message {args.re} to answer")
+    changes = []
+    for item in args.set or []:
+        target, eq, value = item.partition("=")
+        who, dot, key = target.rpartition(".")
+        if not eq or not dot:
+            fail(f"--set takes ID.KEY=VALUE (or room.KEY=VALUE): {item!r}")
+        key = {"model": "use_model", "memory": "context_trim"}.get(key) or key
+        changes.append({"who": who, "key": key, "after": proposal_value(key, value)})
+    adds = []
+    for item in args.add or []:
+        kind, _, rest = item.partition(":")
+        label, _, rest = rest.partition(":")
+        role, _, topic = rest.partition(":")
+        adds.append({"kind": kind, "label": label, **({"role": role} if role else {}), **({"topic": topic} if topic else {})})
+    prop: dict[str, Any] = {k: v for k, v in (("changes", changes), ("add", adds)) if v}
+    # From the lead's own Claude session — the one the room bound to it — a narrowing it was asked for may apply at
+    # once; from anywhere else it waits for the person's Enter: a name given with --from proves nothing.
+    sid = caller_session_or_refuse()
+    bound = next((p.get("claude_session") for p in config["participants"] if p["id"] == args.sender), None)
+    if sid and sid == bound:
+        prop["session"] = sid
+    propose(args.sender, args.re or "", prop, config)
 
 
 def cmd_brief(args: argparse.Namespace) -> None:
@@ -12526,6 +13799,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--from-now", action="store_true", help="do not deliver messages that existed before start")
     s.add_argument("--idle-ok", action="store_true", help="keep running even if nobody needs tmux delivery yet")
     s.set_defaults(func=cmd_deliver)
+
+    s = sub.add_parser("team", help="the room's team: show it, list the ready teams, start one")
+    s.add_argument("action", nargs="?", choices=["show", "scenarios", "start"], default="show")
+    s.add_argument("scenario", nargs="?", help="with start: one of collab team scenarios")
+    s.set_defaults(func=cmd_team)
+
+    s = sub.add_parser("propose", help="the lead proposes a change of the team; the person applies it")
+    s.add_argument("--from", dest="sender", required=True)
+    s.add_argument("--re", help="the person's message it answers")
+    s.add_argument(
+        "--set", action="append", metavar="ID.KEY=VALUE", help="role, topic, model, memory, reports_to; room.lead, goal, round…"
+    )
+    s.add_argument("--add", action="append", metavar="KIND:NAME[:ROLE[:TOPIC]]", help="a new agent")
+    s.set_defaults(func=cmd_propose)
 
     s = sub.add_parser("brief", help="an agent's assignment from the room's settings (--hook: for Claude Code's SessionStart)")
     s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))

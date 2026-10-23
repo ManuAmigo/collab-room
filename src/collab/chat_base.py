@@ -7,7 +7,7 @@ import os
 import shlex
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 import collab.text as m_text
 import collab.store as m_store
@@ -133,6 +133,7 @@ class ChatState:
     and set as x[0]. Each field's meaning is noted where cmd_chat sets it."""
 
     mine_count: int = 0
+    proposals_shown: set[str] = field(default_factory=lambda: set[str]())  # a proposal's card opens by itself once
     bar: str = ""
     menu_line: str = ""
     extra_rows: int = 0

@@ -731,7 +731,8 @@ def cmd_start(args: argparse.Namespace) -> None:
         team = default_team()
         team["participants"] = team["participants"][:1]
         m_store.write_room(team, sys.stdin.isatty())
-        print(f"Room created for {team['participants'][0]['label']}. Add agents in the chat with /add.")
+        m_store.replace_state(m_store.offer_team_path(), m_store.now() + "\n")  # «What will we do?» at its first chat
+        print(f"Room created for {team['participants'][0]['label']}. Pick a ready team or add agents in the chat.")
     if rp.base == rp.root:
         move_room_home(args)
         rp = m_store.room().paths

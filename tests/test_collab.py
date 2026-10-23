@@ -1926,22 +1926,138 @@ class RoomTest(Base):
                     mod.main()
                 except SystemExit as exc:
                     self.fail(f"collab add did not take the settings: {exc}")
+        self.assertEqual(commands, [], "settings from a command line: a proposal, nothing started")
+        self.assertIn("The person applies it with Enter in the chat", out.getvalue())
+        proposal = next(m for m in self.messages() if m.get("proposal"))
+        self.assertEqual(proposal["from"], "room")
+        mod.deliver_once(mod.load_config(), {})  # the room looks at it: it waits for the person
+        for line in mod.apply_proposal(proposal["id"], "owner"):  # the person's Enter
+            print(line, file=out)
         rev = next(p for p in json.loads(self.cfg.read_text())["participants"] if p["label"] == "Rev")
         self.assertEqual({k: rev.get(k) for k in ("role", "topic", "use_model", "reports_to")},
                          {"role": "reviewer", "topic": "тесты", "use_model": "sonnet", "reports_to": "mira"})  # fmt: skip
         self.assertNotIn("context_trim", rev, "not given: not written")
         self.assertIn("--model sonnet", commands[0], "its program runs the model it was given")
-        self.assertIn("Settings: reviewer · тесты · model sonnet · context trim off · reports to Мира.", out.getvalue())
+        with self.assertRaises(ValueError):
+            mod.apply_proposal(proposal["id"], "owner")  # once
         for bad in (["--model", "x#(touch y)"], ["--reports-to", "nobody"], ["--topic", ""], ["--topic", "a\x1b[2J"]):
             with mock.patch.object(sys, "argv", ["collab", "add", "claude", *bad]), self.assertRaises(SystemExit):
                 mod.main()
-        self.assertEqual(len(commands), 1, "refused before anything started")
-        self.assertEqual(len(json.loads(self.cfg.read_text())["participants"]), 3)
-        with seam(mod, "screen.caller_claude_session", lambda: "11111111-2222-3333-4444-555555555555"):
-            for own in (["--role", "lead"], ["--reports-to", "mira"], ["--model", "opus"]):
-                with mock.patch.object(sys, "argv", ["collab", "add", "claude", *own]), self.assertRaises(SystemExit):
-                    mod.main()
-        self.assertEqual(len(commands), 1, "an agent gives no settings: the person's to give")
+        self.assertEqual(len(commands), 1, "refused before anything was proposed or started")
+        self.assertEqual(len([m for m in self.messages() if m.get("proposal")]), 1)
+
+    def test_the_lead_proposes_and_only_a_narrowing_asked_for_in_a_signed_message_applies_at_once(self):
+        LEA = "11111111-2222-3333-4444-555555555555"
+        # A proposal changes nothing itself. Asked for by the person — a signed message to the lead — and only
+        # narrowing (a cheaper model, memory, a topic…), it applies at once with a line and an undo; a widening, one
+        # nobody asked for, or one asked for unsigned waits for the person's Enter. Only the lead proposes.
+        seats = [
+            {"id": "owner", "label": "Андрей"},
+            {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "idle": "x", "role": "lead", "claude_session": LEA},
+            {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x", "use_model": "opus"},
+        ]
+        self.write_config(seats)
+        mod = _Loader(f"collab_propose_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        ask = lambda text, to=("lea",), sign=True: mod.append_message("owner", list(to), text, sign=sign)["id"]
+
+        def propose(*a, session=LEA):
+            # As the lead's own Claude session runs it — or, with another, as anyone naming it.
+            with seam(mod, "screen.caller_claude_session", lambda: session):
+                with mock.patch.object(sys, "argv", ["collab", "propose", "--from", "lea", *a]):
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        try:
+                            mod.main()
+                        except SystemExit as exc:
+                            return SimpleNamespace(returncode=exc.code or 1, stderr=str(exc))
+            return SimpleNamespace(returncode=0, stderr="")
+
+        ann = lambda: next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "ann")
+        state = lambda: json.loads((self.state / "proposals.json").read_text())
+        tick = lambda: mod.deliver_once(mod.load_config(), {})
+        self.assertNotEqual(
+            self.run_collab("propose", "--from", "ann", "--set", "ann.model=haiku").returncode, 0, "only the lead"
+        )
+        self.assertNotEqual(propose("--set", "ann.model=x#(touch y)").returncode, 0, "a bad value: refused")
+        many = [a for i in range(9) for a in ("--set", f"ann.topic=t{i}")]
+        self.assertNotEqual(propose(*many).returncode, 0, "more than a card shows whole: refused")
+        self.assertNotEqual(
+            propose(
+                "--set", "ann.topic=" + "x" * 80, "--set", "lea.topic=" + "y" * 80, "--set", "room.goal=" + "z" * 200
+            ).returncode,
+            0,
+            "too long to read whole: refused",
+        )
+        req = ask("please make Ann cheaper")
+        r = propose("--re", req, "--set", "ann.model=sonnet")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(ann()["use_model"], "opus", "nothing changed by the proposal itself")
+        tick()
+        self.assertEqual(ann()["use_model"], "sonnet", "asked, signed, narrowing: at once")
+        history = [json.loads(x) for x in (self.state / "team-changes.jsonl").read_text().splitlines()]
+        self.assertEqual((history[-1]["by"], history[-1]["re"]), ("lea", req))
+        self.assertIn("By your request, Lea changed: Ann — model opus → sonnet. /team → Changes can undo it.",
+                      [m["text"] for m in self.messages()])  # fmt: skip
+        waits = {
+            "a dearer model": ("--re", ask("use the best model for Ann"), "--set", "ann.model=opus"),
+            "a new agent": ("--re", ask("add a checker"), "--add", "claude:Checker:reviewer:facts"),
+            "nobody asked": ("--set", "ann.topic=prices"),
+            "asked unsigned": ("--re", ask("prices for Ann", sign=False), "--set", "ann.topic=prices"),
+            "asked of someone else": ("--re", ask("prices for Ann", to=("ann",)), "--set", "ann.topic=prices"),
+            "asked of everyone": ("--re", ask("prices for Ann", to=("all",)), "--set", "ann.topic=prices"),
+            "a request used already": ("--re", req, "--set", "ann.topic=prices"),
+            "memory cleared over and over": ("--re", ask("cut Ann's memory"), "--set", "ann.memory=1:clear"),
+        }
+        r = propose("--re", ask("cheaper still, please"), "--set", "ann.model=haiku", session="")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        mid = [m for m in self.messages() if m.get("proposal")][-1]["id"]
+        tick()
+        self.assertEqual(state()[mid], "pending", "named the lead, not from its session: waits for Enter")
+        # A topic is free text that goes into another agent's assignment: the person reads it first, asked or not.
+        r = propose("--re", ask("put Ann on prices"), "--set", "ann.topic=prices")
+        mid = [m for m in self.messages() if m.get("proposal")][-1]["id"]
+        tick()
+        self.assertEqual(state()[mid], "pending", "a topic waits for Enter")
+        for why, args in waits.items():
+            r = propose(*args)
+            self.assertEqual(r.returncode, 0, f"{why}: {r.stderr}")
+            mid = [m for m in self.messages() if m.get("proposal")][-1]["id"]
+            tick()
+            self.assertEqual(state()[mid], "pending", why)
+        self.assertEqual((ann()["use_model"], ann().get("topic")), ("sonnet", None), "none applied without Enter")
+        # An old request, signed then: no longer one.
+        old = {"id": "oldreq01", "at": "2026-01-01T10:00:00+00:00", "from": "owner", "to": ["lea"], "text": "prices"}
+        old["sig"] = mod.signature(mod.owner_key(), old)
+        with (self.state / "messages.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(old) + "\n")
+        self.assertEqual(propose("--re", "oldreq01", "--set", "ann.topic=prices").returncode, 0)
+        tick()
+        self.assertEqual(state()[[m for m in self.messages() if m.get("proposal")][-1]["id"]], "pending", "an old request")
+        self.assertEqual(ann().get("topic"), None)
+        # Written into the log by an agent that is not the lead, or not a proposal at all: never taken for one.
+        forged = mod.append_message("ann", ["owner"], "x", proposal={"changes": [{"who": "ann", "key": "topic", "after": "x"}]})
+        broken = mod.append_message("lea", ["owner"], "x", proposal={"team": ["research"], "changes": [{}]})
+        tick()
+        self.assertEqual((state()[forged["id"]], state()[broken["id"]]), ("refused", "refused"))
+        # A proposal that no longer applies — a team asked for after one started — is refused at the person's Enter.
+        stale = mod.append_message(
+            "room", ["owner"], "x", proposal={"changes": [{"who": "ann", "key": "topic", "after": "late"}]}
+        )
+        tick()
+        cfg = json.loads(self.cfg.read_text())
+        cfg["participants"] = [q for q in cfg["participants"] if q["id"] != "ann"]
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            mod.apply_proposal(stale["id"], "owner")
+        self.assertEqual(state()[stale["id"]], "refused", "it does not wait on for ever")
+        cfg["participants"].append(
+            {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x", "use_model": "sonnet"}
+        )
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        # Enter applies what was shown: changed after it, it is not applied.
+        waiting = [k for k, v in state().items() if v == "pending"][0]
+        with self.assertRaises(ValueError):
+            mod.apply_proposal(waiting, "owner", "0" * 16)
 
     def test_an_agents_brief_is_made_from_the_rooms_settings_alone(self):
         people = [
@@ -1966,6 +2082,11 @@ class RoomTest(Base):
                      "not a task: wait for one from Мира."):  # fmt: skip
             self.assertIn(part, text)
         lead = brief("mira", team)
+        self.assertIn("Your team: Ann — reviewer, безопасность. Give each its part", lead, "the lead knows whom to give work")
+        self.assertNotIn("Goal:", lead, "no goal set: no goal line")
+        goal = "Pick a CRM for a team of five by Friday."
+        self.assertIn(f"Goal: {goal} You answer for reaching it.", brief("mira", {**team, "goal": goal}))
+        self.assertNotIn("Goal:", brief("a", {**team, "goal": goal}), "the lead's to answer for")
         self.assertIn("You are the room's lead", lead)
         self.assertIn("Report to: the person.", lead)
         self.assertIn("Without the person: nothing external", brief("a", {}))
@@ -1976,6 +2097,124 @@ class RoomTest(Base):
         self.assertIn(
             "the room sets nothing for it", self.run_collab("brief", "--as", "a").stdout, "a room without settings: as before"
         )
+
+    def test_the_six_ready_teams_pass_the_checks_of_an_agents_settings(self):
+        self.write_config([{"id": "owner"}])
+        r = self.run_collab("team", "scenarios")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        names = [line.split(":")[0] for line in r.stdout.splitlines()]
+        self.assertEqual(names, ["development", "research", "text", "decision", "long", "assistant"])
+        mod = _Loader(f"collab_scen_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        for name, scenario in mod.SCENARIOS.items():
+            self.assertEqual(mod.scenario_problems(scenario, ["claude", "codex"]), [], name)
+        one = mod.SCENARIOS["text"]
+        lead, editor = one["seats"]
+        bad = {
+            "two leads": {**one, "seats": [lead, {**editor, "role": "lead"}]},
+            "no program": {**one, "seats": [lead, {**editor, "kind": "sh"}]},
+            "a topic with a control": {**one, "seats": [lead, {**editor, "topic": "x\x1b[2J"}]},
+            "a model to run": {**one, "seats": [lead, {**editor, "use_model": "x;rm"}]},
+            "outside the project": {**one, "output": "../x.md"},
+            "one seat twice": {**one, "seats": [lead, {**editor, "seat": "lead", "role": "worker"}]},
+        }
+        for why, scenario in bad.items():
+            self.assertTrue(mod.scenario_problems(scenario, ["claude", "codex"]), why)
+
+    def test_collab_team_start_copies_the_scenario_and_starts_each_seat_with_its_model(self):
+        self.write_config([{"id": "owner", "label": "Андрей"}])
+        mod = _Loader(f"collab_team_start_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        commands: list[str] = []
+
+        def tmux(*argv, **_):
+            if argv[0] == "new-window":
+                commands.append(argv[-1])
+                return SimpleNamespace(stdout=f"%{len(commands) + 10} 4{len(commands)}\n", returncode=0, stderr="")
+            return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        self.enterContext(mock.patch.object(shutil, "which", lambda name: f"/usr/local/bin/{name}"))  # both programs here
+        out = io.StringIO()
+
+        def start(*extra):
+            with mock.patch.object(sys, "argv", ["collab", "team", "start", "research", *extra]):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                    mod.main()
+
+        try:
+            start()
+        except SystemExit as exc:
+            self.fail(f"collab team start refused: {exc}")
+        self.assertEqual(commands, [], "a command line proposes a team: the person starts it in the chat")
+        self.assertNotIn("team", json.loads(self.cfg.read_text()))
+        proposal = next(m for m in self.messages() if m.get("proposal"))
+        mod.deliver_once(mod.load_config(), {})
+        out.write("\n".join(mod.apply_proposal(proposal["id"], "owner")))
+        cfg = json.loads(self.cfg.read_text())
+        team = cfg["team"]
+        self.assertEqual(team["scenario"], "research")
+        self.assertEqual(team["output"], "research.md")
+        self.assertEqual([seat["seat"] for seat in team["seats"]], ["lead", "prices", "risks", "facts"])
+        agents = [p for p in cfg["participants"] if p["id"] != "owner"]
+        self.assertEqual([p["label"] for p in agents], ["Lead", "Prices", "Reviews", "Fact-checker"])
+        self.assertEqual([p["seat"] for p in agents], ["lead", "prices", "risks", "facts"])
+        for p in agents:
+            for key in ("role", "topic", "use_model", "context_trim", "reports_to"):
+                self.assertNotIn(key, p, "its settings go by its seat: nothing copied into the agent")
+        self.assertEqual(team["lead"], agents[0]["id"])
+        self.assertIn("--model opus", commands[0])
+        self.assertIn("--model sonnet", commands[1])
+        self.assertIn("Prices · worker · prices and terms · sonnet · clear past 100k · reports to Lead", out.getvalue())
+        self.assertIn("Team started: 4 of 4 agents. Lead — Lead.", out.getvalue())
+        with self.assertRaises(SystemExit):
+            start()
+        self.assertEqual(len(commands), 4, "a room with a team is not given a second one")
+
+    def test_collab_team_shows_where_each_agent_is_with_its_assignment(self):
+        # Acknowledged: its latest brief closed with ack. Replied: it answered it — the person reads that.
+        # Acknowledged means it got the assignment, not that it keeps it.
+        seats = [{"seat": "w", "role": "worker", "topic": "цены", "use_model": "sonnet"}]
+        agents = [
+            {"id": "a", "label": "Ann", "kind": "claude", "pane": False, "seat": "w"},
+            {"id": "b", "label": "Bob", "kind": "claude", "pane": False, "seat": "w"},
+            {"id": "c", "label": "Cid", "kind": "claude", "pane": False, "seat": "w", "joined": "pending"},
+            {"id": "d", "label": "Dan", "kind": "claude", "pane": False, "seat": "w"},
+        ]
+        cfg = {
+            "version": 2,
+            "session": "t",
+            "participants": [{"id": "owner"}, *agents],
+            "team": {"scenario": "research", "seats": seats},
+        }
+        for p in agents:
+            p.update(idle="x")
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        self.state.mkdir(parents=True, exist_ok=True)
+        briefs = [
+            {
+                "id": f"brief{x}",
+                "at": "2026-10-23T10:00:00+00:00",
+                "from": "room",
+                "to": [x],
+                "text": "Your assignment",
+                "brief": True,
+            }
+            for x in "abd"
+        ]
+        (self.state / "messages.jsonl").write_text("".join(json.dumps(m) + "\n" for m in briefs), encoding="utf-8")
+        self.assertEqual(self.run_collab("ack", "--for", "a", "--no-reply", "--id", "briefa").returncode, 0)
+        r = self.run_collab("say", "--from", "b", "--to", "owner", "--re", "briefb", "I have no access to the web")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = self.run_collab("team")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        rows = {line.split(" · ")[0].strip(): line for line in out.stdout.splitlines()[1:]}
+        self.assertTrue(rows["Ann"].endswith("— Assignment acknowledged"), rows)
+        self.assertTrue(rows["Bob"].endswith("— Replied to its assignment — read it"), rows)
+        self.assertTrue(rows["Cid"].endswith("— Starting"), rows)
+        self.assertTrue(rows["Dan"].endswith("— Getting its assignment"), rows)
+        self.assertIn("Ann · worker · цены · sonnet", rows["Ann"])
+        self.assertTrue(out.stdout.startswith("Team: Research · result: in the chat · without you: nothing external"), out.stdout)
 
     def test_add_takes_the_id_by_the_rooms_file_now_not_the_chats_copy(self):
         # /add chose the id by the chat's copy of the room; one that
@@ -2044,13 +2283,12 @@ class RoomTest(Base):
         with mock.patch.object(sys, "argv", ["collab", "add", "claude", "--name", "Plain"]):
             with contextlib.redirect_stdout(out):
                 mod.main()
+        proposal = next(m for m in self.messages() if m.get("proposal"))  # its own setting: proposed
+        mod.deliver_once(mod.load_config(), {})
+        mod.apply_proposal(proposal["id"], "owner")
         cfg = {p["label"]: p for p in json.loads(self.cfg.read_text())["participants"]}
         self.assertEqual(cfg["Own"]["context_trim"], {"at": 120000, "do": "clear"})
         self.assertNotIn("context_trim", cfg["Plain"], "nothing given: nothing recorded, the layers apply live")
-        self.assertIn(
-            "Settings: no role · model default · context trim /clear past 120k tokens of context · reports to the person.",
-            out.getvalue(),
-        )
         self.assertIn("Settings: no role · model default · context trim off · reports to the person.", out.getvalue())
         for bad in (["claude", "--context-trim", "lots"], ["codex", "--context-trim", "150000:compact"]):
             with mock.patch.object(sys, "argv", ["collab", "add", *bad]), self.assertRaises(SystemExit):
@@ -6772,6 +7010,97 @@ class DeliveryTest(Base):
         self.assertEqual(typed("agent").count("got:/clear"), 1)
         self.assertNotIn("got:", typed("cx"), "a Codex keeps its conversation")
 
+    def test_a_rooms_agents_are_never_typed_model_and_a_room_without_a_template_gets_nothing_automatic(self):
+        # /model in Claude saves the model as the person's own default for every new session: a new model takes
+        # effect at /restart, never typed. And a room with no template and agents set nothing — as before ready
+        # teams: no assignment, no /compact or /clear, no lines about settings.
+        agent = self.root / "agent.sh"
+        seat = lambda pid, kind, **more: {
+            "id": pid, "label": pid.capitalize(), "kind": kind, "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$", **more
+        }  # fmt: skip
+        seats = [{"id": "owner"}, seat("ann", "claude"), seat("bob", "claude"), seat("cx", "codex")]
+        self.write_config(seats, session=self.session)
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        panes = json.loads((self.state / "panes.json").read_text())["panes"]
+        for pid in ("ann", "bob", "cx"):
+            self.assertTrue(self.wait_for(panes[pid], "READY"))
+        typed = lambda pid: (
+            subprocess.run(
+                ["tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", panes[pid]], capture_output=True, text=True
+            ).stdout
+        )
+        (self.state / "context.json").write_text(
+            json.dumps({pid: {"ctx": 400000, "at": "2099-01-01T10:00:00+00:00"} for pid in ("ann", "bob", "cx")}),
+            encoding="utf-8",
+        )
+        for _ in range(2):
+            self.assertEqual(self.run_collab("deliver", "--once").stdout.strip(), "")
+        self.assertEqual([m for m in self.messages() if m["from"] == "room"], [], "nothing automatic: no brief, no lines")
+        seats[1]["use_model"] = "opus"
+        self.write_config(seats, session=self.session)
+        for _ in range(2):
+            self.run_collab("deliver", "--once")
+        time.sleep(0.3)
+        for pid in ("ann", "bob", "cx"):
+            self.assertNotIn("got:", typed(pid), pid)
+
+    def test_a_setting_changed_past_the_chat_is_told_kept_in_the_history_and_can_be_undone(self):
+        # Whoever can write the room's file can change a setting — a label, not a lock: the change applies, the
+        # person's chat names it once, and /team → Changes undoes it. A field changed since is left as it is.
+        mod = _Loader(f"collab_outside_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.state.mkdir(parents=True, exist_ok=True)
+        ann = {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x"}
+        data = {"version": 2, "session": self.session, "participants": [{"id": "owner"}, ann]}
+        mod.write_config(data)
+        mod.deliver_once(mod.load_config(), {})  # the first look: what is there is the start
+        edited = json.loads(self.cfg.read_text())
+        edited["participants"][1]["use_model"] = "haiku"
+        self.cfg.write_text(json.dumps(edited), encoding="utf-8")  # past it
+        mod.deliver_once(mod.load_config(), {})
+        mod.deliver_once(mod.load_config(), {})
+        warned = [m["text"] for m in self.messages() if m["text"].startswith("⚠ Settings changed outside")]
+        self.assertEqual(
+            warned, ["⚠ Settings changed outside the chat: Ann — model the default → haiku. /team → Changes can undo it."]
+        )
+        history = [json.loads(x) for x in (self.state / "team-changes.jsonl").read_text().splitlines()]
+        self.assertEqual([(r["by"], r["changes"][0]["after"]) for r in history], [("outside", "haiku")])
+        record, left = mod.undo_changes(history[0]["id"], "owner")
+        self.assertEqual(left, [])
+        self.assertNotIn("use_model", json.loads(self.cfg.read_text())["participants"][1], "undone: the default again")
+        mod.deliver_once(mod.load_config(), {})
+        self.assertEqual(
+            len([m for m in self.messages() if m["text"].startswith("⚠")]), 1, "the chat's own undo is not «outside»"
+        )
+        first, _ = mod.apply_changes([{"who": "ann", "key": "topic", "after": "prices"}], "owner")
+        edited = json.loads(self.cfg.read_text())
+        edited["participants"][1]["topic"] = "risks"
+        self.cfg.write_text(json.dumps(edited), encoding="utf-8")
+        mod.deliver_once(mod.load_config(), {})
+        _, left = mod.undo_changes(first["id"], "owner")
+        self.assertEqual(left, ["Ann — topic: changed since"])
+        self.assertEqual(json.loads(self.cfg.read_text())["participants"][1]["topic"], "risks", "a later decision is not wiped")
+        with self.assertRaises(ValueError):
+            mod.apply_changes([{"who": "ann", "key": "use_model", "after": "x#(touch y)"}], "owner")
+        with self.assertRaises(ValueError):
+            mod.apply_changes([{"who": "owner", "key": "role", "after": "lead"}], "owner")
+        # Half a lead change back would leave two leads or none: whole, or not at all.
+        cfg = json.loads(self.cfg.read_text())
+        cfg["participants"].append({"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "idle": "x"})
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        mod.deliver_once(mod.load_config(), {})
+        lead = lambda new: mod.apply_changes(
+            [{"who": "room", "key": "lead", "after": new}, {"who": new, "key": "role", "after": "lead"}], "owner"
+        )[0]
+        to_ann = lead("ann")
+        lead("lea")
+        with self.assertRaises(ValueError):
+            mod.undo_changes(to_ann["id"], "owner")
+        # A record planted in the history — an id or key not the program's — is neither shown nor undone.
+        with (self.state / "team-changes.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"id": "x1", "changes": [{"who": "room", "key": "\u001b[2J", "before": 1, "after": 2}]}) + "\n")
+        self.assertNotIn("x1", [r["id"] for r in mod.read_changes()])
+
     def test_past_its_context_threshold_an_idle_agent_is_given_compact_or_clear_and_otherwise_nothing(self):
         # Every wake re-reads the whole context. Past the room's threshold, a free agent is given /compact
         # (or /clear, its own setting); below it, busy, in the merge queue, owing an answer or with no
@@ -6911,6 +7240,8 @@ class DeliveryTest(Base):
         mod.deliver_once({"participants": seats, "team": team}, {})
         self.assertEqual(said()[-1][1], "Setting ignored — Коди: role must be one of lead, worker, reviewer.")
         self.assertEqual(len(said()), 4, "named once")
+        mod.deliver_once({"participants": seats, "team": {**team, "round": "often"}}, {})
+        self.assertEqual(said()[-1][1], "Setting ignored — the lead's round must be minutes from 1 to 1440, or false.")
 
     def test_a_quiet_note_in_the_persons_name_still_wakes_the_agent(self):
         # A person's letter is never left waiting, marked or not — signed, or in their name unsigned (it then
@@ -7152,6 +7483,35 @@ class DeliveryTest(Base):
                 return True
             time.sleep(0.1)
         return False
+
+    def test_a_claudes_fold_of_our_own_text_gets_one_more_enter_and_nothing_else_does(self):
+        # Typed fast, a long brief was taken for a paste: «❯ [Pasted text #1]» with the rest of it after, and the Enter
+        # did not send it — every agent's brief stood as a draft. One more Enter for our own text only.
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_claude_fold", str(COLLAB)).load_module()
+        rules = mod.PRESETS["claude"]
+        typed = "[room → lead] Your assignment in this room (version 1): - Role: lead (if no answer is needed: python3 /tmp/x/collab ack --for lead --no-reply --id 491c5ff999a8)"
+
+        def left(screen, text=typed):
+            self.enterContext(seam(mod, "tmuxio.tmux", lambda *a, **k: SimpleNamespace(returncode=0, stdout=screen, stderr="")))
+            try:
+                return mod.fold_left(rules, "%1", text)
+            except TypeError:  # a build that does not know what was typed: judged by the screen alone
+                return mod.fold_left(rules, "%1")
+
+        bar = "─" * 40
+        self.assertTrue(left(f"{bar}\n❯ [Pasted text #1]\n{bar}\n  ⏵⏵ auto mode on\n"))
+        self.assertTrue(
+            left(f"{bar}\n❯ [Pasted text #1]mp/x/collab ack --for lead\n  --no-reply --id 491c5ff999a8)\n{bar}\n"),
+            "the rest of ours",
+        )
+        self.assertFalse(left(f"{bar}\n❯ [Pasted text #1] and something else\n{bar}\n"), "a word not ours: no Enter")
+        self.assertFalse(left(f"{bar}\n❯ \n{bar}\n"), "nothing folded")
+        self.assertFalse(left(f"⏺ It said [Pasted text #1] earlier.\n{bar}\n❯ \n{bar}\n"), "the words in an answer are no fold")
+        self.assertFalse(
+            left(f"{bar}\n❯ [Pasted text #1]\n{bar}\n  Do you want to proceed?\n  Esc to cancel · Tab to amend\n"), "a question"
+        )
 
     def test_one_more_enter_only_for_our_own_fold_never_for_a_question(self):
         # The second Enter goes only when our fold is in the input line, not when Codex
@@ -13307,6 +13667,167 @@ class DeliveryTest(Base):
         pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
         self.assertTrue(self.wait_chat(pane))
         return pane, (lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True))
+
+    def test_a_new_room_asks_what_we_will_do_once_and_starts_nothing_before_launch(self):
+        # Only a room `collab start` has just created: a room made before, or left empty, opens as ever.
+        self.cfg.unlink(missing_ok=True)
+        r = self.run_collab("start", "--session", self.session)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+        self.assertTrue(self.wait_for(pane, "The room calls you"), self.screen(pane))
+        keys("Enter")  # its name first, then the question
+        self.assertTrue(self.wait_for(pane, "What will we do?  ↑↓"), self.screen(pane))
+        self.assertIn("› No template — nothing automatic, add agents with /add", self.screen(pane), "first, and chosen")
+        self.assertIn("Research — Gather facts", self.screen(pane))
+        keys("Down", "Down")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Prices · worker · prices and terms · sonnet"), self.screen(pane))
+        self.assertIn("Launch the team — 4 agents", self.screen(pane))
+        self.assertIn("Fact-checker · reviewer · fact checking · opus", self.screen(pane))
+        keys("Escape")  # back to the choice
+        self.assertTrue(self.wait_for(pane, "What will we do?  ↑↓"), self.screen(pane))
+        keys("Enter")  # Enter takes the first: no template
+        self.assertTrue(self.wait_for(pane, "No template: nothing automatic"), self.screen(pane))
+        cfg = json.loads(self.cfg.read_text())
+        self.assertEqual([p["id"] for p in cfg["participants"]], ["owner"], "nothing started")
+        self.assertNotIn("team", cfg)
+        subprocess.run(["tmux", "kill-session", "-t", f"={self.session}"], capture_output=True)
+        self.assertEqual(self.run_collab("start", "--session", self.session).returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(pane, "→ Everyone"), self.screen(pane))
+        time.sleep(0.5)
+        self.assertNotIn("What will we do?", self.screen(pane), "asked once")
+
+    def test_team_changes_an_agents_setting_says_before_after_and_when_and_undoes_it(self):
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x", "role": "worker"},
+                {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "idle": "x", "role": "lead"},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(pane))
+        keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+        ann = lambda: next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "ann")
+        keys("-l", "/team")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Change the team?  ↑↓"), self.screen(pane))
+        self.assertIn("Ann · worker · — · default model", self.screen(pane))
+        keys("Enter")  # Change Ann…
+        self.assertTrue(self.wait_for(pane, "Change Ann: which?"), self.screen(pane))
+        keys("Down", "Down")
+        keys("Enter")  # Model
+        self.assertTrue(self.wait_for(pane, "› opus"), self.screen(pane))
+        keys("Down")
+        keys("Enter")  # sonnet
+        self.assertTrue(
+            self.wait_for(pane, "Ann — model: default → sonnet. A model takes effect when the program"),
+            self.screen(pane),
+        )
+        self.assertNotIn("use_model", ann(), "nothing before Save")
+        keys("Enter")  # Save
+        self.assertTrue(self.wait_for(pane, "Saved: Ann — model the default → sonnet."), self.screen(pane))
+        self.assertEqual(ann()["use_model"], "sonnet")
+        keys("-l", "/team")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Change the team?  ↑↓"), self.screen(pane))
+        keys("Down", "Down", "Down")
+        keys("Enter")  # Changes
+        self.assertTrue(self.wait_for(pane, "Undo a change?"), self.screen(pane))
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Work done and money spent stay"), self.screen(pane))
+        keys("Enter")  # Undo
+        self.assertTrue(self.wait_for(pane, "Undone: Ann — model sonnet → the default."), self.screen(pane))
+        self.assertNotIn("use_model", ann())
+        # One lead: the new one takes the role and the one before becomes a worker, in one record.
+        keys("-l", "/team")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Change the team?  ↑↓"), self.screen(pane))
+        keys("Down", "Down")
+        keys("Enter")  # The room
+        self.assertTrue(self.wait_for(pane, "Lead: Lea"), self.screen(pane))
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "› Ann"), self.screen(pane))
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "the room — lead: Lea → Ann."), self.screen(pane))
+        keys("Enter")  # Save
+        cfg = lambda: json.loads(self.cfg.read_text())
+        self.assertTrue(self.until(lambda: cfg().get("team", {}).get("lead") == "ann"), self.screen(pane))
+        self.assertTrue(self.until(lambda: "lead → worker." in self.screen(pane)), self.screen(pane))
+        self.assertEqual({p["id"]: p.get("role") for p in cfg()["participants"]}, {"owner": None, "ann": "lead", "lea": "worker"})
+        keys("-l", "/team")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Change the team?  ↑↓"), self.screen(pane))
+        keys("Enter")  # Change Ann…, the lead now
+        self.assertTrue(self.wait_for(pane, "Change Ann: which?"), self.screen(pane))
+        keys("Enter")  # Role
+        self.assertTrue(self.wait_for(pane, "› lead"), self.screen(pane))
+        keys("Down")
+        keys("Enter")  # worker
+        self.assertTrue(self.wait_for(pane, "The room has one lead"), self.screen(pane))
+        self.assertEqual(cfg()["team"]["lead"], "ann", "no team left without its lead")
+
+    def test_a_proposal_opens_its_card_in_the_chat_and_one_enter_applies_it(self):
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {
+                    "id": "lea",
+                    "label": "Lea",
+                    "kind": "claude",
+                    "command": [str(self.root / "agent.sh")],
+                    "delivery": "tmux",
+                    "idle": r"^READY$",
+                    "role": "lead",
+                },
+                {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x"},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(pane))
+        keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+        r = self.run_collab("propose", "--from", "lea", "--set", "ann.role=reviewer")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.run_collab("deliver", "--once").returncode, 0)  # the room looks at it: it waits for the person
+        self.assertTrue(self.wait_for(pane, "Lea proposes — apply?"), self.screen(pane))
+        self.assertIn("Ann — role the default → reviewer", self.screen(pane))
+        ann = lambda: next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "ann")
+        self.assertNotIn("role", ann())
+        keys("Enter")  # Apply
+        self.assertTrue(self.until(lambda: ann().get("role") == "reviewer"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "Saved: Ann — role"), self.screen(pane))
+        self.assertEqual(self.run_collab("propose", "--from", "lea", "--set", "ann.topic=x").returncode, 0)
+        self.run_collab("deliver", "--once")
+        self.assertTrue(self.wait_for(pane, "Lea proposes — apply?"), self.screen(pane))
+        keys("-l", "no, leave Ann as she is")
+        keys("Enter")  # a draft typed while the card opened: a message, never a yes
+        self.assertTrue(self.wait_for(pane, "The proposal waits"), self.screen(pane))
+        self.assertNotIn("topic", ann())
+        self.assertIn("no, leave Ann as she is", [m["text"] for m in self.messages() if m["from"] == "owner"])
+        keys("-l", "/team")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "› Proposal:"), self.screen(pane))
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Lea proposes — apply?"), self.screen(pane))
+        keys("Down")
+        keys("Enter")  # Decline
+        self.assertTrue(self.wait_for(pane, "Declined."), self.screen(pane))
+        self.assertNotIn("topic", ann())
+        self.assertIn("Your proposal is declined.", [m["text"] for m in self.messages() if m["to"] == ["lea"]])
 
     def test_first_visit_welcomes_once_and_sends_nothing(self):
         # «the user must learn all this easily».

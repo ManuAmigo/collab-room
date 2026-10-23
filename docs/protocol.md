@@ -277,7 +277,8 @@ Each setting goes by layers, each over the one before: the built-in one of the a
 applies is worked out live, so a change of a lower layer reaches every agent that set nothing of its own. A value
 that does not pass its check is skipped — the layer below applies — and named once in the person's chat. `/add` shows
 in one line what applies to the new agent; `collab add --role reviewer --topic "tests" --model sonnet --reports-to lev
---context-trim 150000:compact` gives it its own (a bad one is refused before anything starts). When what applies to an
+--context-trim 150000:compact` proposes it with its own settings — the person applies it with Enter in the chat (a bad
+one is refused before anything is proposed). When what applies to an
 agent changes, the person's chat gets one silent line: who, and to what. A new model applies when the agent's
 program starts: `/restart` it.
 
@@ -290,6 +291,60 @@ its `SessionStart` hook (`collab brief --hook`), for the participant whose sessi
 is given. `collab brief --as ID` prints it. Every delivery to an agent with a role reminds it in one word:
 `(you: reviewer · answer: …)`. The assignment is closed with `ack`; it changes no permissions of the agent's tools.
 A room that sets nothing works as before.
+
+### Ready teams
+
+A room `collab start` has just created opens its first chat on «What will we do?», once. First, and taken by Enter:
+«No template — nothing automatic»: agents come in one by one with `/add`, and the room sends no assignment, cuts no
+context and types nothing of its own — as before ready teams. Then six ready teams (Development, Research, Text,
+Decision, Long work, One assistant).
+Choosing one shows its team as rows — name · role · topic · model · memory · whom it reports to — the result file and
+what is done without you; nothing starts before «Launch the team». A team whose program is not installed is not
+started, and no other program is put in its place unasked. Launching copies the scenario into the room's file
+(`team.seats`, `team.output`) and starts each seat's agent the way `/add` does, with only its `seat` recorded: its
+settings go by the seat. The chat then says how many of how many started and who leads; one that did not start is
+named with why. `collab team start research` from a command line proposes it: the person starts it with Enter in the
+chat. `collab team scenarios` lists them.
+
+`/team` (and `collab team`) shows the team as it is: one row per agent, what applies to it, and where it is with its
+assignment — Starting, Getting its assignment, Assignment acknowledged (its latest assignment closed with `ack`: it
+got it, which is not a promise to keep it), or Replied to its assignment (it answered it with `say --re`: read it).
+
+### Changing a running team
+
+`/team` on a team (or on agents added one by one) shows it, then: change an agent, change the room, or look back
+and undo. An agent's card shows its five settings — each one its own or the scenario's — and each field offers its
+values and «the default» (the explicit one goes, the layer below applies again). Before saving, the chat says before →
+after and when it acts: a new role, topic or whom it reports to comes with its next assignment, after its current
+task; a new model takes effect when the agent's program starts — the chat says to `/restart` it, and its conversation
+goes on (never `/model`: Claude saves that as the person's own default for every new session); memory acts from its
+next free minute and cuts nothing by itself. The room's card: its lead, goal, result file, the lead's rounds and what is done without the
+person. The room has one lead: who leads changes there, in one change — the new one takes the role, the one before
+becomes a worker; an agent's own card does not make or unmake the lead.
+
+Every saved change is one record of the room's history (`team-changes.jsonl` in its state): who, what, before →
+after, when. `/team` → Changes undoes one: each field back to what it was, if it still holds what that change made
+it — a field changed since is left as it is and named, and a lead change goes back whole or not at all; work done and
+money spent stay, history cleared from an agent does not come back. A line of the history the program could not have
+written is neither shown nor undone. A setting changed past the chat — the room's file edited by hand or by an agent — applies,
+gets one line in the person's chat, «⚠ Settings changed outside the chat: …», and a record of its own that can be
+undone the same way. This is a mark, not a lock: whoever can write the room's file can change it.
+
+### The lead proposes, the person applies
+
+The lead changes the team only by proposing: `collab propose --from LEAD [--re PERSON'S-MESSAGE] --set ann.model=sonnet
+--set room.round=60 --add claude:Checker:reviewer:facts`. A proposal is a message in the log; it changes nothing
+itself, and each value passes the checks of `/team`. Only the room's lead proposes; a command line's `collab team
+start` and `collab add` with settings propose too. The person's chat opens its card by itself — what it does, before →
+after, at whose request — and one Enter on Apply applies it (Decline tells the lead; Later leaves it to `/team`; text
+typed while it opened goes out as a message, never as a yes; and it applies only what was shown). One that only
+narrows — compacting memory at 50k tokens or more (never clearing it, never keeping it all), whom one
+reports to (not the person), a cheaper model of the same program, rarer rounds — and answers the person's own request
+(`--re`: their message to the lead alone, signed by their chat, from the last six hours, used by no other proposal,
+not a reply to one), proposed from the lead's own Claude session — the one the room bound to it — is applied at
+once: one line in the chat, «By your request, Lea changed: …», and `/team` → Changes undoes it. A topic (free text
+that goes into another agent's assignment), a new agent, a dearer model or one whose price is not known, a new lead, what is done without the person, or anything nobody asked
+for waits for Enter. A record in the log that only looks like the lead's proposal is not taken for one.
 
 ## Talking to other agents
 

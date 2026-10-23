@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import os
+import json
 import shlex
 import shutil
 import subprocess
@@ -87,10 +88,12 @@ def model_for(p: dict[str, Any]) -> str:
 
 
 @m_store.room_locked
-def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str, own: dict[str, Any] | None = None) -> str:
+def launch_new_agent(
+    config: dict[str, Any], kind: str, folder: str, label: str, own: dict[str, Any] | None = None, seat: str = ""
+) -> str:
     """Start an agent in its own window of the room's tmux session and register it. `own`: the settings
     given it explicitly (store.SETTINGS) — only these are written into its seat; the rest go on by the
-    layers below."""
+    layers below. `seat`: its seat in the room's scenario, whose settings it takes."""
     own = own or {}
     # The id and the name by the room's file as it is now, under its lock — not the chat's copy: two
     # /add at once (two chats, or /add and a join) got one id, and add_participant replaced the first
@@ -101,6 +104,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str,
     if m_store.label_taken(fresh, "", label):
         raise SystemExit("that is already someone else's name here")
     pid = m_text.slug(label, m_store.ids_of(fresh), kind)
+    model = str(m_store.effective(kind, {"id": pid, **({"seat": seat} if seat else {}), **own}, fresh, "use_model") or "")
     cli = (
         m_installer.codex_room_rule(pid, folder, label) if kind == "codex" else ""
     )  # before it starts: Codex reads rules at start
@@ -119,7 +123,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str,
             "-c",
             m_tmuxio.tmux_dir(folder),
             *m_tmuxio.pane_env(),
-            m_tmuxio.in_dir(folder, agent_command(kind, model=str(own.get("use_model") or ""))),
+            m_tmuxio.in_dir(folder, agent_command(kind, model=model)),
             check=False,
         )
         if out.returncode != 0:
@@ -141,6 +145,7 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str,
             "folder": folder,
             **({"cli": cli} if cli else {}),
             **{k: v for k, v in own.items() if k in m_store.SETTINGS},
+            **({"seat": seat} if seat else {}),
         }
         add_participant(entry)
     except BaseException:
@@ -731,6 +736,85 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
     if kind != "claude":  # a Claude tells its session itself (confirm_joins); a Codex is asked
         m_log.append_message(m_text.ROOM, [p["id"]], m_screen.ping_text(code))
     return pane
+
+
+def scenario_unavailable(scenario: dict[str, Any]) -> list[str]:
+    """The seats whose program is not on this machine, named: the team is not started without them, and no
+    other program is put in their place unasked."""
+    return [
+        f"{seat['label']}: {m_screen.PRESETS[seat['kind']]['label']} is not installed"
+        for seat in scenario["seats"]
+        if not shutil.which(m_screen.PRESETS[seat["kind"]]["command"][0])
+    ]
+
+
+def start_scenario(name: str, folder: str) -> tuple[list[str], list[str]]:
+    """A ready team: the scenario is copied into the room's file, then each seat's agent is started the way /add
+    starts one, with only its seat recorded — its settings go by the seat. (started ids, «name: why» of those
+    that did not start). One that failed does not stop the rest."""
+    scenario = m_store.SCENARIOS[name]
+    seats = json.loads(json.dumps(scenario["seats"]))
+    team = {"scenario": name, "seats": seats, "output": scenario["output"], "without_person": []}
+    m_store.set_team(team)
+    started: list[str] = []
+    failed: list[str] = []
+    for seat in seats:
+        config = m_store.load_config()
+        label = next(
+            n for n in [seat["label"]] + [f"{seat['label']} {i}" for i in range(2, 100)] if not m_store.label_taken(config, "", n)
+        )
+        try:
+            pid = launch_new_agent(config, seat["kind"], folder, label, seat=seat["seat"])
+        except SystemExit as exc:
+            failed.append(f"{label}: {exc.code if isinstance(exc.code, str) else 'it did not start'}")
+            continue
+        started.append(pid)
+        if seat["role"] == "lead":
+            m_store.set_team({**m_store.team_of(m_store.load_config()), "lead": pid})
+    return started, failed
+
+
+def team_started(config: dict[str, Any], started: list[str], failed: list[str]) -> str:
+    """One line for a team started: how many of how many, who leads — and each that did not start, with why.
+    Not «all started» when some did not."""
+    lead = m_store.lead_of(config)
+    head = f"Team started: {len(started)} of {len(started) + len(failed)} agents." + (
+        f" Lead — {m_store.label_of(config, lead)}." if lead else " No lead started: /add one, or start the team again."
+    )
+    return "\n".join([head, *(f"  ! {m_text.visible(why)}" for why in failed)])
+
+
+def apply_proposal(mid: str, by: str, digest: str = "") -> list[str]:
+    """The person's Enter on a proposal: its changes as one record of the history, its agents started the way /add
+    starts them, its team started — what each did, in words. Checked again first: the room may have changed."""
+    m = next((x for x in m_log.read_messages() if x.get("id") == mid and isinstance(x.get("proposal"), dict)), None)
+    if m is None or m_store.proposal_state().get(mid) != "pending":
+        raise ValueError("no such proposal waiting")
+    if digest and m_store.proposal_digest(m["proposal"]) != digest:
+        raise ValueError("it changed after it was shown — look at it again in /team")
+    prop, data = m["proposal"], m_store.load_config()
+    problem = m_store.proposal_problem(data, prop, list(m_screen.PRESETS))
+    if problem:
+        m_store.set_proposal_state(mid, "refused")  # no longer applies: it does not wait on for ever
+        raise ValueError(problem)
+    root = str(m_store.room().paths.root)
+    lines = []
+    if prop.get("changes"):
+        rec, _ = m_store.apply_changes(prop["changes"], str(m.get("from")), str(m.get("re") or ""))
+        lines.append(f"Saved: {m_store.change_words(m_store.load_config(), rec)}.")
+    for a in prop.get("add") or []:
+        folder = str(a.get("folder") or root)
+        if why := folder_problem(Path(folder)):
+            lines.append(f"! {a['label']}: {why}")
+            continue
+        own = {k: a[k] for k in m_store.SETTINGS if k in a}
+        pid = launch_new_agent(m_store.load_config(), a["kind"], str(Path(folder).resolve()), a["label"], own)
+        lines.append(f"Starting {a['label']} in room window {pid}.")
+    if prop.get("team"):
+        started, failed = start_scenario(prop["team"], root)
+        lines.append(team_started(m_store.load_config(), started, failed))
+    m_store.set_proposal_state(mid, "applied")
+    return lines
 
 
 def agent_window_alive(q: dict[str, Any]) -> bool:

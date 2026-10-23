@@ -441,6 +441,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
         wizard.update(
             step="welcome", prompt="Welcome to your room", options=[("Show me around", "tour"), ("Skip for now", "skip")]
         )
+    if tty and not welcome and args.as_ in m_store.people_ids(config) and m_chat_wizard.offer_team(config):
+        # A new room: «What will we do?» first — a ready team, or none (Esc, or «No ready team»).
+        m_chat_wizard.open_scenarios_into(wizard)
     if tty and args.as_ in m_store.people_ids(config) and m_store.name_asked(args.as_):
         # Named after the computer's account («Andreynaumov»): asked before anything else, the welcome after.
         mine = m_store.label_of(config, args.as_)
@@ -593,6 +596,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         ("/mine", "what is for you: unread messages, agents waiting for you"),
         ("/dm", "talk privately with an agent in a panel beside the chat"),
         ("/restart", "restart an agent, its conversation continues"),
+        ("/team", "the team: see it, or start a ready one"),
         ("/stop", "stop the room: close its windows and agents"),
         ("/exit", "close this chat panel"),
     ]

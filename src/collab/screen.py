@@ -66,6 +66,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "attention_title": "(Do you want to [^?\\n]+\\?|Is this a project you created[^?\\n]*\\?"
         "|Choose the text style that looks best with your terminal|Select login method)",
         "draft": '^❯[ \u00a0]+(?!Try ")\\S',
+        # Typed fast, a long text is taken for a paste and folded — «❯ [Pasted text #1]», sometimes with the rest of it
+        # after — and the Enter right after did not send it: four briefs stood as drafts, delivery stopped for all.
+        "paste_fold": "^❯[ \u00a0]+\\[Pasted text #\\d+(?: \\+\\d+ lines)?\\]",
         "model_from": "claude-session",
         "dim_is_hint": True,
         # A command it left running in the background: its turn is over, the work is not
@@ -378,7 +381,7 @@ def screen_state(p: dict[str, Any], pane: str, shot: Shot | None = None) -> tupl
     return "unknown", ""
 
 
-def fold_left(rules: dict[str, Any], pane: str) -> bool:
+def fold_left(rules: dict[str, Any], pane: str, typed: str = "") -> bool:
     """Our own text folded in the input line and still not sent — and nothing else on screen that an
     Enter would answer (a question, a menu): one more Enter must press no one else's button.
 
@@ -391,8 +394,19 @@ def fold_left(rules: dict[str, Any], pane: str) -> bool:
     if shown.returncode != 0:
         return False
     tail = "\n".join(line.rstrip() for line in (shown.stdout or "").rstrip("\n").splitlines()[-args_tail() :])
-    inputs = [line for line in tail.splitlines() if line.startswith("›")]
-    if not inputs or not re.fullmatch(rules["paste_fold"].lstrip("^").rstrip("$") + r"\s*", inputs[-1]):
+    prompt = rules["paste_fold"].lstrip("^")[:1]  # «›» Codex, «❯» Claude: the input line's first sign
+    lines = tail.splitlines()
+    at = max((i for i, line in enumerate(lines) if line.startswith(prompt)), default=-1)
+    fold = re.match(rules["paste_fold"].lstrip("^").rstrip("$"), lines[at]) if at >= 0 else None
+    if fold is None:
+        return False
+    # After the fold, only what we typed ourselves — the rest of it, and in Claude's input box (between its «─»
+    # bars) its wrapped lines: a word of anyone else's there, and an Enter would send theirs. Below an input line
+    # with no box (Codex) is its status, not the input.
+    box = next((i for i in range(at + 1, len(lines)) if lines[i].lstrip().startswith("─")), None)
+    rest = [lines[at][fold.end() :]] + (lines[at + 1 : box] if box is not None else [])
+    left = "".join("".join(rest).split())
+    if left and left not in "".join(typed.split()):
         return False
     return not any(
         rules.get(key) and re.search(rules[key], tail, re.MULTILINE) for key in ("attention", "attention_title", "busy")
