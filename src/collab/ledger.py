@@ -23,6 +23,9 @@ import collab.usage as m_usage
 # task it went to»). Primary are the append-only files — tasks.jsonl, usage.jsonl (here), merge-log.jsonl
 # the SQLite base is derived from them, built anew for each report, and asked by queries.
 USAGE_FIELDS = ("input", "output", "cache_read", "cache_write")
+# Answers of the model in the stretch and the longest context of one (input + cache read + cache write):
+# what /clear and a cheaper model change. A line from before them has neither — 0.
+ANSWER_FIELDS = ("answers", "ctx_max")
 
 
 def usage_path() -> Path:
@@ -50,7 +53,7 @@ def usage_line(
         "task_by": task.get("by") if task else None,
         "split": bool(split),
     }
-    for name in USAGE_FIELDS:
+    for name in (*USAGE_FIELDS, *ANSWER_FIELDS):
         line[name] = int(entry.get(name) or 0)
     return line
 
@@ -80,7 +83,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 SCHEMA = """
 CREATE TABLE usage (at TEXT, pid TEXT, agent TEXT, agent_kind TEXT, model TEXT, effort TEXT, t_from TEXT,
     t_to TEXT, input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER, wakeups INTEGER,
-    task TEXT, task_kind TEXT, lane TEXT, task_by TEXT, split INTEGER);
+    task TEXT, task_kind TEXT, lane TEXT, task_by TEXT, split INTEGER, answers INTEGER, ctx_max INTEGER);
 CREATE TABLE task_events (at TEXT, event TEXT, pid TEXT, task TEXT, kind TEXT, lane TEXT, by TEXT, commit_sha TEXT);
 CREATE TABLE runs (at TEXT, by TEXT, what TEXT, who TEXT, exit INTEGER, seconds REAL, red INTEGER, said TEXT);
 """
@@ -113,7 +116,7 @@ def counts(u: dict[str, Any]) -> tuple[int, ...] | None:
     """A usage line's numbers, or None: a field that is not a count — not a number, below 0, past the limit —
     leaves the line out, as a broken line is — never the whole report."""
     out: list[int] = []
-    for name in (*USAGE_FIELDS, "wakeups"):
+    for name in (*USAGE_FIELDS, "wakeups", *ANSWER_FIELDS):
         v = u.get(name) or 0
         if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= TOKENS_LIMIT:
             return None
@@ -138,11 +141,12 @@ def build_base(
         with contextlib.closing(sqlite3.connect(tmp)) as db:
             db.executescript(SCHEMA)
             db.executemany(
-                "INSERT INTO usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         *(cell(u.get(k)) for k in ("at", "pid", "agent", "agent_kind", "model", "effort", "from", "to")),
-                        *n, *(cell(u.get(k)) for k in ("task", "task_kind", "lane", "task_by")), int(bool(u.get("split"))),
+                        *n[:5], *(cell(u.get(k)) for k in ("task", "task_kind", "lane", "task_by")), int(bool(u.get("split"))),
+                        *n[5:],
                     )
                     for u in usage
                     if (n := counts(u)) is not None
@@ -179,24 +183,31 @@ GROUPS = {"kind": "task_kind", "agent": "agent", "model": "model", "lane": "lane
 
 def report_rows(db: sqlite3.Connection, by: str, since: str = "") -> list[tuple[Any, ...]]:
     """Per group: tasks, tokens in, out, cache read, cache write, cache share of what was read, wakeups,
-    tokens per task — input + output + cache write; cache reads, cheap, are not in it. «(no task)» where
+    tokens per task — input + output + cache write; cache reads, cheap, are not in it; the model's answers,
+    the mean and the longest context of one — the mean over the lines that counted answers. «(no task)» where
     nothing was taken. `since` is compared as text with the journal's UTC times (2026-10-19, or with «+00:00»)."""
     column = GROUPS[by]
     query = f"""
         SELECT COALESCE({column}, '(no task)') AS g, COUNT(DISTINCT task), SUM(input), SUM(output), SUM(cache_read),
-               SUM(cache_write), SUM(wakeups)
+               SUM(cache_write), SUM(wakeups), SUM(answers), MAX(ctx_max),
+               SUM(CASE WHEN answers > 0 THEN input + cache_read + cache_write ELSE 0 END)
         FROM usage WHERE t_to >= ? GROUP BY g ORDER BY SUM(input + output + cache_write) DESC
     """
     rows: list[tuple[Any, ...]] = []
-    for g, tasks, inp, out, cread, cwrite, wakeups in db.execute(query, (since,)):
+    for g, tasks, inp, out, cread, cwrite, wakeups, answers, ctx_max, ctx_sum in db.execute(query, (since,)):
         read = inp + cread + cwrite
         share = round(100 * cread / read) if read else 0
         spent = inp + out + cwrite
-        rows.append((g, tasks, inp, out, cread, cwrite, f"{share}%", wakeups, round(spent / tasks) if tasks else spent))
+        per_task = round(spent / tasks) if tasks else spent
+        mean = round(ctx_sum / answers) if answers else 0
+        rows.append((g, tasks, inp, out, cread, cwrite, f"{share}%", wakeups, per_task, answers, mean, ctx_max))
     return rows
 
 
-HEADER = ("group", "tasks", "input", "output", "cache read", "cache write", "cache share", "wakeups", "per task")
+HEADER = (
+    "group", "tasks", "input", "output", "cache read", "cache write", "cache share", "wakeups", "per task",
+    "answers", "mean context", "max context",
+)  # fmt: skip
 
 
 def shown(v: object, fmt: str) -> str:
@@ -224,8 +235,27 @@ def render(rows: list[tuple[Any, ...]], fmt: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def unread_notes() -> list[str]:
+    """«<agent> (<kind>): no data — <why>» for each of the room's agents whose spending is not read."""
+    try:
+        config = m_store.read_config_raw()
+    except SystemExit:  # no room's settings: no agents to name
+        return []
+    notes: list[str] = []
+    for p in config.get("participants") or []:
+        if not isinstance(p, dict) or not any(k in p for k in ("idle", "busy", "attention")):
+            continue  # a person spends no tokens
+        p = cast("dict[str, Any]", p)
+        why = m_usage.unread(p)
+        if why:
+            who = m_text.clean_field(str(p.get("label") or p.get("id")), 80)
+            notes.append(f"{who} ({m_screen.agent_kind(p) or 'agent'}): no data — {why}")
+    return notes
+
+
 def report(by: str, since: str = "", fmt: str = "md") -> str:
-    """The base built anew from the room's files, asked, and the table returned."""
+    """The base built anew from the room's files, asked, and the table returned; in markdown, the agents
+    whose spending is not read under it (the csv stays a table: unread_notes gives them)."""
     rp = m_store.room().paths
     m_store.private_dir(rp.state_dir)
     rows = build_base(
@@ -235,7 +265,8 @@ def report(by: str, since: str = "", fmt: str = "md") -> str:
         read_jsonl(rp.state_dir / "merge-log.jsonl"),
         lambda db: report_rows(db, by, since),
     )
-    return render(rows, fmt)
+    notes = unread_notes() if fmt != "csv" else []
+    return render(rows, fmt) + "".join(f"\n{n}" for n in notes) + ("\n" if notes else "")
 
 
 def task_at(events: list[dict[str, Any]], pid: str, ts: str) -> dict[str, Any] | None:

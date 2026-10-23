@@ -177,6 +177,9 @@ def load_config() -> dict[str, Any]:
     # the target the same way. The room writes only plain names.
     if not isinstance(data.get("session", "collab-room"), str) or not WORD.fullmatch(data.get("session", "collab-room")):
         bad("session must be 1 to 64 letters, digits, _ and -")
+    limit = data.get("talk_limit", 0)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        bad("talk_limit must be a whole number, 0 or more (0: the room never pauses for agents' talk)")
     participants = data.get("participants")
     if not isinstance(participants, list) or not participants:
         bad("config must contain a non-empty participants list")
@@ -543,6 +546,17 @@ def trusted_chat_command(cmd: Any) -> bool:
     real = Path(os.path.realpath(program))
     # This collab, the Codex rule's copy, or the person's installed copy: all where no agent writes.
     return real == Path(m_boot.SELF).resolve() or inst.safe_copies.resolve() in real.parents
+
+
+def current_chat_command(cmd: list[str]) -> list[str]:
+    """The person's chat as it is started: by this collab, not the copy named when the room was made.
+    The room's file keeps the path of the copy `init` ran from, and after an install or update the
+    delivery ran the new copy while the chat and its /dm stayed on the old one. Only a chat
+    trusted_chat_command() lets start unasked is changed; anything else is started as written."""
+    if not trusted_chat_command(cmd):
+        return list(cmd)
+    at = 1 if re.fullmatch(r"python[0-9.]*", Path(cmd[0]).name) else 0
+    return [*cmd[:at], m_boot.SELF, *cmd[at + 1 :]]
 
 
 def write_room(sample: dict[str, Any], ask: bool) -> None:

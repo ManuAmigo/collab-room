@@ -24,13 +24,18 @@ import collab.installer as m_installer
 import collab.ledger as m_ledger
 
 
-def room_cmd(command: str, rest: str, cli: str = "") -> str:
+def room_cmd(command: str, rest: str, cli: str = "", pid: str = "") -> str:
     """A ready-to-run command for an agent: the room named by --room right after the command, so
     the line starts with «python3 …/collab <command>» and matches a narrow permission rule. `cli` —
     the agent's read-only copy, when its Codex rule names that copy."""
     rp = m_store.room().paths
     if cli:
-        return f"{' '.join(shlex.quote(x) for x in m_installer.RULE_PYTHON)} {shlex.quote(cli)} {command} --room {shlex.quote(str(rp.root))} {rest}"
+        python = m_installer.rule_python()
+        if pid:
+            m_installer.check_codex_rule_python(pid, python)
+        return (
+            f"{' '.join(shlex.quote(x) for x in python)} {shlex.quote(cli)} {command} --room {shlex.quote(str(rp.root))} {rest}"
+        )
     return f"python3 {shlex.quote(m_boot.SELF)} {command} --room {shlex.quote(str(rp.root))} {rest}"
 
 
@@ -45,15 +50,41 @@ UNSIGNED = (
 )
 
 
+# How long a Claude the room started has to tell its session before it is asked the connection check.
+CLAUDE_TELLS_SESSION = 60.0
+
+
 @m_store.room_locked
 def confirm_joins(config: dict[str, Any], messages: list[dict[str, Any]]) -> None:
-    """A pending participant becomes «подключён» on its first message after joining."""
+    """A pending participant becomes «подключён» on its first message after joining. A Claude the room
+    started is not asked: its window's process telling its own session is the proof (and how the room
+    continues it later) — the check woke it only to answer. A Codex is asked: its conversation is found
+    by that check in its log."""
+    home = Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser()
     for p in config["participants"]:
         if p.get("joined") != "pending":
             continue
         code = p.get("join_code", "")
-        if code and any(
-            m.get("from") == p["id"] and m.get("at", "") >= p.get("joined_at", "") and code in m.get("text", "") for m in messages
+        told = (
+            m_screen.agent_kind(p) == "claude"
+            and p.get("started_by_room")
+            and bool(m_screen.claude_of_window(home, p.get("target") or ""))
+        )
+        if not told and code and m_screen.agent_kind(p) == "claude" and p.get("started_by_room"):
+            # No session told in time (an older Claude, a window that did not start it): asked as before.
+            late = time.time() - m_text.at_time(p.get("joined_at", "")) > CLAUDE_TELLS_SESSION
+            if late and not any(
+                m.get("from") == m_text.ROOM and m.get("to") == [p["id"]] and m.get("text") == m_screen.ping_text(code)
+                for m in messages
+            ):
+                m_log.append_message(m_text.ROOM, [p["id"]], m_screen.ping_text(code))
+        if (
+            told
+            or code
+            and any(
+                m.get("from") == p["id"] and m.get("at", "") >= p.get("joined_at", "") and code in m.get("text", "")
+                for m in messages
+            )
         ):
             data = m_store.read_config_raw()
             for q in data["participants"]:
@@ -66,7 +97,59 @@ def confirm_joins(config: dict[str, Any], messages: list[dict[str, Any]]) -> Non
                 # about working or ready: unknown until the agent's own hook or screen says.
                 if (m_screen.read_status().get(p["id"]) or {}).get("state") == "joining":
                     m_screen._write_status(p["id"], "unknown", "", "self")
-            m_log.append_message(m_text.ROOM, ["all"], f"{p.get('label') or p['id']} connected.")
+            m_log.append_message(m_text.ROOM, ["all"], f"{p.get('label') or p['id']} connected.", silent=True)
+
+
+# Agents' messages to each other in a row with no word from a person: past it the room pauses and asks
+# the person. Each such message wakes an agent that reads its whole context again; two hours of agents
+# answering each other cost more than all the person's own work. The room's own is `talk_limit` in
+# .collab.json (0 — never): a team whose coordinator hands out work and gets reports reaches ten fast.
+TALK_LIMIT = 10
+
+
+def talk_path() -> Path:
+    return m_store.room().paths.state_dir / "talk.json"
+
+
+def talk_streak(messages: list[dict[str, Any]], config: dict[str, Any]) -> int:
+    """How many messages agents wrote to agents since the person last spoke (signed: a «from the person»
+    an agent wrote does not count as one) or the room was last resumed. A note to the person alone
+    and a quiet note wake no agent: not counted, and not a break either."""
+    people = m_store.people_ids(config)
+    since = str(m_store.read_json(talk_path()).get("since") or "")
+    n = 0
+    for m in reversed(messages):
+        if since and m.get("id") == since:
+            break
+        sender = m.get("from")
+        if sender in people and not m_log.unsigned_person(m, config):
+            break
+        to: list[Any] = m.get("to") or []
+        if sender == m_text.ROOM or sender in people or is_quiet(m, config):
+            continue
+        if any(t == "all" or (t not in people and t != m_text.ROOM) for t in to):
+            n += 1
+    return n
+
+
+def talk_reset() -> None:
+    """Counted again from the room's last message: the person resumed the room, the talk so far is theirs."""
+    last = m_log.read_messages()
+    m_store.write_json(talk_path(), {"since": last[-1]["id"] if last else ""})
+
+
+def pause_for_talk(config: dict[str, Any], n: int) -> None:
+    """The pause /pause sets, and one line to the people: why, and how to go on."""
+    data = m_store.read_config_raw()
+    data["paused"] = True
+    m_store.write_config(data)
+    m_tmuxio.tmux("set-option", "-t", f"={data.get('session', 'collab-room')}:", "@collab_paused", "1", check=False)
+    m_log.append_message(
+        m_text.ROOM,
+        m_store.people_ids(config),
+        f"Agents wrote {n} messages to each other in a row without you, each waking an agent with its whole "
+        "context. The room is paused: what they say waits. /resume lets them go on.",
+    )
 
 
 @m_store.room_locked
@@ -87,6 +170,12 @@ def post_message(args: argparse.Namespace, text: str) -> None:
         m_store.fail(f"no message {args.re} to reply to")
     m_screen.check_name_is_mine(args.sender, config)
     quiet = bool(getattr(args, "quiet", False))
+    silent = bool(getattr(args, "silent", False))  # the room's own notes (merge queue): never typed
+    # The answer to the room's connection check is the room's to read: sent to everyone, it was typed into
+    # every other agent and woke each one. Told by the sender's own pending code, not by the words.
+    me = next((q for q in config["participants"] if q["id"] == args.sender), {})
+    code = me.get("join_code") if me.get("joined") == "pending" else ""
+    silent = silent or bool(code and isinstance(code, str) and f"connected {code}" in text)
     if quiet and args.re:
         # An answer is waited for by whoever asked: quiet, it waited for their next message — and an agent
         # with no task asks the room nothing. An answer always wakes.
@@ -94,11 +183,12 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     if config.get("paused") and args.sender not in m_store.people_ids(config):
         # Paused: agents must stop talking. What an agent still says is kept, not
         # lost, and goes out on resume.
-        held = {"from": args.sender, "to": to, "text": text.strip(), "re": args.re or "", "quiet": quiet}
+        held = {"from": args.sender, "to": to, "text": text.strip(), "re": args.re or "", "quiet": quiet, "silent": silent}
         m_store.write_state(rp.held_path, json.dumps(held, ensure_ascii=False) + "\n", append=True)
         print("Held: the room is paused; your message goes out when it resumes.")
         return
-    record = m_log.append_message(args.sender, to, text.strip(), args.re or "", quiet=quiet)
+    record = m_log.append_message(args.sender, to, text.strip(), args.re or "", quiet=quiet, silent=silent)
+    streak = 0 if args.sender in m_store.people_ids(config) else talk_streak(m_log.read_messages(), config)
     if args.re and any(m["id"] == args.re and m_log.is_for(m, args.sender) for m in m_log.read_messages()):
         # An answer is more than «read»: it closes the message in the answerer's inbox, as ack
         # would — answered ones hung there until a separate ack (22 of them).
@@ -108,6 +198,10 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     with contextlib.suppress(OSError, ValueError, KeyError, m_store.OperationFailed):
         m_screen.bind_claude_session(args.sender)
     print(f"Queued {record['id']} from {args.sender} to {', '.join(to)}.")
+    limit = config.get("talk_limit", TALK_LIMIT)
+    if limit and streak >= limit:
+        pause_for_talk(config, streak)
+        print(f"Paused: agents wrote {streak} messages to each other without the person; wait for the person.")
 
 
 def waits_of(awaiting: dict[str, Any], pid: str) -> list[dict[str, Any]]:
@@ -301,13 +395,15 @@ _WINDOW_SESSION_SEEN: dict[str, float] = {}
 
 
 @m_store.room_locked
-def remember_window_session(p: dict[str, Any]) -> None:
-    """While a room-started Claude runs, keep the session its window's process records — what
-    /restart continues once the process is gone. Read at most every minute."""
+def remember_window_session(p: dict[str, Any], pane: str) -> None:
+    """While a Claude runs in a window delivery types into, keep the session its window's process
+    records — what /restart continues once the process is gone, and where its spending is read. Any
+    Claude in the room's tmux, not only one /add started: `init`'s example seats are opened by `start`,
+    and their spending went uncounted. Read at most every minute."""
     if time.time() - _WINDOW_SESSION_SEEN.get(p["id"], 0) < 60:
         return
     _WINDOW_SESSION_SEEN[p["id"]] = time.time()
-    sid = m_screen.claude_of_window(Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser(), p.get("target") or "")
+    sid = m_screen.claude_of_window(Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser(), pane)
     if not m_screen.SESSION_ID.fullmatch(sid) or sid == p.get("window_session"):
         return
     data = m_store.read_config_raw()
@@ -320,8 +416,8 @@ def remember_window_session(p: dict[str, Any]) -> None:
 def deliver_one(p: dict[str, Any], pane: str, config: dict[str, Any], messages: list[dict[str, Any]]) -> str:
     """One participant's tick: its state from the screen, a limit, a wait for its answer, a message."""
     rp = m_store.room().paths
-    if p.get("started_by_room") and m_screen.agent_kind(p) == "claude":
-        remember_window_session(p)
+    if m_screen.agent_kind(p) == "claude":
+        remember_window_session(p, pane)
     rules = m_screen.screen_rules(p)
     # One tmux call per agent a tick: its state, its window's check, its model,
     # its background commands and a limit are read off this one look. What is typed is still looked at
@@ -406,14 +502,14 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
     # The room is named in the command itself: an agent working in another folder (or with
     # another room in its COLLAB_ROOT) must still answer here.
     if m["from"] == m_text.ROOM:
-        hint = "reply in room: " + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""))
+        hint = "reply in room: " + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), p["id"])
     else:
         # Both ways to close it, ready to run.
         hint = (
             "answer: "
-            + room_cmd("say", f"--from {p['id']} --to {m['from']} --re {m['id']} {reply_body(p)}", p.get("cli", ""))
+            + room_cmd("say", f"--from {p['id']} --to {m['from']} --re {m['id']} {reply_body(p)}", p.get("cli", ""), p["id"])
             + " · if no answer is needed: "
-            + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""))
+            + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"])
         )
     warn = (UNSIGNED + " ") if m_log.unsigned_person(m, config) else ""
     body = " ".join(m_text.body_text(m["text"]).split())  # no head of another inside
@@ -425,7 +521,7 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
         # read-only copy — `show` there was refused. inbox prints it in full.
         body = (
             f"(long message, {len(body)} characters — read it in full: "
-            + room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""))
+            + room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"])
             + ")"
         )
     return f"[{m['from']} → {', '.join(m['to'])}] {warn}{body}" + (f"  ({hint})" if p.get("reply_hint", True) else "")
@@ -465,6 +561,13 @@ def is_quiet(m: dict[str, Any], config: dict[str, Any]) -> bool:
     return m.get("quiet") is True and m.get("from") not in (m_text.ROOM, *m_store.people_ids(config))
 
 
+def is_silent(m: dict[str, Any], config: dict[str, Any]) -> bool:
+    """The room's own notes — «X connected», the merge queue's «waits», «merged», «stopped»: never typed to
+    an agent. Each typing wakes it, and a wake re-reads its whole context; the note stays in its inbox and
+    in the person's chat. A person's letter is never silent."""
+    return m.get("silent") is True and m.get("from") not in m_store.people_ids(config)
+
+
 def digest_order(pending: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[str, Any]]:
     """The room's own notes (the merge queue, «merged») and what the person signed come first; quiet
     notes last; the rest in the log's order. The order is the room's to give, never a sender's: a word
@@ -490,7 +593,9 @@ def digest_text(p: dict[str, Any], pending: list[dict[str, Any]], config: dict[s
         # The sender by its id, as one message shows it: a name is the agent's own to set, and
         # «Room», «claude-5» or the person's name there read as someone else.
         parts.append(f"{mark}{m['from']}: «{words}…» (id {m['id']})")
-    read = room_cmd("inbox", f"--for {p['id']}" + (f" --limit {len(pending)}" if len(pending) > 50 else ""), p.get("cli", ""))
+    read = room_cmd(
+        "inbox", f"--for {p['id']}" + (f" --limit {len(pending)}" if len(pending) > 50 else ""), p.get("cli", ""), p["id"]
+    )
     # No ready answer here, only words: a command with a slot for the body is the shell-injection hole of reply_body back.
     answer = " — answer each with say --re <id>, or close it with ack --no-reply --id <id>"
     hint = f"read them all: {read}" + (answer if p.get("reply_hint", True) else "")
@@ -505,6 +610,42 @@ def digest_text(p: dict[str, Any], pending: list[dict[str, Any]], config: dict[s
             + f" · and {len(pending) - len(parts)} more"
         )
     return f"{text}  ({hint})"
+
+
+def clear_dir() -> Path:
+    return m_store.room().paths.state_dir / "clear-after-merge"
+
+
+def clear_after_merge(pid: str, commit: str) -> None:
+    """What an agent landed through the merge queue is in main: at its next idle moment it is given /clear,
+    and the next task does not re-read the last one's history on every wake."""
+    m_log.write_set(clear_dir(), pid, m_log.read_set(clear_dir(), pid) | {commit})
+
+
+def wants_clear(p: dict[str, Any]) -> bool:
+    """Only a Claude: a Codex's conversation is found by its connection check in its log, and a new one
+    has none — /restart would lose it."""
+    return m_screen.agent_kind(p) == "claude" and bool(m_log.read_set(clear_dir(), p["id"]))
+
+
+def clear_agent(p: dict[str, Any], pane: str) -> str:
+    """/clear typed as a message is: not into a scrolled window, only while idle, only into its own process."""
+    if m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}", check=False).stdout.strip() == "1":
+        return ""
+    if m_screen.screen_state(m_screen.screen_rules(p), pane)[0] != "idle" or m_screen.pane_guard(p, pane):
+        return ""
+    STOPPING["typing"] = True
+    sent = m_tmuxio.tmux("send-keys", "-t", pane, "-l", "/clear", check=False)
+    if sent.returncode == 0:
+        time.sleep(float(os.environ.get("COLLAB_ENTER_DELAY", "0.3")))
+        sent = m_tmuxio.tmux("send-keys", "-t", pane, "Enter", check=False)
+    STOPPING["typing"] = False
+    if sent.returncode != 0:
+        stop_if_asked()
+        return ""
+    m_log.write_set(clear_dir(), p["id"], set())
+    stop_if_asked()
+    return f"cleared {p['id']}"
 
 
 @m_store.room_locked
@@ -525,10 +666,18 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any])
             delivered |= {m["id"] for m in pending if m["id"] in closed}
             m_log.write_set(rp.delivered_dir, p["id"], delivered)
             pending = [m for m in pending if m["id"] not in closed]
+        # The room's own notes are never typed: marked delivered at once, they stay in inbox.
+        silent = {m["id"] for m in pending if is_silent(m, config)}
+        if silent:
+            delivered |= silent
+            m_log.write_set(rp.delivered_dir, p["id"], delivered)
+            pending = [m for m in pending if m["id"] not in silent]
         if p.get("muted"):
             # Muted hears only what is addressed to it by name: a muted agent
             # still sees and answers a direct message; room-wide talk passes it by.
             pending = [m for m in pending if p["id"] in m.get("to", [])]
+        if state == "idle" and all(is_quiet(m, config) or not m_store.well_formed(m) for m in pending) and wants_clear(p):
+            return clear_agent(p, pane)  # a landing done and nothing to say: the history goes
         if not pending or state != "idle" or all(is_quiet(m, config) or not m_store.well_formed(m) for m in pending):
             # Only quiet notes waiting: the agent is not woken for them — each wake re-reads its whole
             # context. They wait in its inbox and go with the next

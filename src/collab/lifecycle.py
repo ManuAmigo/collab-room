@@ -144,6 +144,7 @@ def start_deliverer(session: str) -> None:
             f"={session}:=deliver",
             "-c",
             m_tmuxio.tmux_dir(str(rp.root)),
+            *m_tmuxio.pane_env(),
             m_tmuxio.in_dir(str(rp.root), cmd),
             check=False,
         )
@@ -157,6 +158,7 @@ def start_deliverer(session: str) -> None:
             "deliver",
             "-c",
             m_tmuxio.tmux_dir(str(rp.root)),
+            *m_tmuxio.pane_env(),
             m_tmuxio.in_dir(str(rp.root), cmd),
             check=False,
         )
@@ -209,7 +211,7 @@ def restore_owner_pane(session: str, config: dict[str, Any]) -> None:
     pane = data.get("panes", {}).get(owner["id"])
     if pane and m_tmuxio.tmux("list-panes", "-t", pane, check=False).returncode == 0:
         return
-    cmd = list(owner["command"])
+    cmd = m_store.current_chat_command(owner["command"])
     cmd[0] = shutil.which(cmd[0]) or cmd[0]
     out = m_tmuxio.tmux(
         "new-window",
@@ -266,8 +268,11 @@ def set_paused(paused: bool) -> None:
                     h["text"],
                     h.get("re", "") if isinstance(h.get("re"), str) else "",
                     quiet=h.get("quiet") is True,
+                    silent=h.get("silent") is True,
                 )
         rp.held_path.unlink()
+    if not paused:
+        m_deliver.talk_reset()  # the person let the talk go on: counted anew, or the next word paused again
 
 
 def cmd_pause(args: argparse.Namespace) -> None:
@@ -606,7 +611,7 @@ def open_room_windows(
         # `codex` than the one it found (a test launched the real Codex that way).
         program = ""
         if p.get("command"):
-            cmd = list(p["command"])
+            cmd = m_store.current_chat_command(p["command"])
             cmd[0] = shutil.which(cmd[0]) or cmd[0]
             program = " ".join(shlex.quote(x) for x in cmd)
         run_cmd = [m_tmuxio.in_dir(cwd, program)]
@@ -666,6 +671,9 @@ def cmd_start(args: argparse.Namespace) -> None:
     rp = m_store.room().paths
     if shutil.which(m_tmuxio.TMUX) is None:
         m_store.fail(f"tmux is required: {m_tmuxio.tmux_install_hint()}, and run `collab start` again")
+    venv = m_tmuxio.leave_venv()
+    if venv:
+        print(f"The active venv {m_text.tilde(venv)} is left out of the room: its windows run without it.")
     m_log.owner_key(create=True)  # installed before this feature or removed: the room makes its own
     if not all(c.isprintable() for c in str(rp.root)):
         # The room's path is in every hint typed into an agent's window: a «\r» in a folder's name pressed
@@ -685,6 +693,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         rp = m_store.room().paths
     m_store.record_room_root()
     refresh_codex_rules()
+    m_installer.update_in_background(str(rp.root))
     config = m_store.load_config()
     if not m_tmuxio.tmux_can_read(rp.root):
         m_store.fail(

@@ -304,6 +304,9 @@ GIT_TIMEOUT = 30
 def cmd_usage_report(args: argparse.Namespace) -> None:
     """The spending to plan by, from the room's own files — by task kind, agent, model, lane, task."""
     print(m_ledger.report(args.by, args.since or "", args.format), end="")
+    if args.format == "csv":  # the table stays a table; who has no data — beside it
+        for note in m_ledger.unread_notes():
+            print(note, file=sys.stderr)
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -386,6 +389,7 @@ def interval_seconds(text: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     """Every command and its options; --room is added to each one that lacks it."""
     ap = argparse.ArgumentParser(prog="collab", description="Local room for people and AI agents; any number of participants.")
+    ap.add_argument("--version", action="version", version=f"collab {m_boot.VERSION}")
     sub = ap.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("init", help="create .collab.json with a sample team")
@@ -395,7 +399,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=m_lifecycle.cmd_init)
 
     s = sub.add_parser("install", help="one-time setup: collab command, Claude Code plugin, Codex skill")
-    s.add_argument("--bin-dir", help="where to put the collab command (default: ~/.local/bin, made if missing; install says how to add it to PATH)")
+    s.add_argument(
+        "--bin-dir",
+        help="where to put the collab command (default: ~/.local/bin, made if missing; install says how to add it to PATH)",
+    )
     s.add_argument("--dry-run", action="store_true", help="show what would be done")
     s.add_argument(
         "--dev",
@@ -411,6 +418,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-codex-room-commands", action="store_true", help="withdraw that: forget the consent and remove every rule it gave"
     )
     s.set_defaults(func=m_installer.cmd_install)
+
+    s = sub.add_parser("update", help="install a newer collab now, from the clone it was installed from")
+    s.add_argument("--off", action="store_true", help="turn off the update at collab start (it fetches the clone's origin)")
+    s.add_argument("--on", action="store_true", help="turn the update at collab start back on")
+    s.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)  # what collab start runs beside the room
+    s.add_argument("--after", type=int, default=0, help=argparse.SUPPRESS)  # the start that runs it
+    s.set_defaults(func=m_installer.cmd_update)
 
     s = sub.add_parser("start", help="first time: create the room here; then open it (agents, delivery, chat)")
     s.add_argument("--session")
@@ -461,7 +475,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--quiet", action="store_true", help="no banner line (for agents that turn each line into an event)")
     s.set_defaults(func=cmd_watch)
 
-    s = sub.add_parser("dm", help="the direct-conversation panel beside the chat (open it with /dm in the chat; not secret: the room log holds it)")
+    s = sub.add_parser(
+        "dm",
+        help="the direct-conversation panel beside the chat (open it with /dm in the chat; not secret: the room log holds it)",
+    )
     s.add_argument("--as", dest="as_", required=True)
     s.add_argument("--interval", type=interval_seconds, default=0.5)
     s.set_defaults(func=m_dm.cmd_dm)
@@ -551,7 +568,8 @@ def build_parser() -> argparse.ArgumentParser:
     usage = s.add_subparsers(dest="usage_cmd", required=True)
     u = usage.add_parser(
         "report",
-        help="a table to plan by: spending per task kind, agent, model, lane or task (per task: in + out + cache write)",
+        help="a table to plan by: spending per task kind, agent, model, lane or task (per task: in + out + cache write;"
+        " answers: the model's; context: of one answer, mean and max)",
     )
     u.add_argument("--by", choices=sorted(m_ledger.GROUPS), default="kind")
     u.add_argument(

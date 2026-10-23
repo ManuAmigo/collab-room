@@ -169,7 +169,7 @@ def tick_read(j: Journal) -> list[dict[str, Any]]:
 
 
 def append_message(
-    sender: str, to: list[str], text: str, re_: str = "", sign: bool = False, quiet: bool = False
+    sender: str, to: list[str], text: str, re_: str = "", sign: bool = False, quiet: bool = False, silent: bool = False
 ) -> dict[str, Any]:
     rp = m_store.room().paths
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": m_store.now(), "from": sender, "to": to, "text": text}
@@ -177,6 +177,8 @@ def append_message(
         record["re"] = re_
     if quiet:
         record["quiet"] = True  # a note that wakes no one (is_quiet)
+    if silent:
+        record["silent"] = True  # the room's own note: never typed to an agent (is_silent)
     if sign:
         record["sig"] = signature(owner_key(create=True), record)
         mark_signing(record["id"])

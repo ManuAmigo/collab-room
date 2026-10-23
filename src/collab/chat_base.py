@@ -136,6 +136,10 @@ class ChatState:
     bar: str = ""
     menu_line: str = ""
     extra_rows: int = 0
+    # The size the fixed area was laid out for (setup): a resize after it, before the feed's thread
+    # began, was never seen — tmux resets the scroll region on a resize, and the feed scrolled the
+    # whole window over the input.
+    laid: tuple[int, int] = (0, 0)
     viewing: Any = None
     reading: Any = None
     top: Any = None

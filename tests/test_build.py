@@ -196,6 +196,24 @@ class BuildTest(unittest.TestCase):
 
 
 class WriteTest(unittest.TestCase):
+    def test_a_program_without_its_entry_point_is_not_built(self):
+        # Such a file runs nothing and exits 0: the Codex copy made of one answered no say at all.
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name) / "repo"
+        shutil.copytree(BUILD.ROOT / "src", root / "src")
+        (root / "tools").mkdir()
+        shutil.copy(BUILD.ROOT / "tools" / "build_collab.py", root / "tools")
+        shutil.copy(BUILD.OUTPUT, root / "collab")
+        cli = root / "src" / "collab" / "cli.py"
+        cli.write_text(
+            cli.read_text(encoding="utf-8").replace('\nif __name__ == "__main__":\n    main()\n', "\n"), encoding="utf-8"
+        )
+        run = subprocess.run([sys.executable, str(root / "tools" / "build_collab.py")], capture_output=True, text=True)
+        self.assertNotEqual(run.returncode, 0, run.stdout)
+        self.assertIn("must end in", run.stderr)
+        self.assertEqual((root / "collab").read_bytes(), BUILD.OUTPUT.read_bytes(), "the file people run is left as it was")
+
     def test_a_reader_of_collab_during_the_build_reads_a_whole_file(self):
         # A test read collab while it was being rebuilt in place — half a file, a
         # SyntaxError mid-line. Replaced at once, the file a reader opened stays whole; its mode stays.

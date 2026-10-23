@@ -55,6 +55,9 @@ class InstallPaths:
     # is a copy that never changes, and comparing with it, the chat never knew it was old.
     installed_file: Path
     source_file: Path
+    # The update at start: the switch that turns it off, and what the last one found (told once).
+    update_off: Path
+    update_state: Path
     invites: Path
     welcomed_path: Path
     owner_key: Path  # the person's signing key — see UNSIGNED
@@ -77,6 +80,8 @@ class InstallPaths:
             safe_copies=Path(os.environ.get("COLLAB_SAFE_DIR", "~/.local/share/collab-room")).expanduser(),
             installed_file=home / ".collab-room" / "installed",
             source_file=home / ".collab-room" / "source",
+            update_off=home / ".collab-room" / "no-auto-update",
+            update_state=home / ".collab-room" / "update.json",
             invites=invites,
             welcomed_path=invites.parent / "welcomed",
             owner_key=invites.parent / "owner.key",
@@ -101,6 +106,11 @@ def install() -> Install:
 def paths() -> InstallPaths:
     """Read once per operation: `p = paths()`, then p.… to its end."""
     return _INSTALL.paths
+
+
+# The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
+# raises it — the publishing refuses a version that is already released.
+VERSION = "0.1.0"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -159,33 +169,58 @@ def _link_folder_kept(folder: str) -> bool:
 def trusted_interpreter(path: str) -> bool:
     """A Python we may run as the person: its real file, not inside a virtual environment (a project's
     .venv is where an agent writes), regular, safe mode. Checked before it is ever run."""
+    return not interpreter_refused(path)
+
+
+def _mode_refused(path: str, st: os.stat_result, group_may_write: bool) -> str:
+    """Why _safe_mode refuses it, and the command that fixes it; "" — it does not."""
+    if _safe_mode(st, group_may_write):
+        return ""
+    if st.st_uid not in (os.getuid(), 0):
+        return f"it belongs to another user (uid {st.st_uid})"
+    if st.st_mode & stat.S_IWOTH:
+        return f"anyone may change it; fix: sudo chmod o-w {path}"
+    return f"its group may change it; fix: sudo chmod g-w {path}"
+
+
+def interpreter_refused(path: str) -> str:
+    """Why a Python is not one we may run as the person ("" — it is), in words to show: install said
+    «not found» of three it refused for their group (root:wheel, writable by the group)."""
     real = os.path.realpath(path)
     # A Python by name: the pointer lies in home, and an agent allowed to write there could point it
     # at any program outside home — /bin/sh, osascript — run with the person's arguments.
     # A second line, not the border: a Codex that may write home already owns ~/.zshrc, ~/.claude and
     # the rest. The border is not letting Codex write home — and then no room rule is given.
     if not re.fullmatch(r"python3(\.\d+)?", os.path.basename(real)):
-        return False
+        return f"its real file {real} is not named python3"
     # Only one installed outside the home folder — the system's, python.org's, Homebrew's. What lies
     # in home (uv's, pyenv's, a project's .venv) an agent allowed to write there could change, and the
     # person's next collab would run it.
     if _inside(real, str(Path.home())):
-        return False
+        return "it is in your home folder, where an agent may write"
     if any(os.path.exists(os.path.join(p, "pyvenv.cfg")) for p in Path(real).parents):
-        return False
+        return "it is in a virtual environment"
     # Nor in a temporary folder: Codex writes /tmp and $TMPDIR by default, and no real Python lives there.
     if in_temp_folder(real):
-        return False
+        return "it is in a temporary folder"
     try:
         st = os.lstat(real)
     except OSError:
-        return False
+        return "it cannot be read"
     # Every folder above it, and every folder holding a link on the way to it: kept.
-    if not all(_folder_kept(str(folder)) for folder in Path(real).parents):
-        return False
-    if not all(_link_folder_kept(folder) for folder in link_folders(path)):
-        return False
-    return stat.S_ISREG(st.st_mode) and _safe_mode(st, group_may_write=True) and os.access(real, os.X_OK)
+    for folder in Path(real).parents:
+        if not _folder_kept(str(folder)):
+            return f"its folder {folder} may be changed by others"
+    for folder in link_folders(path):
+        if not _link_folder_kept(folder):
+            return f"the folder {folder} of a link on the way to it may be changed by others, or is in home"
+    if not stat.S_ISREG(st.st_mode):
+        return "it is not a regular file"
+    # The one exception, python.org's: root:admin with the group writing (_safe_mode); root:wheel is not.
+    why = _mode_refused(real, st, group_may_write=True)
+    if why:
+        return why
+    return "" if os.access(real, os.X_OK) else "it cannot be run"
 
 
 def link_folders(path: str) -> list[str]:
@@ -1067,6 +1102,9 @@ def load_config() -> dict[str, Any]:
     # the target the same way. The room writes only plain names.
     if not isinstance(data.get("session", "collab-room"), str) or not WORD.fullmatch(data.get("session", "collab-room")):
         bad("session must be 1 to 64 letters, digits, _ and -")
+    limit = data.get("talk_limit", 0)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
+        bad("talk_limit must be a whole number, 0 or more (0: the room never pauses for agents' talk)")
     participants = data.get("participants")
     if not isinstance(participants, list) or not participants:
         bad("config must contain a non-empty participants list")
@@ -1435,6 +1473,17 @@ def trusted_chat_command(cmd: Any) -> bool:
     return real == Path(SELF).resolve() or inst.safe_copies.resolve() in real.parents
 
 
+def current_chat_command(cmd: list[str]) -> list[str]:
+    """The person's chat as it is started: by this collab, not the copy named when the room was made.
+    The room's file keeps the path of the copy `init` ran from, and after an install or update the
+    delivery ran the new copy while the chat and its /dm stayed on the old one. Only a chat
+    trusted_chat_command() lets start unasked is changed; anything else is started as written."""
+    if not trusted_chat_command(cmd):
+        return list(cmd)
+    at = 1 if re.fullmatch(r"python[0-9.]*", Path(cmd[0]).name) else 0
+    return [*cmd[:at], SELF, *cmd[at + 1 :]]
+
+
 def write_room(sample: dict[str, Any], ask: bool) -> None:
     rp = room().paths
     if ask and len(sample["participants"]) == 1:
@@ -1654,8 +1703,12 @@ def in_dir(folder: str, command: str) -> str:
     """The pane's command, entering its folder itself. tmux's own -c is not enough: a tmux server
     started from a restricted program could not enter folders and silently started every new
     window in its own, already deleted, folder — an agent would have worked in the wrong project.
-    `exec` keeps the program the pane's own process."""
-    return f"cd {shlex.quote(folder)} && exec {command or shlex.quote(os.environ.get('SHELL', '/bin/sh'))}"
+    `exec` keeps the program the pane's own process.
+    No VIRTUAL_ENV: a tmux server started from a shell with a project's venv active keeps it for
+    every window it opens, and `-e` can set a variable but not remove it. `env -u`, not `unset`:
+    tmux runs this line in its default-shell, and fish has no `unset`; env execs the program."""
+    shell = shlex.quote(os.environ.get("SHELL", "/bin/sh"))
+    return f"cd {shlex.quote(folder)} && exec env -u VIRTUAL_ENV {command or shell}"
 
 
 # tmux answers at once; one that does not (typing into a scrolled window without a client) must not
@@ -1663,17 +1716,54 @@ def in_dir(folder: str, command: str) -> str:
 TMUX_TIMEOUT = 15
 
 
+def mac_on_intel() -> bool:
+    """An Intel Mac. Asked of the machine, not of this Python: one running under Rosetta on Apple
+    Silicon says x86_64 too, while the hardware's own flag says arm64."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        # By its full path: /usr/sbin is not on every PATH, and without it the Mac read as Apple Silicon.
+        r = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "hw.optional.arm64"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False  # unknown: the general advice, as before
+    return r.stdout.strip() != "1"
+
+
+def working_brew() -> str:
+    """Homebrew that runs on this Mac — its path as the person types it («brew» on PATH), or "".
+    An Apple Silicon Homebrew carried over to an Intel Mac stays at /opt/homebrew, answers `--version`
+    (a shell script) and then fails on its arm64 Ruby with «Bad CPU type in executable»: on an Intel
+    Mac /opt/homebrew, Apple Silicon's own prefix, does not count. Any other is asked for its version.
+    Homebrew just installed is often not on PATH yet — then its full path. A dead one on PATH does not
+    hide a working one at the other prefix."""
+    on_path = shutil.which("brew") or ""
+    for found in dict.fromkeys(b for b in (on_path, "/opt/homebrew/bin/brew", "/usr/local/bin/brew") if b):
+        if not os.access(found, os.X_OK):
+            continue
+        if os.path.realpath(found).startswith("/opt/homebrew/") and mac_on_intel():
+            continue
+        try:
+            r = subprocess.run([found, "--version"], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if not r.returncode:
+            return "brew" if found == on_path else found
+    return ""
+
+
 def tmux_install_hint() -> str:
     """How to get tmux, where it is missing. On a new Mac there is no Homebrew, and «brew install tmux»
-    was a dead end: install sets Python up itself, tmux it only named.
-    Homebrew just installed is often not on PATH yet — then its full path."""
+    was a dead end: install sets Python up itself, tmux it only named. Homebrew installs on Apple Silicon
+    only now: an Intel Mac is sent to MacPorts, not to a Homebrew that will not run there."""
     if sys.platform != "darwin":
         return "install it with your system's package manager (apt install tmux, dnf install tmux)"
-    brew = shutil.which("brew") or next(
-        (b for b in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew") if os.access(b, os.X_OK)), ""
-    )
+    brew = working_brew()
     if brew:
-        return f"install it: {'brew' if shutil.which('brew') else brew} install tmux"
+        return f"install it: {brew} install tmux"
+    if mac_on_intel():
+        return "Homebrew no longer installs on Intel Macs — install MacPorts (https://www.macports.org), then: sudo port install tmux"
     return "install Homebrew first (the one-line command on https://brew.sh), then: brew install tmux"
 
 
@@ -1703,11 +1793,33 @@ def tmux(*argv: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return r
 
 
+def path_without_venv() -> str:
+    """This process's PATH without the active venv's bin (VIRTUAL_ENV): a room started from a shell
+    with a project's venv active ran its chat, delivery and every window on that venv's python3."""
+    path = os.environ.get("PATH", "")
+    venv = os.environ.get("VIRTUAL_ENV", "")
+    if not venv:
+        return path
+    venv_bin = os.path.normpath(os.path.join(venv, "bin"))
+    return os.pathsep.join(d for d in path.split(os.pathsep) if not d or os.path.normpath(d) != venv_bin)
+
+
+def leave_venv() -> str:
+    """The active venv, left out of this process — PATH, VIRTUAL_ENV — and so out of everything it
+    starts: the tmux server, the programs it finds on PATH. Returns the venv's folder, or ""."""
+    venv = os.environ.get("VIRTUAL_ENV", "")
+    if venv:
+        os.environ["PATH"] = path_without_venv()
+        del os.environ["VIRTUAL_ENV"]
+    return venv
+
+
 def pane_env() -> list[str]:
     """Panes the room opens get this process's PATH and the room's path: the tmux server's own
-    environment may be older or different (a test once launched the real Codex)."""
+    environment may be older or different (a test once launched the real Codex).
+    Not an active venv's bin: the room's python3 is not a project's."""
     rp = room().paths
-    env = ["-e", f"PATH={os.environ.get('PATH', '')}", "-e", f"COLLAB_ROOT={rp.root}"]
+    env = ["-e", f"PATH={path_without_venv()}", "-e", f"COLLAB_ROOT={rp.root}"]
     # The room's own settings go along too (where invitations, the room list, the welcome mark and
     # the agents' history live): without them a test's chat wrote into the person's real home.
     # CODEX_HOME too: the room writes a Codex agent's rules there, and a Codex started without it
@@ -1953,7 +2065,7 @@ def tick_read(j: Journal) -> list[dict[str, Any]]:
 
 
 def append_message(
-    sender: str, to: list[str], text: str, re_: str = "", sign: bool = False, quiet: bool = False
+    sender: str, to: list[str], text: str, re_: str = "", sign: bool = False, quiet: bool = False, silent: bool = False
 ) -> dict[str, Any]:
     rp = room().paths
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": now(), "from": sender, "to": to, "text": text}
@@ -1961,6 +2073,8 @@ def append_message(
         record["re"] = re_
     if quiet:
         record["quiet"] = True  # a note that wakes no one (is_quiet)
+    if silent:
+        record["silent"] = True  # the room's own note: never typed to an agent (is_silent)
     if sign:
         record["sig"] = signature(owner_key(create=True), record)
         mark_signing(record["id"])
@@ -3249,6 +3363,7 @@ from typing import Any, cast
 
 
 
+
 FIELDS = ("input", "output", "cache_read", "cache_write")
 SEEN_MAX = 50_000  # answers remembered per agent; past it the oldest go, and «since» moves past them
 CTX_MAX = 64  # Codex turns whose model and effort are kept for the records that follow them
@@ -3299,7 +3414,10 @@ def claude_files(p: dict[str, Any]) -> list[Path]:
     sid = str(p.get("window_session") or "")
     if not SESSION_ID.fullmatch(sid):
         return []
-    folder = os.path.realpath(p.get("folder") or str(room().paths.root))
+    # /add writes the agent's folder; a seat `start` opens works in its «cwd» under the project.
+    raw: object = p.get("cwd")
+    cwd = raw if isinstance(raw, str) else "."  # the settings are the person's to edit
+    folder = os.path.realpath(p.get("folder") or str(room().paths.root / cwd))
     base = claude_home() / re.sub(r"[^A-Za-z0-9]", "-", folder)
     subs = base / sid / "subagents"
     try:
@@ -3325,6 +3443,27 @@ def codex_file(p: dict[str, Any], known: str) -> list[Path]:
     except OSError:
         return []
     return found[:1]
+
+
+def unread(p: dict[str, Any]) -> str:
+    """Why the agent's spending is not read — its log not found; "" when it is. For the report: a table
+    without an agent looked complete."""
+    kind = agent_kind(p)
+    if kind == "claude":
+        files = claude_files(p)
+        if not files:
+            return (
+                "the session of its window is not known: delivery reads it from Claude's own record once a minute while it runs"
+            )
+        if not files[0].is_file():
+            return f"no log of its session {p.get('window_session')} in {tilde(str(files[0].parent))}"
+        return ""
+    if kind == "codex":
+        known = next(iter(obj(obj(read_json(cursor_path())).get(p["id"])).get("files") or {}), "")
+        if codex_file(p, str(known)):
+            return ""
+        return f"no log of its session in {tilde(str(codex_home()))} (found by its connection check)"
+    return "not a Claude or a Codex: its spending is not read"
 
 
 def open_under(base: Path, path: Path) -> int | None:
@@ -3497,7 +3636,8 @@ class Cursor:
 
 def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
     """What the agent spent since the last call: one record per model and effort — {model, effort, input,
-    output, cache_read, cache_write, from_ts, to_ts} (times of the first and last answer counted). Nothing
+    output, cache_read, cache_write, answers, ctx_max, from_ts, to_ts}: the answers counted, the longest
+    context of one (input + cache read + cache write), times of the first and last answer. Nothing
     new — []. The first call for an agent starts from now: its past is not counted against the task it is
     on. Called under the room's lock by its one writer (delivery's tick); the cursor is in the room's state,
     so a restart of delivery neither counts again nor loses a piece."""
@@ -3545,9 +3685,13 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
             if not ts or not KEY.fullmatch(key) or key in cur.seen or ts < cur.since:
                 continue
             cur.seen[key] = ts
-            g = groups.setdefault((model, effort), {"model": model, "effort": effort, **dict.fromkeys(FIELDS, 0)})
+            g = groups.setdefault(
+                (model, effort), {"model": model, "effort": effort, **dict.fromkeys(FIELDS, 0), "answers": 0, "ctx_max": 0}
+            )
             for f in FIELDS:
                 g[f] += nums[f]
+            g["answers"] += 1
+            g["ctx_max"] = max(g["ctx_max"], nums["input"] + nums["cache_read"] + nums["cache_write"])
             g["from_ts"] = min(g.get("from_ts") or ts, ts)
             g["to_ts"] = max(g.get("to_ts") or ts, ts)
     cur.files = read_to  # a log no longer the agent's (its session ended) is not looked at again
@@ -3571,6 +3715,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -3607,6 +3752,11 @@ def installed_collab() -> Path:
 def installed_name() -> str:
     """The content name of what the `collab` command runs now — to tell a chat or a Codex it is older."""
     return copy_name(installed_collab().read_bytes())
+
+
+class NotTheProgram(OSError):
+    """«This collab» is not the built program (run from the package it is its first module): a copy of it
+    would answer nothing. An OSError, as the caller's other «no copy» are: the old rule goes all the same."""
 
 
 class LinkedCopies(OSError):
@@ -3733,10 +3883,21 @@ def command_copy() -> Path:
     return path
 
 
+# How the one built file ends — and only it: run from the package, SELF is its first module.
+ENTRY = b'\nif __name__ == "__main__":\n    main()\n'
+
+
 def safe_copy() -> Path:
-    """This collab, read-only, named by its content: an update is a new file, never an edit."""
+    """This collab, read-only, named by its content: an update is a new file, never an edit. Only the
+    built program: run from the package, «this collab» is its first module — a copy of it ran every
+    say with exit 0 and did nothing."""
     inst = paths()
     data = Path(SELF).read_bytes()
+    if not data.endswith(ENTRY):
+        raise NotTheProgram(
+            f"{tilde(SELF)} is not the built collab (it does not end in its entry point): "
+            "a copy of it would answer nothing. Run the collab file built from the package (tools/build_collab.py)."
+        )
     path = inst.safe_copies / copy_name(data)
     refuse_linked_copies(inst.safe_copies)  # a rule for a copy reached through a link protects nothing
     if not path.is_file() or path.is_symlink() or path.read_bytes() != data:
@@ -3823,7 +3984,7 @@ def set_agent_rule(room_dir: str, pid: str, cli: str) -> None:
             tag
             + "".join(
                 "prefix_rule(pattern="
-                + json.dumps([*RULE_PYTHON, cli, command, "--room", room_dir, flag, pid], ensure_ascii=False)
+                + json.dumps([*rule_python(), cli, command, "--room", room_dir, flag, pid], ensure_ascii=False)
                 + ', decision="allow")\n'
                 for command, flag in (("say", "--from"), ("ack", "--for"), ("inbox", "--for"))
             )
@@ -3872,54 +4033,179 @@ def room_spellings() -> list[str]:
     return list(dict.fromkeys([str(rp.root), str(rp.root.resolve())]))
 
 
-def codex_room_rule(pid: str, folder: str) -> str:
-    """Before a Codex the room starts: its rule, if the person agreed at install. Returns the
-    collab its hints must name ("" — none: Codex will ask before answering, as before)."""
+@room_locked
+def codex_rule_notice(pid: str, label: str, reason: str, fix: str) -> None:
+    """Explain each refusal once per agent and reason, including after a room restart."""
+    rp = room().paths
+    config = load_config()
+    people = people_ids(config)
+    if not people:
+        return
+    if not label:
+        label = next((p.get("label", pid) for p in config.get("participants", []) if p["id"] == pid), pid)
+    path = rp.state_dir / "codex-rule-notices.json"
+    try:
+        seen = json.loads(read_state_text(path))
+    except (OSError, ValueError):
+        seen = {}
+    if not isinstance(seen, dict):
+        seen = {}
+    key = json.dumps([pid, reason], ensure_ascii=False)
+    if key in seen:
+        return
+    append_message(
+        ROOM,
+        people,
+        f"No room reply rule was issued for {label}: {reason}; Codex will ask permission for every reply; fix: {fix}.",
+    )
+    seen[key] = True
+    write_json(path, seen)
+
+
+def codex_rule_refusal(cli: Path, folder: str) -> tuple[str, str]:
+    """The first unsafe dependency of a room rule, and how to keep it out of reach."""
     inst = paths()
     rp = room().paths
+    reason = ""
+    fix = ""
+    if codex_writable_roots() is None:
+        reason = f"Codex settings in {inst.codex_home / 'config.toml'} could not be read reliably"
+        fix = "correct the TOML settings and make the file readable, then restart this agent"
+    elif not trusted_interpreter(sys.executable):
+        reason = f"the Python running collab ({sys.executable}) did not pass the interpreter safety checks"
+        fix = "run collab install with a Python installed outside agent projects, then restart this agent"
+    else:
+        checks = [
+            (
+                lambda: codex_can_write(cli, folder),
+                "Codex can write the collab command copy",
+                "keep collab copies outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: codex_can_write(rp.root.resolve().parent, folder),
+                "Codex can replace the room folder through its parent",
+                "choose a room whose parent is outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: codex_can_touch_python(sys.executable, folder),
+                "Codex can change the running Python installation or files inside it",
+                "keep the Python installation outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: codex_can_write(rp.base, folder),
+                "Codex can write the room storage folder",
+                "keep room storage outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: codex_can_write(inst.python_file, folder),
+                "Codex can change the file recording collab's Python",
+                "keep the collab installation data outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: bool(recorded_python()) and codex_can_touch_python(recorded_python(), folder),
+                "Codex can change the recorded Python installation or files inside it",
+                "keep the recorded Python installation outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: any(
+                    codex_can_write(Path(f), folder) for f in link_folders(recorded_python(as_written=True))
+                ),
+                "Codex can replace a link leading to the recorded Python",
+                "keep Python links outside temporary folders, the agent folder and its writable_roots",
+            ),
+        ]
+        for check, why, action in checks:
+            if check():
+                reason, fix = why, action + ", then restart this agent"
+                break
+    return reason, fix
+
+
+def codex_room_rule(pid: str, folder: str, label: str = "") -> str:
+    """Issue an opted-in rule, or explain the failed check to the person."""
+    inst = paths()
+    reason = ""
+    fix = ""
+    if not inst.codex_consent.exists():
+        prune_agent_rules()
+        return ""
+    stage = "remove obsolete Codex room reply rules"
     try:
         prune_agent_rules()
-        if not inst.codex_consent.exists():
-            return ""
-        cli = safe_copy()
-        # Nor when Codex could replace the room's folder itself (it lies inside what Codex may
-        # write): the rule names the folder by path, and a link put in its place would lead the
-        # unsandboxed copy anywhere.
-        # Nor the recorded Python: collab started by an older python3 runs whatever it names.
-        # Nor when this collab runs on a Python we would not hand over to (in home, in a venv…): the
-        # rule names sys.executable, run outside the sandbox.
-        if (
-            not trusted_interpreter(sys.executable)
-            or codex_can_write(cli, folder)
-            or codex_can_write(rp.root.resolve().parent, folder)
-            or codex_can_touch_python(sys.executable, folder)
-            or codex_can_write(rp.base, folder)
-            or codex_can_write(inst.python_file, folder)
-            or (bool(recorded_python()) and codex_can_touch_python(recorded_python(), folder))
-            # The folders of the recorded link: Codex changing a link changes what runs.
-            or any(codex_can_write(Path(f), folder) for f in link_folders(recorded_python(as_written=True)))
-        ):
-            for spelling in room_spellings():
-                set_agent_rule(spelling, pid, "")
-            return ""
+        stage = "prepare the read-only collab copy"
+        try:
+            cli = safe_copy()
+        except (SystemExit, OperationFailed) as exc:
+            # safe_copy can refuse via fail(), in both CLI and chat mode. Its earlier
+            # rule must be removed just as on an IO error.
+            raise OSError(f"could not prepare the read-only collab copy: {exc}") from exc
+        reason, fix = codex_rule_refusal(cli, folder)
+        stage = "write the Codex room reply rules"
+        if not reason:
+            if inst.agent_rules.is_symlink():
+                reason = f"the rules file {inst.agent_rules} is a symbolic link"
+                fix = "replace the link with a regular rules file, then restart this agent"
+            elif (
+                inst.agent_rules.exists()
+                and (text := inst.agent_rules.read_text(encoding="utf-8"))
+                and not text.startswith(RULES_HEADER)
+            ):
+                reason = f"the rules file {inst.agent_rules} is not managed by collab"
+                fix = "move that file aside after reviewing it, then restart this agent"
         for spelling in room_spellings():
-            set_agent_rule(spelling, pid, str(cli))
-    except OSError:
-        # No copy to name (its folder is a link, or unwritable): a rule given earlier must not stay
-        # and keep running the old copy outside the sandbox.
+            set_agent_rule(spelling, pid, "" if reason else str(cli))
+    except (OSError, UnicodeError) as exc:
+        reason = f"could not {stage}: {exc}"
+        fix = "check the named path, its permissions and free disk space, run collab install, then restart this agent"
         with contextlib.suppress(OSError, SystemExit, OperationFailed):
             for spelling in room_spellings():
                 set_agent_rule(spelling, pid, "")
+    if reason:
+        codex_rule_notice(pid, label, reason, fix)
         return ""
     return str(cli)
 
 
-# The interpreter a Codex rule allows: this exact one by its absolute path, isolated (-I: no
-# PYTHON* variables, no module next to the script) — a bare «python3» matched any file of that name,
-# also one a sandboxed Codex had put in its own folder.
-# The real file, the one the checks looked at — not a link Codex might replace afterwards; -S: no
-# site packages, no .pth to run.
-RULE_PYTHON = [os.path.realpath(sys.executable), "-I", "-S"]
+def rule_python() -> list[str]:
+    """The same installed interpreter for rules and hints, even in different Python processes."""
+    recorded = recorded_python()
+    python = recorded if recorded and trusted_interpreter(recorded) else sys.executable
+    # Use the real binary, isolated from environment variables and site packages.
+    return [os.path.realpath(python), "-I", "-S"]
+
+
+def check_codex_rule_python(pid: str, python: list[str]) -> None:
+    """Drop an obsolete rule when a delivery process would name a different interpreter."""
+    inst = paths()
+    if not inst.codex_consent.exists() or inst.agent_rules.is_symlink():
+        return
+    try:
+        text = inst.agent_rules.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return
+    if not text.startswith(RULES_HEADER):
+        return
+    tags = {f"# room={json.dumps(spelling, ensure_ascii=False)} id={pid}" for spelling in room_spellings()}
+    active = False
+    for line in text.splitlines():
+        if line.startswith("# room="):
+            active = line in tags
+        elif active and line.startswith("prefix_rule(pattern="):
+            pattern = line.removeprefix("prefix_rule(pattern=").removesuffix(', decision="allow")')
+            try:
+                argv = json.loads(pattern)
+            except ValueError:
+                continue
+            if isinstance(argv, list) and argv[:3] != python:
+                for spelling in room_spellings():
+                    set_agent_rule(spelling, pid, "")
+                codex_rule_notice(
+                    pid,
+                    "",
+                    "the reply command uses a different Python from this agent's saved permission rule",
+                    "restart this agent so collab can issue a matching rule",
+                )
+                return
 
 
 def python311_version(path: str) -> str | None:
@@ -3958,16 +4244,23 @@ PYTHON_ROOTS = frozenset(
 )
 
 
-def find_python311(skipped: list[str] | None = None) -> tuple[str, str] | None:
+# python.org's installer puts each version here, and links on PATH only if its command-line tools are chosen.
+PYTHON_ORG = Path("/Library/Frameworks/Python.framework/Versions")
+
+
+def find_python311(skipped: list[str] | None = None, refused: list[tuple[str, str]] | None = None) -> tuple[str, str] | None:
     """A Python 3.11+ already on this computer, installed outside home: the one recorded, the one
-    running, then python3.14…python3.11 and python3 on PATH, Homebrew's. (path, version) or None.
-    `skipped` gets each one passed over for lying where an agent writes — to say so, not silently."""
+    running, then python3.14…python3.11 and python3 on PATH, Homebrew's, python.org's. (path, version) or None.
+    `skipped` gets each one passed over for lying where an agent writes, `refused` each one there that
+    may not be run, with why — to say so, not «not found» of three Pythons in place."""
     names = [f"python3.{minor}" for minor in range(14, 10, -1)] + ["python3"]
     # The one already recorded comes first: a repeated install keeps it while it is still trusted
     # and 3.11+, instead of switching to whichever python3 ran install this time.
     candidates = [recorded_python(as_written=True), sys.executable, *(shutil.which(n) or "" for n in names)]
     for folder in ("/opt/homebrew/bin", "/usr/local/bin"):
         candidates += [os.path.join(folder, n) for n in names]
+    # Not on PATH, it was never looked at: three of them stood there and install said «not found».
+    candidates += [str(PYTHON_ORG / f"3.{minor}" / "bin" / f"python3.{minor}") for minor in range(14, 10, -1)]
     # Nothing from a folder an agent writes to: the one we are in, every room's project, every agent's
     # folder — that weighs more than the file's permissions. Not the one we are in when
     # it is a root every Python sits under: from / (or /opt/homebrew, /Library) each lay «inside» it, and
@@ -3992,6 +4285,10 @@ def find_python311(skipped: list[str] | None = None) -> tuple[str, str] | None:
             version = python311_version(real)
             if version:
                 return keep, version
+        elif real and real not in seen and os.path.isfile(real):
+            seen.add(real)
+            if refused is not None:
+                refused.append((real, interpreter_refused(real)))
     return None
 
 
@@ -4023,8 +4320,9 @@ def python_install_ways() -> list[tuple[str, list[list[str]]]]:
     installed; the person types the password («a command — Enter, and it is done»)."""
     ways: list[tuple[str, list[list[str]]]] = []
     if sys.platform == "darwin":
-        if shutil.which("brew"):
-            ways.append(("Install Python 3.12 with Homebrew", [["brew", "install", "python@3.12"]]))
+        # Only a Homebrew that runs here: an Apple Silicon one carried over to an Intel Mac fails.
+        if brew := working_brew():
+            ways.append(("Install Python 3.12 with Homebrew", [[brew, "install", "python@3.12"]]))
         pkg = os.path.join(tempfile.gettempdir(), f"collab-python-{secrets.token_hex(4)}.pkg")
         ways.append(
             (
@@ -4085,11 +4383,14 @@ def install_python_step(dry_run: bool) -> bool:
     # started by an older python3 runs itself again with it (PYTHON_FILE, at the top).
     before = recorded_python(as_written=True)
     passed_over: list[str] = []
-    found = find_python311(passed_over)
+    refused: list[tuple[str, str]] = []
+    found = find_python311(passed_over, refused)
     for real in passed_over:  # said, not silent: why the one there is not used
         print(
             f"  · Python {tilde(real)}: passed over — it lies in the folder you are in or an agent's, where an agent may write"
         )
+    for real, why in [] if found else refused:
+        print(f"  · Python {tilde(real)}: found, refused — {why}")
     found = found or (None if dry_run else install_python311())
     if found and dry_run:
         print(f"  · Python {found[1]}: {found[0]} → {inst.python_file}")
@@ -4109,9 +4410,11 @@ def install_python_step(dry_run: bool) -> bool:
             )
             ok = False
     else:
+        brew = working_brew()
+        mac = f"{brew} install python@3.12" if brew else "the installer from https://www.python.org/downloads/macos/"
         print(
-            "  ✗ Python 3.11 or newer, installed outside your home folder — not found. Install one (macOS: brew install\n"
-            "    python@3.12; Linux: your system's python3.11 package), then run collab install again."
+            f"  ✗ Python 3.11 or newer, installed outside your home folder — not found. Install one (macOS: {mac};\n"
+            "    Linux: your system's python3.11 package), then run collab install again."
         )
         ok = False
     # An older Python has no tomllib — Codex's writable_roots went unread
@@ -4177,10 +4480,13 @@ def install_command_step(args: argparse.Namespace, bin_dir: Path, link: Path, re
             if link.exists() or link.is_symlink():
                 if not our_command_link(link):
                     raise FileExistsError
-                link.unlink()
             else:
                 bin_dir.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(target)
+            # In one step: never a moment without the command — an update stopped here leaves the old one.
+            fresh = link.with_name(f".{link.name}.{os.getpid()}.new")
+            fresh.unlink(missing_ok=True)
+            fresh.symlink_to(target)
+            os.replace(fresh, link)
             write_private(inst.installed_file, str(link))
             write_private(inst.source_file, str(repo))
             print(f"  ✓ collab command: {link} — {what}")
@@ -4202,6 +4508,270 @@ def install_command_step(args: argparse.Namespace, bin_dir: Path, link: Path, re
         print(f"  ✗ collab command: cannot write to {bin_dir} ({error.strerror}) — pass a folder you can write to with --bin-dir")
         ok = False
     return ok
+
+
+# The update: the clone install was made from is moved to the newest release (a tag v<VERSION> of its
+# origin) and installed again — what a person did by hand with git pull and install. Only the installed
+# copy updates itself: a --dev install runs the clone's own file, and its clone is the developer's.
+UPDATE_FETCH_WAIT = 20  # seconds; `collab start` never waits for it — the check runs beside the room
+UPDATE_ROOM_WAIT = 60  # seconds for the room this start opens to be up before its deliverer is restarted
+
+
+def release_of(tag: str) -> tuple[int, ...] | None:
+    found = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+    return tuple(int(n) for n in found.groups()) if found else None
+
+
+def release_text(release: tuple[int, ...]) -> str:
+    return ".".join(map(str, release))
+
+
+def update_source() -> tuple[Path | None, str]:
+    """The clone to update from, or None and why there is none."""
+    inst = paths()
+    if inst.safe_copies.resolve() not in Path(SELF).resolve().parents:
+        return None, "this collab is not the installed copy — a --dev install is updated with git pull in its clone"
+    source = read_private(inst.source_file)
+    if not source or not (Path(source) / "collab").is_file() or not (Path(source) / ".git").exists():
+        return None, "the git clone collab was installed from is not found — install again from a clone"
+    return Path(source), ""
+
+
+# Fetched releases are kept under a name of their own: a tag made in the clone itself is not a release.
+UPDATE_REFS = "refs/collab-update/"
+# Releases come only from collab-room's own repository. COLLAB_UPDATE_ORIGIN names one more (a mirror
+# of the person's own, the tests' local one): set in the person's environment, it is their choice.
+OUR_ORIGIN = re.compile(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)ManuAmigo/collab-room(?:\.git)?/?")
+
+
+def our_origin(origin: str) -> bool:
+    return bool(OUR_ORIGIN.fullmatch(origin)) or (bool(origin) and origin == os.environ.get("COLLAB_UPDATE_ORIGIN"))
+
+
+def codex_reaches(source: Path) -> str:
+    """Who could change the clone the update installs from — the update runs what is there outside any
+    sandbox, so a clone a Codex may write would be the very way out the read-only copy closes. "" if no one."""
+    real = os.path.realpath(source)
+    if in_temp_folder(real):
+        return "it is in a temporary folder, where a Codex may write"
+    roots = codex_writable_roots()
+    if roots is None:
+        return "Codex's config cannot be read to tell where a Codex may write"
+    places = [(f"Codex may write {tilde(str(r))} (writable_roots)", str(r)) for r in roots]
+    places += [(f"{who} works in {tilde(folder)}", folder) for who, folder in codex_workplaces()]
+    # By spelling, case-folded on macOS (its disks ignore case), and by file identity — as for the copies.
+    fold = (lambda x: x.casefold()) if sys.platform == "darwin" else (lambda x: x)
+    for why, folder in places:
+        there = os.path.realpath(os.path.expanduser(folder))
+        a, b = fold(real), fold(there)
+        if a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a + "/"):
+            return why
+        if os.path.exists(there) and (
+            os.path.samefile(real, there) or _inside(real, there) or _inside(there, real)
+        ):
+            return why
+    return ""
+
+
+def git_in(source: Path, *args: str, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+    """git in the person's clone, never asking anything: a password or host-key question in a check
+    that runs beside the room would wait for no one. None of the clone's own hooks or helpers run."""
+    env = os.environ | {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    safe = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.ext.allow=never"]
+    return subprocess.run(
+        ["git", *safe, "-C", str(source), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def run_update(source: Path) -> tuple[str, str]:
+    """Fetch the clone's origin; a newer release: move the clone to it and install it. (outcome, line):
+    outcome is «current», «offline» (no answer — said to no one), «blocked» or «updated»."""
+    reach = codex_reaches(source)
+    git_dir = source / ".git"
+    if not reach and (git_dir.is_symlink() or not git_dir.is_dir()):
+        # A .git file or link leads to a git folder elsewhere — whose hooks and refs the check above never saw.
+        reach = "its .git is not a folder inside it"
+    # The URL git fetches from (insteadOf applied), and then that very URL is what is fetched.
+    origin = git_in(source, "remote", "get-url", "origin").stdout.strip()
+    if not reach and not our_origin(origin):
+        reach = f"its origin {origin or '(none)'} is not collab-room's repository"
+    if not reach and origin and (origin.startswith("file://") or not re.match(r"[a-z][a-z0-9+.-]*://|[^/:]+:", origin)):
+        # A path for origin: the releases come from that folder — the same question for it.
+        reach = codex_reaches(source / os.path.expanduser(origin.removeprefix("file://")))
+    if reach:
+        return "blocked", (
+            f"collab is not updated by itself from {tilde(str(source))}: {reach} — update by hand when you "
+            f"have looked at it: git pull there, then python3 {shlex.quote(str(source / 'collab'))} install"
+        )
+    try:
+        fetched = git_in(
+            source,
+            "fetch",
+            "--quiet",
+            "--prune",
+            "--no-tags",
+            origin,
+            f"+refs/tags/v*:{UPDATE_REFS}v*",
+            timeout=UPDATE_FETCH_WAIT,
+        )
+    except subprocess.TimeoutExpired:
+        return "offline", f"no answer from the clone's origin in {UPDATE_FETCH_WAIT} s"
+    if fetched.returncode:
+        return "offline", (fetched.stderr.strip().splitlines() or ["git fetch failed"])[-1]
+    fetched_tags = git_in(source, "for-each-ref", "--format=%(refname:strip=2)", UPDATE_REFS).stdout.split()
+    releases = [r for r in map(release_of, fetched_tags) if r]
+    mine = release_of("v" + VERSION) or (0, 0, 0)
+    if not releases or max(releases) <= mine:
+        return "current", f"collab {VERSION} is the newest"
+    newest = release_text(max(releases))
+    by_hand = (
+        f"update it by hand: git pull in {tilde(str(source))}, then python3 {shlex.quote(str(source / 'collab'))} install"
+    )
+    if git_in(source, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+        return "blocked", f"collab {newest} is out, not installed: your clone has changes of its own — {by_hand}"
+    release = git_in(source, "rev-parse", "--verify", "-q", f"{UPDATE_REFS}v{newest}^{{commit}}").stdout.strip()
+    before = git_in(source, "rev-parse", "HEAD").stdout.strip()
+    if git_in(source, "merge", "--ff-only", "--quiet", release).returncode:
+        return "blocked", f"collab {newest} is out, not installed: your clone has commits of its own — {by_hand}"
+
+    def back(why: str) -> tuple[str, str]:
+        # The clone goes back to where it was: what runs and what the clone holds stay one version.
+        git_in(source, "reset", "-q", "--keep", before)
+        return "blocked", f"collab {newest} is out, not installed: {why} — {by_hand}"
+
+    # Whole before it replaces anything: the clone holds exactly the release's commit (git checks every
+    # object by its hash), and its collab runs and says it is that release.
+    if (
+        git_in(source, "rev-parse", "HEAD").stdout.strip() != release
+        or git_in(source, "diff", "--quiet", release, "--").returncode
+    ):
+        return back("the clone does not hold the release as it was published")
+    said = subprocess.run([sys.executable, str(source / "collab"), "--version"], capture_output=True, text=True, timeout=60)
+    if said.stdout.strip() != f"collab {newest}":
+        return back(f"its collab says {said.stdout.strip()[:40] or 'nothing'!r}, not «collab {newest}»")
+    link = read_private(paths().installed_file)
+    command = [sys.executable, str(source / "collab"), "install"] + (["--bin-dir", str(Path(link).parent)] if link else [])
+    was = installed_collab()
+    # No terminal: install asks nothing (the Codex consent stays as the person answered it).
+    done = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600)
+    failed = [x.strip() for x in done.stdout.splitlines() if x.strip().startswith("✗")] or [done.stderr.strip()[-200:]]
+    if installed_collab() == was:
+        # The command was not replaced (install swaps it in one step, or not at all): the old one runs on.
+        return back(f"its install did not complete ({failed[0]})")
+    if done.returncode:
+        return "updated", f"collab updated from {VERSION} to {newest}; install also said: {failed[0]}"
+    return "updated", f"collab updated from {VERSION} to {newest}."
+
+
+def update_in_background(root: str) -> None:
+    """`collab start`: look for a newer collab beside the room — the start never waits for the network.
+    Not from a --dev install, not when switched off."""
+    inst = paths()
+    if os.environ.get("COLLAB_NO_UPDATE") or inst.update_off.exists() or update_source()[0] is None:
+        return
+    private_dir(inst.update_state.parent, strict=False)
+    with open(inst.update_state.with_suffix(".log"), "ab") as log:
+        subprocess.Popen(
+            [sys.executable, SELF, "update", "--auto", "--after", str(os.getpid()), "--room", root],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,  # not the start's: its Ctrl+C or its terminal closing do not end an install midway
+        )
+
+
+def wait_for_room(session: str, starter: int) -> bool:
+    """The room this start opens is up: its deliverer's window is there (made last, before attach).
+    False when it is not coming: no session, and the start that ran this check has ended (or there was none)."""
+    deadline = time.monotonic() + UPDATE_ROOM_WAIT
+    while time.monotonic() < deadline:
+        if tmux("list-panes", "-t", f"={session}:=deliver", check=False).returncode == 0:
+            return True
+        if tmux("has-session", "-t", f"={session}", check=False).returncode and not process_alive(starter):
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def auto_update(starter: int) -> None:
+    """The check `collab start` runs beside the room. One at a time; what it found goes to the room's
+    people once — an update every start, a refusal once per new version; no network is said to no one.
+    After an update the room's deliverer and the Codex rules move to the new copy: `collab start` of the
+    new copy, in the running room (the chat and the agents stay; each says when it runs older code)."""
+    inst = paths()
+    source, _ = update_source()
+    if source is None:
+        return
+    import fcntl
+
+    with open(inst.update_state.with_suffix(".lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return  # another room's start is updating already
+        outcome, line = run_update(source)
+        try:
+            told = json.loads(inst.update_state.read_text(encoding="utf-8")).get("told", "")
+        except (OSError, ValueError, AttributeError):
+            told = ""
+        tell = outcome == "updated" or (outcome == "blocked" and line != told)
+        state = {"at": now(), "outcome": outcome, "line": line, "told": line if tell else told}
+        write_private(inst.update_state, json.dumps(state, ensure_ascii=False))
+    if not tell:
+        return
+    config = config_now()
+    append_message(ROOM, people_ids(config), line)
+    link = read_private(inst.installed_file)
+    session = config.get("session", "collab-room")
+    if outcome == "updated" and link and wait_for_room(session, starter):
+        env = os.environ | {"COLLAB_NO_ATTACH": "1", "COLLAB_NO_UPDATE": "1"}
+        rp = room().paths
+        subprocess.run(
+            [sys.executable, link, "start", "--room", str(rp.root)], env=env, capture_output=True, stdin=subprocess.DEVNULL
+        )
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    """`collab update`: now, in this terminal; --off / --on: the update at `collab start`."""
+    inst = paths()
+    if args.off:
+        write_private(inst.update_off, now())
+        print("The update at collab start is off. `collab update` still updates when you run it; --on turns it back on.")
+        return
+    if args.on:
+        inst.update_off.unlink(missing_ok=True)
+        print("The update at collab start is on: each start looks for a newer collab and installs it.")
+        return
+    if args.auto:
+        auto_update(args.after)
+        return
+    source, why = update_source()
+    if source is None:
+        fail(why)
+    outcome, line = run_update(source)
+    print(line)
+    if outcome == "updated":
+        print("Running rooms keep the old code: `collab start` in a room moves its delivery; /restart an agent, reopen a chat.")
+    elif outcome in ("blocked", "offline"):
+        raise SystemExit(1)
 
 
 def cmd_install(args: argparse.Namespace) -> None:
@@ -4350,6 +4920,9 @@ from typing import Any, Callable, TypeVar, cast
 # task it went to»). Primary are the append-only files — tasks.jsonl, usage.jsonl (here), merge-log.jsonl
 # the SQLite base is derived from them, built anew for each report, and asked by queries.
 USAGE_FIELDS = ("input", "output", "cache_read", "cache_write")
+# Answers of the model in the stretch and the longest context of one (input + cache read + cache write):
+# what /clear and a cheaper model change. A line from before them has neither — 0.
+ANSWER_FIELDS = ("answers", "ctx_max")
 
 
 def usage_path() -> Path:
@@ -4377,7 +4950,7 @@ def usage_line(
         "task_by": task.get("by") if task else None,
         "split": bool(split),
     }
-    for name in USAGE_FIELDS:
+    for name in (*USAGE_FIELDS, *ANSWER_FIELDS):
         line[name] = int(entry.get(name) or 0)
     return line
 
@@ -4407,7 +4980,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 SCHEMA = """
 CREATE TABLE usage (at TEXT, pid TEXT, agent TEXT, agent_kind TEXT, model TEXT, effort TEXT, t_from TEXT,
     t_to TEXT, input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER, wakeups INTEGER,
-    task TEXT, task_kind TEXT, lane TEXT, task_by TEXT, split INTEGER);
+    task TEXT, task_kind TEXT, lane TEXT, task_by TEXT, split INTEGER, answers INTEGER, ctx_max INTEGER);
 CREATE TABLE task_events (at TEXT, event TEXT, pid TEXT, task TEXT, kind TEXT, lane TEXT, by TEXT, commit_sha TEXT);
 CREATE TABLE runs (at TEXT, by TEXT, what TEXT, who TEXT, exit INTEGER, seconds REAL, red INTEGER, said TEXT);
 """
@@ -4440,7 +5013,7 @@ def counts(u: dict[str, Any]) -> tuple[int, ...] | None:
     """A usage line's numbers, or None: a field that is not a count — not a number, below 0, past the limit —
     leaves the line out, as a broken line is — never the whole report."""
     out: list[int] = []
-    for name in (*USAGE_FIELDS, "wakeups"):
+    for name in (*USAGE_FIELDS, "wakeups", *ANSWER_FIELDS):
         v = u.get(name) or 0
         if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= TOKENS_LIMIT:
             return None
@@ -4465,11 +5038,12 @@ def build_base(
         with contextlib.closing(sqlite3.connect(tmp)) as db:
             db.executescript(SCHEMA)
             db.executemany(
-                "INSERT INTO usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         *(cell(u.get(k)) for k in ("at", "pid", "agent", "agent_kind", "model", "effort", "from", "to")),
-                        *n, *(cell(u.get(k)) for k in ("task", "task_kind", "lane", "task_by")), int(bool(u.get("split"))),
+                        *n[:5], *(cell(u.get(k)) for k in ("task", "task_kind", "lane", "task_by")), int(bool(u.get("split"))),
+                        *n[5:],
                     )
                     for u in usage
                     if (n := counts(u)) is not None
@@ -4506,24 +5080,31 @@ GROUPS = {"kind": "task_kind", "agent": "agent", "model": "model", "lane": "lane
 
 def report_rows(db: sqlite3.Connection, by: str, since: str = "") -> list[tuple[Any, ...]]:
     """Per group: tasks, tokens in, out, cache read, cache write, cache share of what was read, wakeups,
-    tokens per task — input + output + cache write; cache reads, cheap, are not in it. «(no task)» where
+    tokens per task — input + output + cache write; cache reads, cheap, are not in it; the model's answers,
+    the mean and the longest context of one — the mean over the lines that counted answers. «(no task)» where
     nothing was taken. `since` is compared as text with the journal's UTC times (2026-10-19, or with «+00:00»)."""
     column = GROUPS[by]
     query = f"""
         SELECT COALESCE({column}, '(no task)') AS g, COUNT(DISTINCT task), SUM(input), SUM(output), SUM(cache_read),
-               SUM(cache_write), SUM(wakeups)
+               SUM(cache_write), SUM(wakeups), SUM(answers), MAX(ctx_max),
+               SUM(CASE WHEN answers > 0 THEN input + cache_read + cache_write ELSE 0 END)
         FROM usage WHERE t_to >= ? GROUP BY g ORDER BY SUM(input + output + cache_write) DESC
     """
     rows: list[tuple[Any, ...]] = []
-    for g, tasks, inp, out, cread, cwrite, wakeups in db.execute(query, (since,)):
+    for g, tasks, inp, out, cread, cwrite, wakeups, answers, ctx_max, ctx_sum in db.execute(query, (since,)):
         read = inp + cread + cwrite
         share = round(100 * cread / read) if read else 0
         spent = inp + out + cwrite
-        rows.append((g, tasks, inp, out, cread, cwrite, f"{share}%", wakeups, round(spent / tasks) if tasks else spent))
+        per_task = round(spent / tasks) if tasks else spent
+        mean = round(ctx_sum / answers) if answers else 0
+        rows.append((g, tasks, inp, out, cread, cwrite, f"{share}%", wakeups, per_task, answers, mean, ctx_max))
     return rows
 
 
-HEADER = ("group", "tasks", "input", "output", "cache read", "cache write", "cache share", "wakeups", "per task")
+HEADER = (
+    "group", "tasks", "input", "output", "cache read", "cache write", "cache share", "wakeups", "per task",
+    "answers", "mean context", "max context",
+)  # fmt: skip
 
 
 def shown(v: object, fmt: str) -> str:
@@ -4551,8 +5132,27 @@ def render(rows: list[tuple[Any, ...]], fmt: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def unread_notes() -> list[str]:
+    """«<agent> (<kind>): no data — <why>» for each of the room's agents whose spending is not read."""
+    try:
+        config = read_config_raw()
+    except SystemExit:  # no room's settings: no agents to name
+        return []
+    notes: list[str] = []
+    for p in config.get("participants") or []:
+        if not isinstance(p, dict) or not any(k in p for k in ("idle", "busy", "attention")):
+            continue  # a person spends no tokens
+        p = cast("dict[str, Any]", p)
+        why = unread(p)
+        if why:
+            who = clean_field(str(p.get("label") or p.get("id")), 80)
+            notes.append(f"{who} ({agent_kind(p) or 'agent'}): no data — {why}")
+    return notes
+
+
 def report(by: str, since: str = "", fmt: str = "md") -> str:
-    """The base built anew from the room's files, asked, and the table returned."""
+    """The base built anew from the room's files, asked, and the table returned; in markdown, the agents
+    whose spending is not read under it (the csv stays a table: unread_notes gives them)."""
     rp = room().paths
     private_dir(rp.state_dir)
     rows = build_base(
@@ -4562,7 +5162,8 @@ def report(by: str, since: str = "", fmt: str = "md") -> str:
         read_jsonl(rp.state_dir / "merge-log.jsonl"),
         lambda db: report_rows(db, by, since),
     )
-    return render(rows, fmt)
+    notes = unread_notes() if fmt != "csv" else []
+    return render(rows, fmt) + "".join(f"\n{n}" for n in notes) + ("\n" if notes else "")
 
 
 def task_at(events: list[dict[str, Any]], pid: str, ts: str) -> dict[str, Any] | None:
@@ -4658,13 +5259,18 @@ from typing import Any
 
 
 
-def room_cmd(command: str, rest: str, cli: str = "") -> str:
+def room_cmd(command: str, rest: str, cli: str = "", pid: str = "") -> str:
     """A ready-to-run command for an agent: the room named by --room right after the command, so
     the line starts with «python3 …/collab <command>» and matches a narrow permission rule. `cli` —
     the agent's read-only copy, when its Codex rule names that copy."""
     rp = room().paths
     if cli:
-        return f"{' '.join(shlex.quote(x) for x in RULE_PYTHON)} {shlex.quote(cli)} {command} --room {shlex.quote(str(rp.root))} {rest}"
+        python = rule_python()
+        if pid:
+            check_codex_rule_python(pid, python)
+        return (
+            f"{' '.join(shlex.quote(x) for x in python)} {shlex.quote(cli)} {command} --room {shlex.quote(str(rp.root))} {rest}"
+        )
     return f"python3 {shlex.quote(SELF)} {command} --room {shlex.quote(str(rp.root))} {rest}"
 
 
@@ -4679,15 +5285,41 @@ UNSIGNED = (
 )
 
 
+# How long a Claude the room started has to tell its session before it is asked the connection check.
+CLAUDE_TELLS_SESSION = 60.0
+
+
 @room_locked
 def confirm_joins(config: dict[str, Any], messages: list[dict[str, Any]]) -> None:
-    """A pending participant becomes «подключён» on its first message after joining."""
+    """A pending participant becomes «подключён» on its first message after joining. A Claude the room
+    started is not asked: its window's process telling its own session is the proof (and how the room
+    continues it later) — the check woke it only to answer. A Codex is asked: its conversation is found
+    by that check in its log."""
+    home = Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser()
     for p in config["participants"]:
         if p.get("joined") != "pending":
             continue
         code = p.get("join_code", "")
-        if code and any(
-            m.get("from") == p["id"] and m.get("at", "") >= p.get("joined_at", "") and code in m.get("text", "") for m in messages
+        told = (
+            agent_kind(p) == "claude"
+            and p.get("started_by_room")
+            and bool(claude_of_window(home, p.get("target") or ""))
+        )
+        if not told and code and agent_kind(p) == "claude" and p.get("started_by_room"):
+            # No session told in time (an older Claude, a window that did not start it): asked as before.
+            late = time.time() - at_time(p.get("joined_at", "")) > CLAUDE_TELLS_SESSION
+            if late and not any(
+                m.get("from") == ROOM and m.get("to") == [p["id"]] and m.get("text") == ping_text(code)
+                for m in messages
+            ):
+                append_message(ROOM, [p["id"]], ping_text(code))
+        if (
+            told
+            or code
+            and any(
+                m.get("from") == p["id"] and m.get("at", "") >= p.get("joined_at", "") and code in m.get("text", "")
+                for m in messages
+            )
         ):
             data = read_config_raw()
             for q in data["participants"]:
@@ -4700,7 +5332,59 @@ def confirm_joins(config: dict[str, Any], messages: list[dict[str, Any]]) -> Non
                 # about working or ready: unknown until the agent's own hook or screen says.
                 if (read_status().get(p["id"]) or {}).get("state") == "joining":
                     _write_status(p["id"], "unknown", "", "self")
-            append_message(ROOM, ["all"], f"{p.get('label') or p['id']} connected.")
+            append_message(ROOM, ["all"], f"{p.get('label') or p['id']} connected.", silent=True)
+
+
+# Agents' messages to each other in a row with no word from a person: past it the room pauses and asks
+# the person. Each such message wakes an agent that reads its whole context again; two hours of agents
+# answering each other cost more than all the person's own work. The room's own is `talk_limit` in
+# .collab.json (0 — never): a team whose coordinator hands out work and gets reports reaches ten fast.
+TALK_LIMIT = 10
+
+
+def talk_path() -> Path:
+    return room().paths.state_dir / "talk.json"
+
+
+def talk_streak(messages: list[dict[str, Any]], config: dict[str, Any]) -> int:
+    """How many messages agents wrote to agents since the person last spoke (signed: a «from the person»
+    an agent wrote does not count as one) or the room was last resumed. A note to the person alone
+    and a quiet note wake no agent: not counted, and not a break either."""
+    people = people_ids(config)
+    since = str(read_json(talk_path()).get("since") or "")
+    n = 0
+    for m in reversed(messages):
+        if since and m.get("id") == since:
+            break
+        sender = m.get("from")
+        if sender in people and not unsigned_person(m, config):
+            break
+        to: list[Any] = m.get("to") or []
+        if sender == ROOM or sender in people or is_quiet(m, config):
+            continue
+        if any(t == "all" or (t not in people and t != ROOM) for t in to):
+            n += 1
+    return n
+
+
+def talk_reset() -> None:
+    """Counted again from the room's last message: the person resumed the room, the talk so far is theirs."""
+    last = read_messages()
+    write_json(talk_path(), {"since": last[-1]["id"] if last else ""})
+
+
+def pause_for_talk(config: dict[str, Any], n: int) -> None:
+    """The pause /pause sets, and one line to the people: why, and how to go on."""
+    data = read_config_raw()
+    data["paused"] = True
+    write_config(data)
+    tmux("set-option", "-t", f"={data.get('session', 'collab-room')}:", "@collab_paused", "1", check=False)
+    append_message(
+        ROOM,
+        people_ids(config),
+        f"Agents wrote {n} messages to each other in a row without you, each waking an agent with its whole "
+        "context. The room is paused: what they say waits. /resume lets them go on.",
+    )
 
 
 @room_locked
@@ -4721,6 +5405,12 @@ def post_message(args: argparse.Namespace, text: str) -> None:
         fail(f"no message {args.re} to reply to")
     check_name_is_mine(args.sender, config)
     quiet = bool(getattr(args, "quiet", False))
+    silent = bool(getattr(args, "silent", False))  # the room's own notes (merge queue): never typed
+    # The answer to the room's connection check is the room's to read: sent to everyone, it was typed into
+    # every other agent and woke each one. Told by the sender's own pending code, not by the words.
+    me = next((q for q in config["participants"] if q["id"] == args.sender), {})
+    code = me.get("join_code") if me.get("joined") == "pending" else ""
+    silent = silent or bool(code and isinstance(code, str) and f"connected {code}" in text)
     if quiet and args.re:
         # An answer is waited for by whoever asked: quiet, it waited for their next message — and an agent
         # with no task asks the room nothing. An answer always wakes.
@@ -4728,11 +5418,12 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     if config.get("paused") and args.sender not in people_ids(config):
         # Paused: agents must stop talking. What an agent still says is kept, not
         # lost, and goes out on resume.
-        held = {"from": args.sender, "to": to, "text": text.strip(), "re": args.re or "", "quiet": quiet}
+        held = {"from": args.sender, "to": to, "text": text.strip(), "re": args.re or "", "quiet": quiet, "silent": silent}
         write_state(rp.held_path, json.dumps(held, ensure_ascii=False) + "\n", append=True)
         print("Held: the room is paused; your message goes out when it resumes.")
         return
-    record = append_message(args.sender, to, text.strip(), args.re or "", quiet=quiet)
+    record = append_message(args.sender, to, text.strip(), args.re or "", quiet=quiet, silent=silent)
+    streak = 0 if args.sender in people_ids(config) else talk_streak(read_messages(), config)
     if args.re and any(m["id"] == args.re and is_for(m, args.sender) for m in read_messages()):
         # An answer is more than «read»: it closes the message in the answerer's inbox, as ack
         # would — answered ones hung there until a separate ack (22 of them).
@@ -4742,6 +5433,10 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     with contextlib.suppress(OSError, ValueError, KeyError, OperationFailed):
         bind_claude_session(args.sender)
     print(f"Queued {record['id']} from {args.sender} to {', '.join(to)}.")
+    limit = config.get("talk_limit", TALK_LIMIT)
+    if limit and streak >= limit:
+        pause_for_talk(config, streak)
+        print(f"Paused: agents wrote {streak} messages to each other without the person; wait for the person.")
 
 
 def waits_of(awaiting: dict[str, Any], pid: str) -> list[dict[str, Any]]:
@@ -4935,13 +5630,15 @@ _WINDOW_SESSION_SEEN: dict[str, float] = {}
 
 
 @room_locked
-def remember_window_session(p: dict[str, Any]) -> None:
-    """While a room-started Claude runs, keep the session its window's process records — what
-    /restart continues once the process is gone. Read at most every minute."""
+def remember_window_session(p: dict[str, Any], pane: str) -> None:
+    """While a Claude runs in a window delivery types into, keep the session its window's process
+    records — what /restart continues once the process is gone, and where its spending is read. Any
+    Claude in the room's tmux, not only one /add started: `init`'s example seats are opened by `start`,
+    and their spending went uncounted. Read at most every minute."""
     if time.time() - _WINDOW_SESSION_SEEN.get(p["id"], 0) < 60:
         return
     _WINDOW_SESSION_SEEN[p["id"]] = time.time()
-    sid = claude_of_window(Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser(), p.get("target") or "")
+    sid = claude_of_window(Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser(), pane)
     if not SESSION_ID.fullmatch(sid) or sid == p.get("window_session"):
         return
     data = read_config_raw()
@@ -4954,8 +5651,8 @@ def remember_window_session(p: dict[str, Any]) -> None:
 def deliver_one(p: dict[str, Any], pane: str, config: dict[str, Any], messages: list[dict[str, Any]]) -> str:
     """One participant's tick: its state from the screen, a limit, a wait for its answer, a message."""
     rp = room().paths
-    if p.get("started_by_room") and agent_kind(p) == "claude":
-        remember_window_session(p)
+    if agent_kind(p) == "claude":
+        remember_window_session(p, pane)
     rules = screen_rules(p)
     # One tmux call per agent a tick: its state, its window's check, its model,
     # its background commands and a limit are read off this one look. What is typed is still looked at
@@ -5040,14 +5737,14 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
     # The room is named in the command itself: an agent working in another folder (or with
     # another room in its COLLAB_ROOT) must still answer here.
     if m["from"] == ROOM:
-        hint = "reply in room: " + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""))
+        hint = "reply in room: " + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), p["id"])
     else:
         # Both ways to close it, ready to run.
         hint = (
             "answer: "
-            + room_cmd("say", f"--from {p['id']} --to {m['from']} --re {m['id']} {reply_body(p)}", p.get("cli", ""))
+            + room_cmd("say", f"--from {p['id']} --to {m['from']} --re {m['id']} {reply_body(p)}", p.get("cli", ""), p["id"])
             + " · if no answer is needed: "
-            + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""))
+            + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"])
         )
     warn = (UNSIGNED + " ") if unsigned_person(m, config) else ""
     body = " ".join(body_text(m["text"]).split())  # no head of another inside
@@ -5059,7 +5756,7 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
         # read-only copy — `show` there was refused. inbox prints it in full.
         body = (
             f"(long message, {len(body)} characters — read it in full: "
-            + room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""))
+            + room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"])
             + ")"
         )
     return f"[{m['from']} → {', '.join(m['to'])}] {warn}{body}" + (f"  ({hint})" if p.get("reply_hint", True) else "")
@@ -5099,6 +5796,13 @@ def is_quiet(m: dict[str, Any], config: dict[str, Any]) -> bool:
     return m.get("quiet") is True and m.get("from") not in (ROOM, *people_ids(config))
 
 
+def is_silent(m: dict[str, Any], config: dict[str, Any]) -> bool:
+    """The room's own notes — «X connected», the merge queue's «waits», «merged», «stopped»: never typed to
+    an agent. Each typing wakes it, and a wake re-reads its whole context; the note stays in its inbox and
+    in the person's chat. A person's letter is never silent."""
+    return m.get("silent") is True and m.get("from") not in people_ids(config)
+
+
 def digest_order(pending: list[dict[str, Any]], config: dict[str, Any]) -> list[dict[str, Any]]:
     """The room's own notes (the merge queue, «merged») and what the person signed come first; quiet
     notes last; the rest in the log's order. The order is the room's to give, never a sender's: a word
@@ -5124,7 +5828,9 @@ def digest_text(p: dict[str, Any], pending: list[dict[str, Any]], config: dict[s
         # The sender by its id, as one message shows it: a name is the agent's own to set, and
         # «Room», «claude-5» or the person's name there read as someone else.
         parts.append(f"{mark}{m['from']}: «{words}…» (id {m['id']})")
-    read = room_cmd("inbox", f"--for {p['id']}" + (f" --limit {len(pending)}" if len(pending) > 50 else ""), p.get("cli", ""))
+    read = room_cmd(
+        "inbox", f"--for {p['id']}" + (f" --limit {len(pending)}" if len(pending) > 50 else ""), p.get("cli", ""), p["id"]
+    )
     # No ready answer here, only words: a command with a slot for the body is the shell-injection hole of reply_body back.
     answer = " — answer each with say --re <id>, or close it with ack --no-reply --id <id>"
     hint = f"read them all: {read}" + (answer if p.get("reply_hint", True) else "")
@@ -5139,6 +5845,42 @@ def digest_text(p: dict[str, Any], pending: list[dict[str, Any]], config: dict[s
             + f" · and {len(pending) - len(parts)} more"
         )
     return f"{text}  ({hint})"
+
+
+def clear_dir() -> Path:
+    return room().paths.state_dir / "clear-after-merge"
+
+
+def clear_after_merge(pid: str, commit: str) -> None:
+    """What an agent landed through the merge queue is in main: at its next idle moment it is given /clear,
+    and the next task does not re-read the last one's history on every wake."""
+    write_set(clear_dir(), pid, read_set(clear_dir(), pid) | {commit})
+
+
+def wants_clear(p: dict[str, Any]) -> bool:
+    """Only a Claude: a Codex's conversation is found by its connection check in its log, and a new one
+    has none — /restart would lose it."""
+    return agent_kind(p) == "claude" and bool(read_set(clear_dir(), p["id"]))
+
+
+def clear_agent(p: dict[str, Any], pane: str) -> str:
+    """/clear typed as a message is: not into a scrolled window, only while idle, only into its own process."""
+    if tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}", check=False).stdout.strip() == "1":
+        return ""
+    if screen_state(screen_rules(p), pane)[0] != "idle" or pane_guard(p, pane):
+        return ""
+    STOPPING["typing"] = True
+    sent = tmux("send-keys", "-t", pane, "-l", "/clear", check=False)
+    if sent.returncode == 0:
+        time.sleep(float(os.environ.get("COLLAB_ENTER_DELAY", "0.3")))
+        sent = tmux("send-keys", "-t", pane, "Enter", check=False)
+    STOPPING["typing"] = False
+    if sent.returncode != 0:
+        stop_if_asked()
+        return ""
+    write_set(clear_dir(), p["id"], set())
+    stop_if_asked()
+    return f"cleared {p['id']}"
 
 
 @room_locked
@@ -5159,10 +5901,18 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any])
             delivered |= {m["id"] for m in pending if m["id"] in closed}
             write_set(rp.delivered_dir, p["id"], delivered)
             pending = [m for m in pending if m["id"] not in closed]
+        # The room's own notes are never typed: marked delivered at once, they stay in inbox.
+        silent = {m["id"] for m in pending if is_silent(m, config)}
+        if silent:
+            delivered |= silent
+            write_set(rp.delivered_dir, p["id"], delivered)
+            pending = [m for m in pending if m["id"] not in silent]
         if p.get("muted"):
             # Muted hears only what is addressed to it by name: a muted agent
             # still sees and answers a direct message; room-wide talk passes it by.
             pending = [m for m in pending if p["id"] in m.get("to", [])]
+        if state == "idle" and all(is_quiet(m, config) or not well_formed(m) for m in pending) and wants_clear(p):
+            return clear_agent(p, pane)  # a landing done and nothing to say: the history goes
         if not pending or state != "idle" or all(is_quiet(m, config) or not well_formed(m) for m in pending):
             # Only quiet notes waiting: the agent is not woken for them — each wake re-reads its whole
             # context. They wait in its inbox and go with the next
@@ -5370,11 +6120,12 @@ def add_participant(entry: dict[str, Any]) -> None:
 
 # Whether a codex program's own help names --no-daemon, by its path, its file and the subcommand.
 _NO_DAEMON: dict[tuple[str, ...], bool] = {}
+CODEX_HELP_WAIT = 3  # seconds a codex has to answer `--help` before it is taken not to know --no-daemon
 
 
 def codex_knows_no_daemon(program: str, sub: list[str]) -> bool:
     """Does this codex (or its `resume`) take --no-daemon? Its own help says — nothing else is run.
-    Not said, or no answer in 3 seconds: no, and it starts as before rather than not at all."""
+    Not said, or no answer in CODEX_HELP_WAIT seconds: no, and it starts as before rather than not at all."""
     try:
         st = os.stat(program)
     except OSError:
@@ -5382,7 +6133,9 @@ def codex_knows_no_daemon(program: str, sub: list[str]) -> bool:
     key = (program, *sub, str(st.st_mtime_ns), str(st.st_size))
     if key not in _NO_DAEMON:
         try:
-            r = subprocess.run([program, *sub, "--help"], capture_output=True, text=True, timeout=3, stdin=subprocess.DEVNULL)
+            r = subprocess.run(
+                [program, *sub, "--help"], capture_output=True, text=True, timeout=CODEX_HELP_WAIT, stdin=subprocess.DEVNULL
+            )
             _NO_DAEMON[key] = r.returncode == 0 and any(line.split()[:1] == ["--no-daemon"] for line in r.stdout.splitlines())
         except (OSError, subprocess.SubprocessError):
             _NO_DAEMON[key] = False
@@ -5407,7 +6160,6 @@ def agent_command(kind: str, resume: list[str] | None = None) -> str:
 @room_locked
 def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str) -> str:
     """Start an agent in its own window of the room's tmux session and register it."""
-    inst = paths()
     # The id and the name by the room's file as it is now, under its lock — not the chat's copy: two
     # /add at once (two chats, or /add and a join) got one id, and add_participant replaced the first
     # The session too: `start --session` writes it there, a chat started before kept the
@@ -5417,7 +6169,9 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str)
     if label_taken(fresh, "", label):
         raise SystemExit("that is already someone else's name here")
     pid = slug(label, ids_of(fresh), kind)
-    cli = codex_room_rule(pid, folder) if kind == "codex" else ""  # before it starts: Codex reads rules at start
+    cli = (
+        codex_room_rule(pid, folder, label) if kind == "codex" else ""
+    )  # before it starts: Codex reads rules at start
     pane = ""
     try:
         out = tmux(
@@ -5466,24 +6220,8 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str)
                 set_agent_rule(spelling, pid, "")
         raise
     write_status(pid, "joining", "", "self")
-    append_message(ROOM, [pid], ping_text(code))
-    if kind == "codex" and not cli and inst.codex_consent.exists():
-        # The person agreed at install, yet this Codex asks before every reply — say
-        # why (nothing silently). No rule is the safe answer; it stays that way.
-        if codex_writable_roots() is None:
-            why = f"Codex's settings {inst.codex_home / 'config.toml'} could not be read for sure"
-        elif not trusted_interpreter(sys.executable):
-            why = (
-                f"this collab runs on {sys.executable}, which lies where an agent could change it "
-                "(run collab install to use a Python installed outside your home folder)"
-            )
-        else:
-            why = "Codex may write to files its permission would rely on (collab, its Python or the room's folder)"
-        append_message(
-            ROOM,
-            people_ids(config),
-            f"{label} will ask you before each room reply: {why}, so no permission was given.",
-        )
+    if kind != "claude":  # a Claude tells its session itself (confirm_joins); a Codex is asked
+        append_message(ROOM, [pid], ping_text(code))
     return pid
 
 
@@ -6057,7 +6795,8 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
             q.update({"cli": cli} if cli else {})
     write_config(data)
     write_status(p["id"], "joining", "", "self")
-    append_message(ROOM, [p["id"]], ping_text(code))
+    if kind != "claude":  # a Claude tells its session itself (confirm_joins); a Codex is asked
+        append_message(ROOM, [p["id"]], ping_text(code))
     return pane
 
 
@@ -6138,7 +6877,8 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str) -> s
             q.update({"cli": cli} if cli else {})
     write_config(data)
     write_status(p["id"], "joining", "", "self")
-    append_message(ROOM, [p["id"]], ping_text(code))
+    if kind != "claude":  # a Claude tells its session itself (confirm_joins); a Codex is asked
+        append_message(ROOM, [p["id"]], ping_text(code))
     return pane
 
 import argparse
@@ -6286,6 +7026,7 @@ def start_deliverer(session: str) -> None:
             f"={session}:=deliver",
             "-c",
             tmux_dir(str(rp.root)),
+            *pane_env(),
             in_dir(str(rp.root), cmd),
             check=False,
         )
@@ -6299,6 +7040,7 @@ def start_deliverer(session: str) -> None:
             "deliver",
             "-c",
             tmux_dir(str(rp.root)),
+            *pane_env(),
             in_dir(str(rp.root), cmd),
             check=False,
         )
@@ -6351,7 +7093,7 @@ def restore_owner_pane(session: str, config: dict[str, Any]) -> None:
     pane = data.get("panes", {}).get(owner["id"])
     if pane and tmux("list-panes", "-t", pane, check=False).returncode == 0:
         return
-    cmd = list(owner["command"])
+    cmd = current_chat_command(owner["command"])
     cmd[0] = shutil.which(cmd[0]) or cmd[0]
     out = tmux(
         "new-window",
@@ -6408,8 +7150,11 @@ def set_paused(paused: bool) -> None:
                     h["text"],
                     h.get("re", "") if isinstance(h.get("re"), str) else "",
                     quiet=h.get("quiet") is True,
+                    silent=h.get("silent") is True,
                 )
         rp.held_path.unlink()
+    if not paused:
+        talk_reset()  # the person let the talk go on: counted anew, or the next word paused again
 
 
 def cmd_pause(args: argparse.Namespace) -> None:
@@ -6748,7 +7493,7 @@ def open_room_windows(
         # `codex` than the one it found (a test launched the real Codex that way).
         program = ""
         if p.get("command"):
-            cmd = list(p["command"])
+            cmd = current_chat_command(p["command"])
             cmd[0] = shutil.which(cmd[0]) or cmd[0]
             program = " ".join(shlex.quote(x) for x in cmd)
         run_cmd = [in_dir(cwd, program)]
@@ -6808,6 +7553,9 @@ def cmd_start(args: argparse.Namespace) -> None:
     rp = room().paths
     if shutil.which(TMUX) is None:
         fail(f"tmux is required: {tmux_install_hint()}, and run `collab start` again")
+    venv = leave_venv()
+    if venv:
+        print(f"The active venv {tilde(venv)} is left out of the room: its windows run without it.")
     owner_key(create=True)  # installed before this feature or removed: the room makes its own
     if not all(c.isprintable() for c in str(rp.root)):
         # The room's path is in every hint typed into an agent's window: a «\r» in a folder's name pressed
@@ -6827,6 +7575,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         rp = room().paths
     record_room_root()
     refresh_codex_rules()
+    update_in_background(str(rp.root))
     config = load_config()
     if not tmux_can_read(rp.root):
         fail(
@@ -7061,6 +7810,10 @@ class ChatState:
     bar: str = ""
     menu_line: str = ""
     extra_rows: int = 0
+    # The size the fixed area was laid out for (setup): a resize after it, before the feed's thread
+    # began, was never seen — tmux resets the scroll region on a resize, and the feed scrolled the
+    # whole window over the input.
+    laid: tuple[int, int] = (0, 0)
     viewing: Any = None
     reading: Any = None
     top: Any = None
@@ -8957,7 +9710,7 @@ def chat_fold_into_dm(ctx: ChatFeedContext, m: dict[str, Any]) -> bool:
 
 
 def chat_pump(ctx: ChatFeedContext) -> None:
-    last_bar, last_rows = None, (ctx.rows(), shutil.get_terminal_size((100, 24)).columns)
+    last_bar, last_rows = None, ctx.ui.laid
     said: set[str] = set()  # each trouble once, not every tick
 
     def trouble(text: str) -> None:
@@ -9533,6 +10286,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         border_title(BORDER_CHAT.format(room=rp.root.name.lstrip(".") or rp.root.name))
         h = rows()
         sys.stdout.write("\n" * 3 + f"\033[1;{h - 3}r")
+        ui.laid = (h, shutil.get_terminal_size((100, 24)).columns)
         # The /dm panel beside it puts its rule and input on the chat's own rows («the
         # input and the output on one level»): it reads how many rows lie under the chat's rule.
         if os.environ.get("TMUX_PANE"):
@@ -10755,6 +11509,9 @@ GIT_TIMEOUT = 30
 def cmd_usage_report(args: argparse.Namespace) -> None:
     """The spending to plan by, from the room's own files — by task kind, agent, model, lane, task."""
     print(report(args.by, args.since or "", args.format), end="")
+    if args.format == "csv":  # the table stays a table; who has no data — beside it
+        for note in unread_notes():
+            print(note, file=sys.stderr)
 
 
 def cmd_report(args: argparse.Namespace) -> None:
@@ -10837,6 +11594,7 @@ def interval_seconds(text: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     """Every command and its options; --room is added to each one that lacks it."""
     ap = argparse.ArgumentParser(prog="collab", description="Local room for people and AI agents; any number of participants.")
+    ap.add_argument("--version", action="version", version=f"collab {VERSION}")
     sub = ap.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("init", help="create .collab.json with a sample team")
@@ -10846,7 +11604,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_init)
 
     s = sub.add_parser("install", help="one-time setup: collab command, Claude Code plugin, Codex skill")
-    s.add_argument("--bin-dir", help="where to put the collab command (default: ~/.local/bin, made if missing; install says how to add it to PATH)")
+    s.add_argument(
+        "--bin-dir",
+        help="where to put the collab command (default: ~/.local/bin, made if missing; install says how to add it to PATH)",
+    )
     s.add_argument("--dry-run", action="store_true", help="show what would be done")
     s.add_argument(
         "--dev",
@@ -10862,6 +11623,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-codex-room-commands", action="store_true", help="withdraw that: forget the consent and remove every rule it gave"
     )
     s.set_defaults(func=cmd_install)
+
+    s = sub.add_parser("update", help="install a newer collab now, from the clone it was installed from")
+    s.add_argument("--off", action="store_true", help="turn off the update at collab start (it fetches the clone's origin)")
+    s.add_argument("--on", action="store_true", help="turn the update at collab start back on")
+    s.add_argument("--auto", action="store_true", help=argparse.SUPPRESS)  # what collab start runs beside the room
+    s.add_argument("--after", type=int, default=0, help=argparse.SUPPRESS)  # the start that runs it
+    s.set_defaults(func=cmd_update)
 
     s = sub.add_parser("start", help="first time: create the room here; then open it (agents, delivery, chat)")
     s.add_argument("--session")
@@ -10912,7 +11680,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--quiet", action="store_true", help="no banner line (for agents that turn each line into an event)")
     s.set_defaults(func=cmd_watch)
 
-    s = sub.add_parser("dm", help="the direct-conversation panel beside the chat (open it with /dm in the chat; not secret: the room log holds it)")
+    s = sub.add_parser(
+        "dm",
+        help="the direct-conversation panel beside the chat (open it with /dm in the chat; not secret: the room log holds it)",
+    )
     s.add_argument("--as", dest="as_", required=True)
     s.add_argument("--interval", type=interval_seconds, default=0.5)
     s.set_defaults(func=cmd_dm)
@@ -11002,7 +11773,8 @@ def build_parser() -> argparse.ArgumentParser:
     usage = s.add_subparsers(dest="usage_cmd", required=True)
     u = usage.add_parser(
         "report",
-        help="a table to plan by: spending per task kind, agent, model, lane or task (per task: in + out + cache write)",
+        help="a table to plan by: spending per task kind, agent, model, lane or task (per task: in + out + cache write;"
+        " answers: the model's; context: of one answer, mean and max)",
     )
     u.add_argument("--by", choices=sorted(GROUPS), default="kind")
     u.add_argument(

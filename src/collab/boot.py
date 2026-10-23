@@ -55,6 +55,9 @@ class InstallPaths:
     # is a copy that never changes, and comparing with it, the chat never knew it was old.
     installed_file: Path
     source_file: Path
+    # The update at start: the switch that turns it off, and what the last one found (told once).
+    update_off: Path
+    update_state: Path
     invites: Path
     welcomed_path: Path
     owner_key: Path  # the person's signing key — see UNSIGNED
@@ -77,6 +80,8 @@ class InstallPaths:
             safe_copies=Path(os.environ.get("COLLAB_SAFE_DIR", "~/.local/share/collab-room")).expanduser(),
             installed_file=home / ".collab-room" / "installed",
             source_file=home / ".collab-room" / "source",
+            update_off=home / ".collab-room" / "no-auto-update",
+            update_state=home / ".collab-room" / "update.json",
             invites=invites,
             welcomed_path=invites.parent / "welcomed",
             owner_key=invites.parent / "owner.key",
@@ -101,6 +106,11 @@ def install() -> Install:
 def paths() -> InstallPaths:
     """Read once per operation: `p = paths()`, then p.… to its end."""
     return _INSTALL.paths
+
+
+# The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
+# raises it — the publishing refuses a version that is already released.
+VERSION = "0.1.0"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -159,33 +169,58 @@ def _link_folder_kept(folder: str) -> bool:
 def trusted_interpreter(path: str) -> bool:
     """A Python we may run as the person: its real file, not inside a virtual environment (a project's
     .venv is where an agent writes), regular, safe mode. Checked before it is ever run."""
+    return not interpreter_refused(path)
+
+
+def _mode_refused(path: str, st: os.stat_result, group_may_write: bool) -> str:
+    """Why _safe_mode refuses it, and the command that fixes it; "" — it does not."""
+    if _safe_mode(st, group_may_write):
+        return ""
+    if st.st_uid not in (os.getuid(), 0):
+        return f"it belongs to another user (uid {st.st_uid})"
+    if st.st_mode & stat.S_IWOTH:
+        return f"anyone may change it; fix: sudo chmod o-w {path}"
+    return f"its group may change it; fix: sudo chmod g-w {path}"
+
+
+def interpreter_refused(path: str) -> str:
+    """Why a Python is not one we may run as the person ("" — it is), in words to show: install said
+    «not found» of three it refused for their group (root:wheel, writable by the group)."""
     real = os.path.realpath(path)
     # A Python by name: the pointer lies in home, and an agent allowed to write there could point it
     # at any program outside home — /bin/sh, osascript — run with the person's arguments.
     # A second line, not the border: a Codex that may write home already owns ~/.zshrc, ~/.claude and
     # the rest. The border is not letting Codex write home — and then no room rule is given.
     if not re.fullmatch(r"python3(\.\d+)?", os.path.basename(real)):
-        return False
+        return f"its real file {real} is not named python3"
     # Only one installed outside the home folder — the system's, python.org's, Homebrew's. What lies
     # in home (uv's, pyenv's, a project's .venv) an agent allowed to write there could change, and the
     # person's next collab would run it.
     if _inside(real, str(Path.home())):
-        return False
+        return "it is in your home folder, where an agent may write"
     if any(os.path.exists(os.path.join(p, "pyvenv.cfg")) for p in Path(real).parents):
-        return False
+        return "it is in a virtual environment"
     # Nor in a temporary folder: Codex writes /tmp and $TMPDIR by default, and no real Python lives there.
     if in_temp_folder(real):
-        return False
+        return "it is in a temporary folder"
     try:
         st = os.lstat(real)
     except OSError:
-        return False
+        return "it cannot be read"
     # Every folder above it, and every folder holding a link on the way to it: kept.
-    if not all(_folder_kept(str(folder)) for folder in Path(real).parents):
-        return False
-    if not all(_link_folder_kept(folder) for folder in link_folders(path)):
-        return False
-    return stat.S_ISREG(st.st_mode) and _safe_mode(st, group_may_write=True) and os.access(real, os.X_OK)
+    for folder in Path(real).parents:
+        if not _folder_kept(str(folder)):
+            return f"its folder {folder} may be changed by others"
+    for folder in link_folders(path):
+        if not _link_folder_kept(folder):
+            return f"the folder {folder} of a link on the way to it may be changed by others, or is in home"
+    if not stat.S_ISREG(st.st_mode):
+        return "it is not a regular file"
+    # The one exception, python.org's: root:admin with the group writing (_safe_mode); root:wheel is not.
+    why = _mode_refused(real, st, group_may_write=True)
+    if why:
+        return why
+    return "" if os.access(real, os.X_OK) else "it cannot be run"
 
 
 def link_folders(path: str) -> list[str]:

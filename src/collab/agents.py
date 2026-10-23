@@ -40,11 +40,12 @@ def add_participant(entry: dict[str, Any]) -> None:
 
 # Whether a codex program's own help names --no-daemon, by its path, its file and the subcommand.
 _NO_DAEMON: dict[tuple[str, ...], bool] = {}
+CODEX_HELP_WAIT = 3  # seconds a codex has to answer `--help` before it is taken not to know --no-daemon
 
 
 def codex_knows_no_daemon(program: str, sub: list[str]) -> bool:
     """Does this codex (or its `resume`) take --no-daemon? Its own help says — nothing else is run.
-    Not said, or no answer in 3 seconds: no, and it starts as before rather than not at all."""
+    Not said, or no answer in CODEX_HELP_WAIT seconds: no, and it starts as before rather than not at all."""
     try:
         st = os.stat(program)
     except OSError:
@@ -52,7 +53,9 @@ def codex_knows_no_daemon(program: str, sub: list[str]) -> bool:
     key = (program, *sub, str(st.st_mtime_ns), str(st.st_size))
     if key not in _NO_DAEMON:
         try:
-            r = subprocess.run([program, *sub, "--help"], capture_output=True, text=True, timeout=3, stdin=subprocess.DEVNULL)
+            r = subprocess.run(
+                [program, *sub, "--help"], capture_output=True, text=True, timeout=CODEX_HELP_WAIT, stdin=subprocess.DEVNULL
+            )
             _NO_DAEMON[key] = r.returncode == 0 and any(line.split()[:1] == ["--no-daemon"] for line in r.stdout.splitlines())
         except (OSError, subprocess.SubprocessError):
             _NO_DAEMON[key] = False
@@ -77,7 +80,6 @@ def agent_command(kind: str, resume: list[str] | None = None) -> str:
 @m_store.room_locked
 def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str) -> str:
     """Start an agent in its own window of the room's tmux session and register it."""
-    inst = m_boot.paths()
     # The id and the name by the room's file as it is now, under its lock — not the chat's copy: two
     # /add at once (two chats, or /add and a join) got one id, and add_participant replaced the first
     # The session too: `start --session` writes it there, a chat started before kept the
@@ -87,7 +89,9 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str)
     if m_store.label_taken(fresh, "", label):
         raise SystemExit("that is already someone else's name here")
     pid = m_text.slug(label, m_store.ids_of(fresh), kind)
-    cli = m_installer.codex_room_rule(pid, folder) if kind == "codex" else ""  # before it starts: Codex reads rules at start
+    cli = (
+        m_installer.codex_room_rule(pid, folder, label) if kind == "codex" else ""
+    )  # before it starts: Codex reads rules at start
     pane = ""
     try:
         out = m_tmuxio.tmux(
@@ -136,24 +140,8 @@ def launch_new_agent(config: dict[str, Any], kind: str, folder: str, label: str)
                 m_installer.set_agent_rule(spelling, pid, "")
         raise
     m_screen.write_status(pid, "joining", "", "self")
-    m_log.append_message(m_text.ROOM, [pid], m_screen.ping_text(code))
-    if kind == "codex" and not cli and inst.codex_consent.exists():
-        # The person agreed at install, yet this Codex asks before every reply — say
-        # why (nothing silently). No rule is the safe answer; it stays that way.
-        if m_installer.codex_writable_roots() is None:
-            why = f"Codex's settings {inst.codex_home / 'config.toml'} could not be read for sure"
-        elif not m_boot.trusted_interpreter(sys.executable):
-            why = (
-                f"this collab runs on {sys.executable}, which lies where an agent could change it "
-                "(run collab install to use a Python installed outside your home folder)"
-            )
-        else:
-            why = "Codex may write to files its permission would rely on (collab, its Python or the room's folder)"
-        m_log.append_message(
-            m_text.ROOM,
-            m_store.people_ids(config),
-            f"{label} will ask you before each room reply: {why}, so no permission was given.",
-        )
+    if kind != "claude":  # a Claude tells its session itself (confirm_joins); a Codex is asked
+        m_log.append_message(m_text.ROOM, [pid], m_screen.ping_text(code))
     return pid
 
 
@@ -727,7 +715,8 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
             q.update({"cli": cli} if cli else {})
     m_store.write_config(data)
     m_screen.write_status(p["id"], "joining", "", "self")
-    m_log.append_message(m_text.ROOM, [p["id"]], m_screen.ping_text(code))
+    if kind != "claude":  # a Claude tells its session itself (confirm_joins); a Codex is asked
+        m_log.append_message(m_text.ROOM, [p["id"]], m_screen.ping_text(code))
     return pane
 
 
@@ -808,5 +797,6 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str) -> s
             q.update({"cli": cli} if cli else {})
     m_store.write_config(data)
     m_screen.write_status(p["id"], "joining", "", "self")
-    m_log.append_message(m_text.ROOM, [p["id"]], m_screen.ping_text(code))
+    if kind != "claude":  # a Claude tells its session itself (confirm_joins); a Codex is asked
+        m_log.append_message(m_text.ROOM, [p["id"]], m_screen.ping_text(code))
     return pane

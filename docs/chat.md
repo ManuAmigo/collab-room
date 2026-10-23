@@ -154,8 +154,9 @@ so the final folder stays visible.
 
 A name is suggested: Enter accepts it, typing replaces it. Names must be non-empty and unique,
 without control or invisible characters, with letters from one alphabet; visually similar names
-may count as duplicates. The room opens a dedicated tmux window and sends a connection check. Until
-the agent answers it, the agent is **Connecting**, unless its screen needs you (a sign-in or trust
+may count as duplicates. The room opens a dedicated tmux window. A Codex gets a connection check; a Claude
+is not asked — it is connected once its window tells its session (if it tells nothing within a minute, it
+is asked too). Until then the agent is **Connecting**, unless its screen needs you (a sign-in or trust
 question shows **Needs your input**). Starting the process alone does not prove a connection. Once
 added, the name is available with Tab.
 

@@ -20,14 +20,17 @@ paths() { for p in collab scripts tests tools src; do if [ -e "$p" ]; then echo 
 # here when a fix brings it down (the check says so). Tests are not gated: their mocks are untyped.
 PYRIGHT_DEBT=1
 
+# The one ruff: the version pyproject.toml requires (required-version), never whatever uvx has newest.
+ruff() { uvx "ruff@$(sed -n 's/^required-version = "==\(.*\)"$/\1/p' pyproject.toml)" "$@"; }
+
 lint() {
     local code
-    echo "== ruff check"
-    uvx ruff check $(paths)
+    echo "== ruff check ($(ruff --version))"
+    ruff check $(paths)
     echo "== ruff format --check"
     # Not collab: it is the package's build — its empty lines stand for imports the build empties —
     # checked below.
-    uvx ruff format --check $(paths | grep -v '^collab$')
+    ruff format --check $(paths | grep -v '^collab$')
     echo "== pyright (program code: at most $PYRIGHT_DEBT, the current debt)"
     # Not collab once src is there: it is src's build (checked below), and its findings are src's, counted twice.
     code=$(paths | grep -v '^tests$' | { if [ -d src ]; then grep -v '^collab$'; else cat; fi; })

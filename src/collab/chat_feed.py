@@ -220,7 +220,7 @@ def chat_fold_into_dm(ctx: ChatFeedContext, m: dict[str, Any]) -> bool:
 
 
 def chat_pump(ctx: ChatFeedContext) -> None:
-    last_bar, last_rows = None, (ctx.rows(), shutil.get_terminal_size((100, 24)).columns)
+    last_bar, last_rows = None, ctx.ui.laid
     said: set[str] = set()  # each trouble once, not every tick
 
     def trouble(text: str) -> None:

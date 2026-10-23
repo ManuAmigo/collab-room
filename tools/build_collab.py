@@ -446,12 +446,24 @@ def write_whole(path: Path, data: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+# How the program ends — what installer.safe_copy looks for before it copies «this collab» for Codex.
+ENTRY = b'\nif __name__ == "__main__":\n    main()\n'
+
+
+def program(out: bytes) -> bytes:
+    """The one file, refused unless it ends in its entry point: without it the file defines everything,
+    runs nothing and exits 0 — the Codex copy that answered nothing was such a file."""
+    if not out.endswith(ENTRY):
+        raise BuildError(f'the last module, {MODULES[-1][1]}, must end in «if __name__ == "__main__":» and «    main()»')
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build the one-file collab from the package.")
     parser.add_argument("--check", action="store_true", help="only compare the committed file with a fresh build")
     args = parser.parse_args()
     try:
-        out = build(MODULES)
+        out = program(build(MODULES))
     except BuildError as exc:
         print(f"build refused: {exc}", file=sys.stderr)
         return 2

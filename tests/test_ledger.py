@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -22,9 +23,9 @@ from _seam import seam  # noqa: E402
 COLLAB = Path(__file__).resolve().parents[1] / "collab"
 
 
-def entry(model="Opus 5.5", input=0, output=0, cache_read=0, cache_write=0, to="2026-10-19T10:00:00+00:00"):
+def entry(model="Opus 5.5", input=0, output=0, cache_read=0, cache_write=0, to="2026-10-19T10:00:00+00:00", **more):
     return {"model": model, "effort": None, "input": input, "output": output, "cache_read": cache_read,
-            "cache_write": cache_write, "from_ts": to, "to_ts": to}  # fmt: skip
+            "cache_write": cache_write, "from_ts": to, "to_ts": to, **more}  # fmt: skip
 
 
 class LedgerRoom(unittest.TestCase):
@@ -61,7 +62,7 @@ class LedgerTest(LedgerRoom):
         self.use("misha", entry(input=40, output=10), review)
         self.use("misha", entry(input=7, output=3))  # spent outside any task
         t = self.table("kind")
-        self.assertEqual(t["fix"][1:], ["2", "300", "100", "300", "100", "43%", "3", "250"])  # (300+100+100)/2 tasks
+        self.assertEqual(t["fix"][1:9], ["2", "300", "100", "300", "100", "43%", "3", "250"])  # (300+100+100)/2 tasks
         self.assertEqual(t["review"][1], "1")
         self.assertEqual(t["(no task)"][2:4], ["7", "3"], "spending outside any task is counted, not dropped")
         self.assertEqual(list(t)[0], "fix", "the costliest first")
@@ -74,6 +75,46 @@ class LedgerTest(LedgerRoom):
         self.assertEqual(set(self.table("agent")), {"Петя"})
         self.assertEqual(set(self.table("lane")), {"B"})
         self.assertEqual(self.table("task")["T3"][2], "15")
+
+    def test_the_report_shows_answers_and_the_mean_and_longest_context_of_one(self):
+        # A context is input + cache read + cache write of one answer; a line from before the count (no «answers»)
+        # is spending, but no answers: it neither lowers the mean nor counts as one.
+        self.use("petya", entry(input=10, cache_read=900, cache_write=90, answers=2, ctx_max=700))
+        self.use("petya", entry(input=5, cache_read=2900, cache_write=95, answers=1, ctx_max=3000))
+        self.use("petya", entry(input=1000, cache_read=10**6))
+        self.use("misha", entry(input=1, cache_read=99, answers=1, ctx_max=100))
+        t = self.table("agent")
+        self.assertEqual(t["petya"][-3:], ["3", "1333", "3000"])  # (1000 + 3000) / 3
+        self.assertEqual(t["misha"][-3:], ["1", "100", "100"])
+
+    def test_an_agent_whose_spending_cannot_be_read_is_named_with_why(self):
+        # A table without a Claude looked complete: the report says who has no data and why.
+        sid = "11111111-2222-3333-4444-555555555555"
+        claude_home = self.root / "_claude"
+        os.environ["COLLAB_CLAUDE_HOME"] = str(claude_home)
+        os.environ["CODEX_HOME"] = str(self.root / "_codex")
+        preset = self.mod.PRESETS
+        people = [{"id": "owner", "label": "Маша", "command": ["sh"], "delivery": "pull"}]
+        agents = [
+            {**preset["claude"], "id": "petya", "label": "Петя"},
+            {**preset["claude"], "id": "misha", "label": "Миша", "window_session": sid},
+            {**preset["codex"], "id": "olya", "label": "Оля"},
+        ]
+        self.mod.write_config({"version": 2, "session": "s", "participants": people + agents})
+        self.use("olya", entry(input=10), label="Оля")
+        out = self.mod.report("agent")
+        notes = [line for line in out.splitlines() if "no data" in line]
+        self.assertEqual(len(notes), 3, out)
+        self.assertTrue(notes[0].startswith("Петя (claude): no data — ") and "session" in notes[0], notes)
+        self.assertTrue(notes[1].startswith("Миша (claude): no data — ") and sid in notes[1], notes)
+        self.assertTrue(notes[2].startswith("Оля (codex): no data — "), notes)
+        self.assertNotIn("Маша", out, "a person spends no tokens")
+        log = claude_home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(self.root)) / f"{sid}.jsonl"
+        log.parent.mkdir(parents=True)
+        log.write_text("", encoding="utf-8")
+        self.assertFalse(any("Миша" in line for line in self.mod.report("agent").splitlines() if "no data" in line))
+        self.assertNotIn("no data", self.mod.report("agent", fmt="csv"), "the csv stays a table")
+        self.assertEqual(len(self.mod.unread_notes()), 2, "the csv's reader gets them apart")
 
     def test_since_leaves_out_earlier_spending(self):
         self.use("petya", entry(input=10, to="2026-10-18T10:00:00+00:00"))
@@ -92,7 +133,7 @@ class LedgerTest(LedgerRoom):
         self.assertEqual(
             set(line),
             {"at", "pid", "agent", "agent_kind", "model", "effort", "from", "to", "wakeups", "task", "task_kind", "lane",
-             "task_by", "split", "input", "output", "cache_read", "cache_write"},
+             "task_by", "split", "input", "output", "cache_read", "cache_write", "answers", "ctx_max"},
         )  # fmt: skip
         self.assertIsNone(line["task"])
         on_disk = [json.loads(x) for x in (self.state / "usage.jsonl").read_text().splitlines()]
@@ -195,7 +236,10 @@ class LedgerTest(LedgerRoom):
         r = subprocess.run([sys.executable, str(COLLAB), "usage", "report", "--by", "agent", "--format", "csv"],
                            cwd=self.root, env=env, capture_output=True, text=True)  # fmt: skip
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.splitlines()[0], "group,tasks,input,output,cache read,cache write,cache share,wakeups,per task")
+        self.assertEqual(
+            r.stdout.splitlines()[0],
+            "group,tasks,input,output,cache read,cache write,cache share,wakeups,per task,answers,mean context,max context",
+        )
         self.assertTrue(r.stdout.splitlines()[1].startswith("petya,0,10,2,"), r.stdout)
 
 

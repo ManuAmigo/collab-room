@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 import collab.boot as m_boot
@@ -48,6 +49,11 @@ def installed_collab() -> Path:
 def installed_name() -> str:
     """The content name of what the `collab` command runs now — to tell a chat or a Codex it is older."""
     return copy_name(installed_collab().read_bytes())
+
+
+class NotTheProgram(OSError):
+    """«This collab» is not the built program (run from the package it is its first module): a copy of it
+    would answer nothing. An OSError, as the caller's other «no copy» are: the old rule goes all the same."""
 
 
 class LinkedCopies(OSError):
@@ -174,10 +180,21 @@ def command_copy() -> Path:
     return path
 
 
+# How the one built file ends — and only it: run from the package, SELF is its first module.
+ENTRY = b'\nif __name__ == "__main__":\n    main()\n'
+
+
 def safe_copy() -> Path:
-    """This collab, read-only, named by its content: an update is a new file, never an edit."""
+    """This collab, read-only, named by its content: an update is a new file, never an edit. Only the
+    built program: run from the package, «this collab» is its first module — a copy of it ran every
+    say with exit 0 and did nothing."""
     inst = m_boot.paths()
     data = Path(m_boot.SELF).read_bytes()
+    if not data.endswith(ENTRY):
+        raise NotTheProgram(
+            f"{m_text.tilde(m_boot.SELF)} is not the built collab (it does not end in its entry point): "
+            "a copy of it would answer nothing. Run the collab file built from the package (tools/build_collab.py)."
+        )
     path = inst.safe_copies / copy_name(data)
     refuse_linked_copies(inst.safe_copies)  # a rule for a copy reached through a link protects nothing
     if not path.is_file() or path.is_symlink() or path.read_bytes() != data:
@@ -264,7 +281,7 @@ def set_agent_rule(room_dir: str, pid: str, cli: str) -> None:
             tag
             + "".join(
                 "prefix_rule(pattern="
-                + json.dumps([*RULE_PYTHON, cli, command, "--room", room_dir, flag, pid], ensure_ascii=False)
+                + json.dumps([*rule_python(), cli, command, "--room", room_dir, flag, pid], ensure_ascii=False)
                 + ', decision="allow")\n'
                 for command, flag in (("say", "--from"), ("ack", "--for"), ("inbox", "--for"))
             )
@@ -313,54 +330,179 @@ def room_spellings() -> list[str]:
     return list(dict.fromkeys([str(rp.root), str(rp.root.resolve())]))
 
 
-def codex_room_rule(pid: str, folder: str) -> str:
-    """Before a Codex the room starts: its rule, if the person agreed at install. Returns the
-    collab its hints must name ("" — none: Codex will ask before answering, as before)."""
+@m_store.room_locked
+def codex_rule_notice(pid: str, label: str, reason: str, fix: str) -> None:
+    """Explain each refusal once per agent and reason, including after a room restart."""
+    rp = m_store.room().paths
+    config = m_store.load_config()
+    people = m_store.people_ids(config)
+    if not people:
+        return
+    if not label:
+        label = next((p.get("label", pid) for p in config.get("participants", []) if p["id"] == pid), pid)
+    path = rp.state_dir / "codex-rule-notices.json"
+    try:
+        seen = json.loads(m_store.read_state_text(path))
+    except (OSError, ValueError):
+        seen = {}
+    if not isinstance(seen, dict):
+        seen = {}
+    key = json.dumps([pid, reason], ensure_ascii=False)
+    if key in seen:
+        return
+    m_log.append_message(
+        m_text.ROOM,
+        people,
+        f"No room reply rule was issued for {label}: {reason}; Codex will ask permission for every reply; fix: {fix}.",
+    )
+    seen[key] = True
+    m_store.write_json(path, seen)
+
+
+def codex_rule_refusal(cli: Path, folder: str) -> tuple[str, str]:
+    """The first unsafe dependency of a room rule, and how to keep it out of reach."""
     inst = m_boot.paths()
     rp = m_store.room().paths
+    reason = ""
+    fix = ""
+    if codex_writable_roots() is None:
+        reason = f"Codex settings in {inst.codex_home / 'config.toml'} could not be read reliably"
+        fix = "correct the TOML settings and make the file readable, then restart this agent"
+    elif not m_boot.trusted_interpreter(sys.executable):
+        reason = f"the Python running collab ({sys.executable}) did not pass the interpreter safety checks"
+        fix = "run collab install with a Python installed outside agent projects, then restart this agent"
+    else:
+        checks = [
+            (
+                lambda: codex_can_write(cli, folder),
+                "Codex can write the collab command copy",
+                "keep collab copies outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: codex_can_write(rp.root.resolve().parent, folder),
+                "Codex can replace the room folder through its parent",
+                "choose a room whose parent is outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: codex_can_touch_python(sys.executable, folder),
+                "Codex can change the running Python installation or files inside it",
+                "keep the Python installation outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: codex_can_write(rp.base, folder),
+                "Codex can write the room storage folder",
+                "keep room storage outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: codex_can_write(inst.python_file, folder),
+                "Codex can change the file recording collab's Python",
+                "keep the collab installation data outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: bool(m_boot.recorded_python()) and codex_can_touch_python(m_boot.recorded_python(), folder),
+                "Codex can change the recorded Python installation or files inside it",
+                "keep the recorded Python installation outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
+                lambda: any(
+                    codex_can_write(Path(f), folder) for f in m_boot.link_folders(m_boot.recorded_python(as_written=True))
+                ),
+                "Codex can replace a link leading to the recorded Python",
+                "keep Python links outside temporary folders, the agent folder and its writable_roots",
+            ),
+        ]
+        for check, why, action in checks:
+            if check():
+                reason, fix = why, action + ", then restart this agent"
+                break
+    return reason, fix
+
+
+def codex_room_rule(pid: str, folder: str, label: str = "") -> str:
+    """Issue an opted-in rule, or explain the failed check to the person."""
+    inst = m_boot.paths()
+    reason = ""
+    fix = ""
+    if not inst.codex_consent.exists():
+        prune_agent_rules()
+        return ""
+    stage = "remove obsolete Codex room reply rules"
     try:
         prune_agent_rules()
-        if not inst.codex_consent.exists():
-            return ""
-        cli = safe_copy()
-        # Nor when Codex could replace the room's folder itself (it lies inside what Codex may
-        # write): the rule names the folder by path, and a link put in its place would lead the
-        # unsandboxed copy anywhere.
-        # Nor the recorded Python: collab started by an older python3 runs whatever it names.
-        # Nor when this collab runs on a Python we would not hand over to (in home, in a venv…): the
-        # rule names sys.executable, run outside the sandbox.
-        if (
-            not m_boot.trusted_interpreter(sys.executable)
-            or codex_can_write(cli, folder)
-            or codex_can_write(rp.root.resolve().parent, folder)
-            or codex_can_touch_python(sys.executable, folder)
-            or codex_can_write(rp.base, folder)
-            or codex_can_write(inst.python_file, folder)
-            or (bool(m_boot.recorded_python()) and codex_can_touch_python(m_boot.recorded_python(), folder))
-            # The folders of the recorded link: Codex changing a link changes what runs.
-            or any(codex_can_write(Path(f), folder) for f in m_boot.link_folders(m_boot.recorded_python(as_written=True)))
-        ):
-            for spelling in room_spellings():
-                set_agent_rule(spelling, pid, "")
-            return ""
+        stage = "prepare the read-only collab copy"
+        try:
+            cli = safe_copy()
+        except (SystemExit, m_store.OperationFailed) as exc:
+            # safe_copy can refuse via fail(), in both CLI and chat mode. Its earlier
+            # rule must be removed just as on an IO error.
+            raise OSError(f"could not prepare the read-only collab copy: {exc}") from exc
+        reason, fix = codex_rule_refusal(cli, folder)
+        stage = "write the Codex room reply rules"
+        if not reason:
+            if inst.agent_rules.is_symlink():
+                reason = f"the rules file {inst.agent_rules} is a symbolic link"
+                fix = "replace the link with a regular rules file, then restart this agent"
+            elif (
+                inst.agent_rules.exists()
+                and (text := inst.agent_rules.read_text(encoding="utf-8"))
+                and not text.startswith(RULES_HEADER)
+            ):
+                reason = f"the rules file {inst.agent_rules} is not managed by collab"
+                fix = "move that file aside after reviewing it, then restart this agent"
         for spelling in room_spellings():
-            set_agent_rule(spelling, pid, str(cli))
-    except OSError:
-        # No copy to name (its folder is a link, or unwritable): a rule given earlier must not stay
-        # and keep running the old copy outside the sandbox.
+            set_agent_rule(spelling, pid, "" if reason else str(cli))
+    except (OSError, UnicodeError) as exc:
+        reason = f"could not {stage}: {exc}"
+        fix = "check the named path, its permissions and free disk space, run collab install, then restart this agent"
         with contextlib.suppress(OSError, SystemExit, m_store.OperationFailed):
             for spelling in room_spellings():
                 set_agent_rule(spelling, pid, "")
+    if reason:
+        codex_rule_notice(pid, label, reason, fix)
         return ""
     return str(cli)
 
 
-# The interpreter a Codex rule allows: this exact one by its absolute path, isolated (-I: no
-# PYTHON* variables, no module next to the script) — a bare «python3» matched any file of that name,
-# also one a sandboxed Codex had put in its own folder.
-# The real file, the one the checks looked at — not a link Codex might replace afterwards; -S: no
-# site packages, no .pth to run.
-RULE_PYTHON = [os.path.realpath(sys.executable), "-I", "-S"]
+def rule_python() -> list[str]:
+    """The same installed interpreter for rules and hints, even in different Python processes."""
+    recorded = m_boot.recorded_python()
+    python = recorded if recorded and m_boot.trusted_interpreter(recorded) else sys.executable
+    # Use the real binary, isolated from environment variables and site packages.
+    return [os.path.realpath(python), "-I", "-S"]
+
+
+def check_codex_rule_python(pid: str, python: list[str]) -> None:
+    """Drop an obsolete rule when a delivery process would name a different interpreter."""
+    inst = m_boot.paths()
+    if not inst.codex_consent.exists() or inst.agent_rules.is_symlink():
+        return
+    try:
+        text = inst.agent_rules.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return
+    if not text.startswith(RULES_HEADER):
+        return
+    tags = {f"# room={json.dumps(spelling, ensure_ascii=False)} id={pid}" for spelling in room_spellings()}
+    active = False
+    for line in text.splitlines():
+        if line.startswith("# room="):
+            active = line in tags
+        elif active and line.startswith("prefix_rule(pattern="):
+            pattern = line.removeprefix("prefix_rule(pattern=").removesuffix(', decision="allow")')
+            try:
+                argv = json.loads(pattern)
+            except ValueError:
+                continue
+            if isinstance(argv, list) and argv[:3] != python:
+                for spelling in room_spellings():
+                    set_agent_rule(spelling, pid, "")
+                codex_rule_notice(
+                    pid,
+                    "",
+                    "the reply command uses a different Python from this agent's saved permission rule",
+                    "restart this agent so collab can issue a matching rule",
+                )
+                return
 
 
 def python311_version(path: str) -> str | None:
@@ -399,16 +541,23 @@ PYTHON_ROOTS = frozenset(
 )
 
 
-def find_python311(skipped: list[str] | None = None) -> tuple[str, str] | None:
+# python.org's installer puts each version here, and links on PATH only if its command-line tools are chosen.
+PYTHON_ORG = Path("/Library/Frameworks/Python.framework/Versions")
+
+
+def find_python311(skipped: list[str] | None = None, refused: list[tuple[str, str]] | None = None) -> tuple[str, str] | None:
     """A Python 3.11+ already on this computer, installed outside home: the one recorded, the one
-    running, then python3.14…python3.11 and python3 on PATH, Homebrew's. (path, version) or None.
-    `skipped` gets each one passed over for lying where an agent writes — to say so, not silently."""
+    running, then python3.14…python3.11 and python3 on PATH, Homebrew's, python.org's. (path, version) or None.
+    `skipped` gets each one passed over for lying where an agent writes, `refused` each one there that
+    may not be run, with why — to say so, not «not found» of three Pythons in place."""
     names = [f"python3.{minor}" for minor in range(14, 10, -1)] + ["python3"]
     # The one already recorded comes first: a repeated install keeps it while it is still trusted
     # and 3.11+, instead of switching to whichever python3 ran install this time.
     candidates = [m_boot.recorded_python(as_written=True), sys.executable, *(shutil.which(n) or "" for n in names)]
     for folder in ("/opt/homebrew/bin", "/usr/local/bin"):
         candidates += [os.path.join(folder, n) for n in names]
+    # Not on PATH, it was never looked at: three of them stood there and install said «not found».
+    candidates += [str(PYTHON_ORG / f"3.{minor}" / "bin" / f"python3.{minor}") for minor in range(14, 10, -1)]
     # Nothing from a folder an agent writes to: the one we are in, every room's project, every agent's
     # folder — that weighs more than the file's permissions. Not the one we are in when
     # it is a root every Python sits under: from / (or /opt/homebrew, /Library) each lay «inside» it, and
@@ -433,6 +582,10 @@ def find_python311(skipped: list[str] | None = None) -> tuple[str, str] | None:
             version = python311_version(real)
             if version:
                 return keep, version
+        elif real and real not in seen and os.path.isfile(real):
+            seen.add(real)
+            if refused is not None:
+                refused.append((real, m_boot.interpreter_refused(real)))
     return None
 
 
@@ -464,8 +617,9 @@ def python_install_ways() -> list[tuple[str, list[list[str]]]]:
     installed; the person types the password («a command — Enter, and it is done»)."""
     ways: list[tuple[str, list[list[str]]]] = []
     if sys.platform == "darwin":
-        if shutil.which("brew"):
-            ways.append(("Install Python 3.12 with Homebrew", [["brew", "install", "python@3.12"]]))
+        # Only a Homebrew that runs here: an Apple Silicon one carried over to an Intel Mac fails.
+        if brew := m_tmuxio.working_brew():
+            ways.append(("Install Python 3.12 with Homebrew", [[brew, "install", "python@3.12"]]))
         pkg = os.path.join(tempfile.gettempdir(), f"collab-python-{secrets.token_hex(4)}.pkg")
         ways.append(
             (
@@ -526,11 +680,14 @@ def install_python_step(dry_run: bool) -> bool:
     # started by an older python3 runs itself again with it (PYTHON_FILE, at the top).
     before = m_boot.recorded_python(as_written=True)
     passed_over: list[str] = []
-    found = find_python311(passed_over)
+    refused: list[tuple[str, str]] = []
+    found = find_python311(passed_over, refused)
     for real in passed_over:  # said, not silent: why the one there is not used
         print(
             f"  · Python {m_text.tilde(real)}: passed over — it lies in the folder you are in or an agent's, where an agent may write"
         )
+    for real, why in [] if found else refused:
+        print(f"  · Python {m_text.tilde(real)}: found, refused — {why}")
     found = found or (None if dry_run else install_python311())
     if found and dry_run:
         print(f"  · Python {found[1]}: {found[0]} → {inst.python_file}")
@@ -550,9 +707,11 @@ def install_python_step(dry_run: bool) -> bool:
             )
             ok = False
     else:
+        brew = m_tmuxio.working_brew()
+        mac = f"{brew} install python@3.12" if brew else "the installer from https://www.python.org/downloads/macos/"
         print(
-            "  ✗ Python 3.11 or newer, installed outside your home folder — not found. Install one (macOS: brew install\n"
-            "    python@3.12; Linux: your system's python3.11 package), then run collab install again."
+            f"  ✗ Python 3.11 or newer, installed outside your home folder — not found. Install one (macOS: {mac};\n"
+            "    Linux: your system's python3.11 package), then run collab install again."
         )
         ok = False
     # An older Python has no tomllib — Codex's writable_roots went unread
@@ -618,10 +777,13 @@ def install_command_step(args: argparse.Namespace, bin_dir: Path, link: Path, re
             if link.exists() or link.is_symlink():
                 if not our_command_link(link):
                     raise FileExistsError
-                link.unlink()
             else:
                 bin_dir.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(target)
+            # In one step: never a moment without the command — an update stopped here leaves the old one.
+            fresh = link.with_name(f".{link.name}.{os.getpid()}.new")
+            fresh.unlink(missing_ok=True)
+            fresh.symlink_to(target)
+            os.replace(fresh, link)
             m_store.write_private(inst.installed_file, str(link))
             m_store.write_private(inst.source_file, str(repo))
             print(f"  ✓ collab command: {link} — {what}")
@@ -643,6 +805,270 @@ def install_command_step(args: argparse.Namespace, bin_dir: Path, link: Path, re
         print(f"  ✗ collab command: cannot write to {bin_dir} ({error.strerror}) — pass a folder you can write to with --bin-dir")
         ok = False
     return ok
+
+
+# The update: the clone install was made from is moved to the newest release (a tag v<VERSION> of its
+# origin) and installed again — what a person did by hand with git pull and install. Only the installed
+# copy updates itself: a --dev install runs the clone's own file, and its clone is the developer's.
+UPDATE_FETCH_WAIT = 20  # seconds; `collab start` never waits for it — the check runs beside the room
+UPDATE_ROOM_WAIT = 60  # seconds for the room this start opens to be up before its deliverer is restarted
+
+
+def release_of(tag: str) -> tuple[int, ...] | None:
+    found = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
+    return tuple(int(n) for n in found.groups()) if found else None
+
+
+def release_text(release: tuple[int, ...]) -> str:
+    return ".".join(map(str, release))
+
+
+def update_source() -> tuple[Path | None, str]:
+    """The clone to update from, or None and why there is none."""
+    inst = m_boot.paths()
+    if inst.safe_copies.resolve() not in Path(m_boot.SELF).resolve().parents:
+        return None, "this collab is not the installed copy — a --dev install is updated with git pull in its clone"
+    source = m_boot.read_private(inst.source_file)
+    if not source or not (Path(source) / "collab").is_file() or not (Path(source) / ".git").exists():
+        return None, "the git clone collab was installed from is not found — install again from a clone"
+    return Path(source), ""
+
+
+# Fetched releases are kept under a name of their own: a tag made in the clone itself is not a release.
+UPDATE_REFS = "refs/collab-update/"
+# Releases come only from collab-room's own repository. COLLAB_UPDATE_ORIGIN names one more (a mirror
+# of the person's own, the tests' local one): set in the person's environment, it is their choice.
+OUR_ORIGIN = re.compile(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)ManuAmigo/collab-room(?:\.git)?/?")
+
+
+def our_origin(origin: str) -> bool:
+    return bool(OUR_ORIGIN.fullmatch(origin)) or (bool(origin) and origin == os.environ.get("COLLAB_UPDATE_ORIGIN"))
+
+
+def codex_reaches(source: Path) -> str:
+    """Who could change the clone the update installs from — the update runs what is there outside any
+    sandbox, so a clone a Codex may write would be the very way out the read-only copy closes. "" if no one."""
+    real = os.path.realpath(source)
+    if m_boot.in_temp_folder(real):
+        return "it is in a temporary folder, where a Codex may write"
+    roots = codex_writable_roots()
+    if roots is None:
+        return "Codex's config cannot be read to tell where a Codex may write"
+    places = [(f"Codex may write {m_text.tilde(str(r))} (writable_roots)", str(r)) for r in roots]
+    places += [(f"{who} works in {m_text.tilde(folder)}", folder) for who, folder in codex_workplaces()]
+    # By spelling, case-folded on macOS (its disks ignore case), and by file identity — as for the copies.
+    fold = (lambda x: x.casefold()) if sys.platform == "darwin" else (lambda x: x)
+    for why, folder in places:
+        there = os.path.realpath(os.path.expanduser(folder))
+        a, b = fold(real), fold(there)
+        if a == b or a.startswith(b.rstrip("/") + "/") or b.startswith(a + "/"):
+            return why
+        if os.path.exists(there) and (
+            os.path.samefile(real, there) or m_boot._inside(real, there) or m_boot._inside(there, real)
+        ):
+            return why
+    return ""
+
+
+def git_in(source: Path, *args: str, timeout: float = 60) -> subprocess.CompletedProcess[str]:
+    """git in the person's clone, never asking anything: a password or host-key question in a check
+    that runs beside the room would wait for no one. None of the clone's own hooks or helpers run."""
+    env = os.environ | {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+    safe = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.ext.allow=never"]
+    return subprocess.run(
+        ["git", *safe, "-C", str(source), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def run_update(source: Path) -> tuple[str, str]:
+    """Fetch the clone's origin; a newer release: move the clone to it and install it. (outcome, line):
+    outcome is «current», «offline» (no answer — said to no one), «blocked» or «updated»."""
+    reach = codex_reaches(source)
+    git_dir = source / ".git"
+    if not reach and (git_dir.is_symlink() or not git_dir.is_dir()):
+        # A .git file or link leads to a git folder elsewhere — whose hooks and refs the check above never saw.
+        reach = "its .git is not a folder inside it"
+    # The URL git fetches from (insteadOf applied), and then that very URL is what is fetched.
+    origin = git_in(source, "remote", "get-url", "origin").stdout.strip()
+    if not reach and not our_origin(origin):
+        reach = f"its origin {origin or '(none)'} is not collab-room's repository"
+    if not reach and origin and (origin.startswith("file://") or not re.match(r"[a-z][a-z0-9+.-]*://|[^/:]+:", origin)):
+        # A path for origin: the releases come from that folder — the same question for it.
+        reach = codex_reaches(source / os.path.expanduser(origin.removeprefix("file://")))
+    if reach:
+        return "blocked", (
+            f"collab is not updated by itself from {m_text.tilde(str(source))}: {reach} — update by hand when you "
+            f"have looked at it: git pull there, then python3 {shlex.quote(str(source / 'collab'))} install"
+        )
+    try:
+        fetched = git_in(
+            source,
+            "fetch",
+            "--quiet",
+            "--prune",
+            "--no-tags",
+            origin,
+            f"+refs/tags/v*:{UPDATE_REFS}v*",
+            timeout=UPDATE_FETCH_WAIT,
+        )
+    except subprocess.TimeoutExpired:
+        return "offline", f"no answer from the clone's origin in {UPDATE_FETCH_WAIT} s"
+    if fetched.returncode:
+        return "offline", (fetched.stderr.strip().splitlines() or ["git fetch failed"])[-1]
+    fetched_tags = git_in(source, "for-each-ref", "--format=%(refname:strip=2)", UPDATE_REFS).stdout.split()
+    releases = [r for r in map(release_of, fetched_tags) if r]
+    mine = release_of("v" + m_boot.VERSION) or (0, 0, 0)
+    if not releases or max(releases) <= mine:
+        return "current", f"collab {m_boot.VERSION} is the newest"
+    newest = release_text(max(releases))
+    by_hand = (
+        f"update it by hand: git pull in {m_text.tilde(str(source))}, then python3 {shlex.quote(str(source / 'collab'))} install"
+    )
+    if git_in(source, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+        return "blocked", f"collab {newest} is out, not installed: your clone has changes of its own — {by_hand}"
+    release = git_in(source, "rev-parse", "--verify", "-q", f"{UPDATE_REFS}v{newest}^{{commit}}").stdout.strip()
+    before = git_in(source, "rev-parse", "HEAD").stdout.strip()
+    if git_in(source, "merge", "--ff-only", "--quiet", release).returncode:
+        return "blocked", f"collab {newest} is out, not installed: your clone has commits of its own — {by_hand}"
+
+    def back(why: str) -> tuple[str, str]:
+        # The clone goes back to where it was: what runs and what the clone holds stay one version.
+        git_in(source, "reset", "-q", "--keep", before)
+        return "blocked", f"collab {newest} is out, not installed: {why} — {by_hand}"
+
+    # Whole before it replaces anything: the clone holds exactly the release's commit (git checks every
+    # object by its hash), and its collab runs and says it is that release.
+    if (
+        git_in(source, "rev-parse", "HEAD").stdout.strip() != release
+        or git_in(source, "diff", "--quiet", release, "--").returncode
+    ):
+        return back("the clone does not hold the release as it was published")
+    said = subprocess.run([sys.executable, str(source / "collab"), "--version"], capture_output=True, text=True, timeout=60)
+    if said.stdout.strip() != f"collab {newest}":
+        return back(f"its collab says {said.stdout.strip()[:40] or 'nothing'!r}, not «collab {newest}»")
+    link = m_boot.read_private(m_boot.paths().installed_file)
+    command = [sys.executable, str(source / "collab"), "install"] + (["--bin-dir", str(Path(link).parent)] if link else [])
+    was = installed_collab()
+    # No terminal: install asks nothing (the Codex consent stays as the person answered it).
+    done = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600)
+    failed = [x.strip() for x in done.stdout.splitlines() if x.strip().startswith("✗")] or [done.stderr.strip()[-200:]]
+    if installed_collab() == was:
+        # The command was not replaced (install swaps it in one step, or not at all): the old one runs on.
+        return back(f"its install did not complete ({failed[0]})")
+    if done.returncode:
+        return "updated", f"collab updated from {m_boot.VERSION} to {newest}; install also said: {failed[0]}"
+    return "updated", f"collab updated from {m_boot.VERSION} to {newest}."
+
+
+def update_in_background(root: str) -> None:
+    """`collab start`: look for a newer collab beside the room — the start never waits for the network.
+    Not from a --dev install, not when switched off."""
+    inst = m_boot.paths()
+    if os.environ.get("COLLAB_NO_UPDATE") or inst.update_off.exists() or update_source()[0] is None:
+        return
+    m_store.private_dir(inst.update_state.parent, strict=False)
+    with open(inst.update_state.with_suffix(".log"), "ab") as log:
+        subprocess.Popen(
+            [sys.executable, m_boot.SELF, "update", "--auto", "--after", str(os.getpid()), "--room", root],
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,  # not the start's: its Ctrl+C or its terminal closing do not end an install midway
+        )
+
+
+def wait_for_room(session: str, starter: int) -> bool:
+    """The room this start opens is up: its deliverer's window is there (made last, before attach).
+    False when it is not coming: no session, and the start that ran this check has ended (or there was none)."""
+    deadline = time.monotonic() + UPDATE_ROOM_WAIT
+    while time.monotonic() < deadline:
+        if m_tmuxio.tmux("list-panes", "-t", f"={session}:=deliver", check=False).returncode == 0:
+            return True
+        if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode and not process_alive(starter):
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def process_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def auto_update(starter: int) -> None:
+    """The check `collab start` runs beside the room. One at a time; what it found goes to the room's
+    people once — an update every start, a refusal once per new version; no network is said to no one.
+    After an update the room's deliverer and the Codex rules move to the new copy: `collab start` of the
+    new copy, in the running room (the chat and the agents stay; each says when it runs older code)."""
+    inst = m_boot.paths()
+    source, _ = update_source()
+    if source is None:
+        return
+    import fcntl
+
+    with open(inst.update_state.with_suffix(".lock"), "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return  # another room's start is updating already
+        outcome, line = run_update(source)
+        try:
+            told = json.loads(inst.update_state.read_text(encoding="utf-8")).get("told", "")
+        except (OSError, ValueError, AttributeError):
+            told = ""
+        tell = outcome == "updated" or (outcome == "blocked" and line != told)
+        state = {"at": m_store.now(), "outcome": outcome, "line": line, "told": line if tell else told}
+        m_store.write_private(inst.update_state, json.dumps(state, ensure_ascii=False))
+    if not tell:
+        return
+    config = m_store.config_now()
+    m_log.append_message(m_text.ROOM, m_store.people_ids(config), line)
+    link = m_boot.read_private(inst.installed_file)
+    session = config.get("session", "collab-room")
+    if outcome == "updated" and link and wait_for_room(session, starter):
+        env = os.environ | {"COLLAB_NO_ATTACH": "1", "COLLAB_NO_UPDATE": "1"}
+        rp = m_store.room().paths
+        subprocess.run(
+            [sys.executable, link, "start", "--room", str(rp.root)], env=env, capture_output=True, stdin=subprocess.DEVNULL
+        )
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    """`collab update`: now, in this terminal; --off / --on: the update at `collab start`."""
+    inst = m_boot.paths()
+    if args.off:
+        m_store.write_private(inst.update_off, m_store.now())
+        print("The update at collab start is off. `collab update` still updates when you run it; --on turns it back on.")
+        return
+    if args.on:
+        inst.update_off.unlink(missing_ok=True)
+        print("The update at collab start is on: each start looks for a newer collab and installs it.")
+        return
+    if args.auto:
+        auto_update(args.after)
+        return
+    source, why = update_source()
+    if source is None:
+        m_store.fail(why)
+    outcome, line = run_update(source)
+    print(line)
+    if outcome == "updated":
+        print("Running rooms keep the old code: `collab start` in a room moves its delivery; /restart an agent, reopen a chat.")
+    elif outcome in ("blocked", "offline"):
+        raise SystemExit(1)
 
 
 def cmd_install(args: argparse.Namespace) -> None:

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 import collab.store as m_store
 import collab.screen as m_screen
+import collab.text as m_text
 
 FIELDS = ("input", "output", "cache_read", "cache_write")
 SEEN_MAX = 50_000  # answers remembered per agent; past it the oldest go, and «since» moves past them
@@ -67,7 +68,10 @@ def claude_files(p: dict[str, Any]) -> list[Path]:
     sid = str(p.get("window_session") or "")
     if not m_screen.SESSION_ID.fullmatch(sid):
         return []
-    folder = os.path.realpath(p.get("folder") or str(m_store.room().paths.root))
+    # /add writes the agent's folder; a seat `start` opens works in its «cwd» under the project.
+    raw: object = p.get("cwd")
+    cwd = raw if isinstance(raw, str) else "."  # the settings are the person's to edit
+    folder = os.path.realpath(p.get("folder") or str(m_store.room().paths.root / cwd))
     base = claude_home() / re.sub(r"[^A-Za-z0-9]", "-", folder)
     subs = base / sid / "subagents"
     try:
@@ -93,6 +97,27 @@ def codex_file(p: dict[str, Any], known: str) -> list[Path]:
     except OSError:
         return []
     return found[:1]
+
+
+def unread(p: dict[str, Any]) -> str:
+    """Why the agent's spending is not read — its log not found; "" when it is. For the report: a table
+    without an agent looked complete."""
+    kind = m_screen.agent_kind(p)
+    if kind == "claude":
+        files = claude_files(p)
+        if not files:
+            return (
+                "the session of its window is not known: delivery reads it from Claude's own record once a minute while it runs"
+            )
+        if not files[0].is_file():
+            return f"no log of its session {p.get('window_session')} in {m_text.tilde(str(files[0].parent))}"
+        return ""
+    if kind == "codex":
+        known = next(iter(obj(obj(m_store.read_json(cursor_path())).get(p["id"])).get("files") or {}), "")
+        if codex_file(p, str(known)):
+            return ""
+        return f"no log of its session in {m_text.tilde(str(codex_home()))} (found by its connection check)"
+    return "not a Claude or a Codex: its spending is not read"
 
 
 def open_under(base: Path, path: Path) -> int | None:
@@ -265,7 +290,8 @@ class Cursor:
 
 def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
     """What the agent spent since the last call: one record per model and effort — {model, effort, input,
-    output, cache_read, cache_write, from_ts, to_ts} (times of the first and last answer counted). Nothing
+    output, cache_read, cache_write, answers, ctx_max, from_ts, to_ts}: the answers counted, the longest
+    context of one (input + cache read + cache write), times of the first and last answer. Nothing
     new — []. The first call for an agent starts from now: its past is not counted against the task it is
     on. Called under the room's lock by its one writer (delivery's tick); the cursor is in the room's state,
     so a restart of delivery neither counts again nor loses a piece."""
@@ -313,9 +339,13 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
             if not ts or not KEY.fullmatch(key) or key in cur.seen or ts < cur.since:
                 continue
             cur.seen[key] = ts
-            g = groups.setdefault((model, effort), {"model": model, "effort": effort, **dict.fromkeys(FIELDS, 0)})
+            g = groups.setdefault(
+                (model, effort), {"model": model, "effort": effort, **dict.fromkeys(FIELDS, 0), "answers": 0, "ctx_max": 0}
+            )
             for f in FIELDS:
                 g[f] += nums[f]
+            g["answers"] += 1
+            g["ctx_max"] = max(g["ctx_max"], nums["input"] + nums["cache_read"] + nums["cache_write"])
             g["from_ts"] = min(g.get("from_ts") or ts, ts)
             g["to_ts"] = max(g.get("to_ts") or ts, ts)
     cur.files = read_to  # a log no longer the agent's (its session ended) is not looked at again

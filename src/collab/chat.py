@@ -155,6 +155,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         m_agents.border_title(m_chat_base.BORDER_CHAT.format(room=rp.root.name.lstrip(".") or rp.root.name))
         h = rows()
         sys.stdout.write("\n" * 3 + f"\033[1;{h - 3}r")
+        ui.laid = (h, shutil.get_terminal_size((100, 24)).columns)
         # The /dm panel beside it puts its rule and input on the chat's own rows («the
         # input and the output on one level»): it reads how many rows lie under the chat's rule.
         if os.environ.get("TMUX_PANE"):

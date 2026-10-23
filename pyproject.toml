@@ -1,10 +1,13 @@
 # Development checks only — collab itself has no dependencies (ruff + pyright are for development).
 # Run from the checkout — all of them at once: scripts/ci:
-#   uvx ruff check          (or: ruff check)
-#   uvx ruff format --check (one style for all the code; `uvx ruff format` writes it)
+#   uvx ruff@0.17.1 check          (the version below; scripts/ci reads it from here)
+#   uvx ruff@0.17.1 format --check (one style for all the code; `… format` writes it)
 #   pyright                 (npm i -g pyright / brew install pyright)
 
 [tool.ruff]
+# One version for everyone, scripts/ci and the merge queue included: a new ruff that formats otherwise
+# turned main red while nobody changed a line. Raised here, by hand, with the code it reformats.
+required-version = "==0.17.1"
 target-version = "py39"
 line-length = 130
 extend-include = ["collab"]          # the program is one file without .py

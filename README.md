@@ -75,8 +75,28 @@ If `~/.local/bin` is not on your PATH, install prints the line to add to your sh
 open a new terminal. Until then, use the full command printed on the last line
 (`Done. Next, in your project folder: …`).
 
-To update: `git pull` in your clone, then run the same install command again — the `collab` command
-points to a copy, not to your clone. Details, manual setup and the Codex permission rules:
+### Updates
+
+**`collab start` checks for a newer collab and installs it.** This is a network request:
+each start runs `git fetch` of your clone's `origin` (GitHub, for a clone made as above) to read its
+release tags (`v1.2.3`). It runs beside the room: the room opens at once, and with no network or a slow
+one, nothing waits and nothing fails. If a newer release is there, your clone is fast-forwarded to it and
+installed, and the chat gets a line: `collab updated from 0.1.0 to 0.2.0.` Delivery switches to the new
+code at once. An open chat keeps the old code until you reopen it, a running agent until you
+`/restart` it; the chat tells you which.
+
+- Turn it off: `collab update --off` (back on: `collab update --on`). `collab update` updates right
+  away, in the terminal. `collab --version` shows the installed version.
+- Nothing is changed when your clone has changes or commits of its own, or when a Codex may write
+  to the clone or its origin: the chat says so once, and you update by hand.
+- Only release tags of collab-room's own repository (`github.com/ManuAmigo/collab-room`) count; a tag
+  made in the clone itself does not. Before anything is replaced, the clone must hold exactly the
+  release's commit and its `collab` must report that version. If the install stops, the old `collab`
+  command stays and the clone goes back to where it was.
+- A `--dev` install never updates itself.
+
+To update by hand: `git pull` in your clone, then run the same install command again. The `collab`
+command points to a copy, not to your clone. Details, manual setup and the Codex permission rules:
 [docs/integrations.md](docs/integrations.md).
 
 ## Your first room
@@ -90,7 +110,8 @@ points to a copy, not to your clone. Details, manual setup and the Codex permiss
 4. Type `/add` and press Enter. Choose **Claude**, then its project folder (current and recent
    folders are suggested; **Browse folders…** and **Enter path manually…** are there too), then its
    name (Enter accepts the suggested one). The room starts it in its own tmux window and shows it as
-   **Connecting** until it answers a connection check.
+   **Connecting** until it is connected: a Claude when its window tells its session, a Codex when it
+   answers a connection check (a Claude is asked too if it tells nothing within a minute).
 5. Repeat `/add` for **Codex**.
 6. The first run of an agent often stops at a sign-in, theme or "trust this folder" question. Its
    status turns red: **Needs your input**. Type `/answer`, choose the agent and answer in its

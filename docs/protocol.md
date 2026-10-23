@@ -244,7 +244,32 @@ A reply (`--re`) is never quiet: `say` refuses. Programs that write to the room 
 on their notifications. The mark is a field of the record, not words
 in the text. The person's messages always wake, even with the mark.
 
+The room's own notes go further: «X connected» and the merge queue's «waits», «Merged», «stopped» are never
+typed into an agent's window, not even with the next message. They stay in the log, in the person's chat and in
+the agent's `inbox`. Only «the queue may be stuck» is typed: it asks someone to act.
+
+Once an agent's commits land through the merge queue, delivery types `/clear` into its window at its next
+idle moment, after any message waiting for it: the next task does not re-read the last one's history on every
+wake. Only a Claude: a Codex keeps its conversation (the room finds it by its connection check).
+
 `collab deliver --from-now` marks old messages as already delivered, then listens for new ones. `collab start` creates panes and saves their IDs in `.collab/panes.json`; `collab start` manages the deliverer; a second deliverer is not needed. Terminal delivery is needed only for participants with `delivery: "tmux"`.
+
+## Talking to other agents
+
+Messages between agents are the room's largest cost. Each one wakes its recipient, and the recipient
+rereads its whole context — hundreds of thousands of tokens a wake-up for a long-running agent. Two agents
+answering each other without the person can spend more than the work itself.
+
+- Write to another agent only when the work cannot go on without it. With a team, tasks come from the
+  coordinator; the others report to it, not to each other.
+- One task — one message: the goal, the files, what to send back. Then three reports at most:
+  «Taking», «for review», «Merged» (with what is not proven). «Taking» and other notices — `say --quiet`.
+  So is «Merged» or «done» that asks nothing: the merge queue's own note already tells the person, and the
+  coordinator reads the report in its `inbox` with its next message. A report that needs a decision wakes.
+- No «got it», «thanks», «agreed»: `ack --no-reply`. No retelling of what the recipient can read: give
+  the file and line, or the message id for `collab show`.
+- Ask one agent for an independent opinion, not all of them at once. Do not write to `all` what one
+  participant needs: `all` wakes everyone.
 
 ## Work ownership
 

@@ -189,8 +189,9 @@ class Base(unittest.TestCase):
         mod.append_message(mod.ROOM, [pid], mod.ping_text(code))
         return code
 
-    def until(self, check, timeout=5.0):
-        """Wait for a condition instead of a fixed sleep: returns the last result. A check
+    def until(self, check, timeout=30.0):
+        """Wait for a condition instead of a fixed sleep: returns the last result. 30 s by default: a pass
+        is as fast, and under the queue's low priority 5 s ran out (a chat's screen, a client's). A check
         that raises is «not yet»: a screen read while the chat repaints is empty or half drawn, and
         `[...][-1]` on it failed the test instead of waiting; at the deadline it raises."""
         end = time.time() + timeout
@@ -501,9 +502,7 @@ class RoomTest(Base):
         self.assertEqual(mod.wrap_cols("    if x:", 40), ["    if x:"])
         self.assertEqual(mod.wrap_cols("        rm -rf  build", 40), ["        rm -rf  build"])
         self.assertEqual(mod.wrap_cols("one two three", 8), ["one two", "three"], "at a break the space goes")
-        self.assertEqual(
-            mod.wrap_cols(" " * 30 + "deep", 20), ["deep"], "an indent wider than the line leaves no empty one"
-        )
+        self.assertEqual(mod.wrap_cols(" " * 30 + "deep", 20), ["deep"], "an indent wider than the line leaves no empty one")
         # And colours from another screen: one hidden inside a title code is not the line's own.
         self.assertEqual(mod.colours_only("\x1b]0;a\x1b[31mb\x07X\x1b[32mY\x1b[0m"), "X\x1b[32mY\x1b[0m")
 
@@ -1109,6 +1108,70 @@ class RoomTest(Base):
             with self.assertRaises(mod.LinkedCopies):
                 mod.safe_copy()
         self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_python_orgs_pythons_off_path_are_found_or_named(self):
+        # python.org puts each version under /Library/Frameworks and links it on PATH only if asked to;
+        # off PATH, three stood there and install said «not found» without a word of them.
+        mod = _Loader(f"collab_frameworks_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        versions = self.root / "Versions"
+        good, group = versions / "3.13" / "bin" / "python3.13", versions / "3.12" / "bin" / "python3.12"
+        for path, mode in ((good, 0o755), (group, 0o775)):
+            path.parent.mkdir(parents=True)
+            path.write_text("#!/bin/sh\n", encoding="utf-8")
+            path.chmod(mode)
+        empty = self.root / "empty"
+        empty.mkdir()
+
+        def common():
+            # Fresh each time: a seam is entered once.
+            return [
+                mock.patch.dict(os.environ, {"PATH": str(empty)}),
+                seam(mod, "installer.PYTHON_ORG", versions),
+                seam(mod, "boot._inside", lambda *a: False),  # as if outside home, as /Library is
+                seam(mod, "boot.in_temp_folder", lambda real: False),
+                seam(mod, "boot.recorded_python", lambda as_written=False: ""),
+            ]
+
+        with contextlib.ExitStack() as stack:
+            for c in common():
+                stack.enter_context(c)
+            stack.enter_context(seam(mod, "installer.python311_version", lambda p: "3.13.1" if p == str(good) else None))
+            found = mod.find_python311()
+        self.assertEqual((os.path.realpath(found[0]), found[1]), (str(good), "3.13.1"), "found off PATH")
+        out = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            for c in common():
+                stack.enter_context(c)
+            stack.enter_context(seam(mod, "installer.python311_version", lambda p: None))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            self.assertFalse(mod.install_python_step(dry_run=True))
+        self.assertIn(f"Python {group}: found, refused — its group may change it; fix: sudo chmod g-w {group}", out.getvalue())
+
+    def test_the_codex_copy_is_refused_when_this_collab_is_not_the_built_program(self):
+        # Run from the package, «this collab» was its first module: the copy for Codex was 21 KB of it,
+        # and every say through it exited 0 having done nothing. Now no copy, and the reason said.
+        copies = self.root / "copies"
+        src = Path(__file__).resolve().parents[1] / "src"
+        code = "import collab.installer as i\ntry:\n    i.safe_copy()\nexcept i.NotTheProgram as e:\n    raise SystemExit(str(e))"
+        env = {**os.environ, "COLLAB_SAFE_DIR": str(copies), "PYTHONPATH": str(src)}
+        r = subprocess.run([sys.executable, "-c", code], cwd=self.root, text=True, capture_output=True, env=env, timeout=30)
+        self.assertNotEqual(r.returncode, 0, r.stdout)
+        self.assertIn("is not the built collab", r.stderr)
+        self.assertFalse(copies.exists() and any(copies.iterdir()), "no copy made")
+        r = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                f"import importlib.machinery as m; c = m.SourceFileLoader('c', {str(COLLAB)!r}).load_module(); print(c.safe_copy())",
+            ],
+            cwd=self.root,
+            text=True,
+            capture_output=True,
+            env={**os.environ, "COLLAB_SAFE_DIR": str(copies)},
+            timeout=30,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Path(r.stdout.strip()).read_bytes(), COLLAB.read_bytes(), "the built one is copied whole")
 
     def test_a_link_above_the_copies_is_allowed_unless_a_codex_may_write_where_it_leads(self):
         # ~/.local or ~/.local/share is often a link to dotfiles kept elsewhere —
@@ -1819,6 +1882,45 @@ class RoomTest(Base):
         with self.assertRaises(SystemExit):  # and the name, too, by the file now
             mod.launch_new_agent(stale, "claude", str(self.root), "Joined Meanwhile")
 
+    def test_a_claude_the_room_starts_is_not_asked_the_connection_check(self):
+        # The check woke a Claude only to answer «connected»: its window's process tells its session itself,
+        # and that is how the room continues it. A Codex is still asked — its conversation is found by the check.
+        self.write_config([{"id": "owner", "label": "Андрей"}])
+        opened: list[str] = []
+        mod = self._launch_mod("collab_launch_no_check", opened)
+        told = {"%10": ""}
+        self.enterContext(seam(mod, "screen.claude_of_window", lambda home, target: told.get(target, "")))
+        claude = mod.launch_new_agent(mod.load_config(), "claude", str(self.root), "Клод")
+        codex = mod.launch_new_agent(mod.load_config(), "codex", str(self.root), "Коди")
+        to = lambda pid: [m["text"] for m in self.messages() if m["to"] == [pid]]
+        self.assertEqual(to(claude), [], "nothing for the room to type into the new Claude")
+        self.assertEqual(len(to(codex)), 1, "the Codex is asked")
+        joined = lambda pid: next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == pid)["joined"]
+        mod.confirm_joins(mod.load_config(), mod.read_messages())
+        self.assertEqual(joined(claude), "pending", "no session told yet")
+        told["%10"] = "s-1"  # Claude wrote its session record for this window
+        mod.confirm_joins(mod.load_config(), mod.read_messages())
+        self.assertIs(joined(claude), True)
+        self.assertEqual(joined(codex), "pending", "a Codex joins by its answer only")
+        self.assertEqual(to(claude), [], "connected without a word typed to it")
+
+    def test_a_claude_that_tells_no_session_in_time_is_asked_as_before(self):
+        self.write_config([{"id": "owner", "label": "Андрей"}])
+        opened: list[str] = []
+        mod = self._launch_mod("collab_launch_late", opened)
+        self.enterContext(seam(mod, "screen.claude_of_window", lambda home, target: ""))
+        claude = mod.launch_new_agent(mod.load_config(), "claude", str(self.root), "Клод")
+        cfg = json.loads(self.cfg.read_text())
+        for q in cfg["participants"]:
+            if q["id"] == claude:
+                q["joined_at"] = "2000-01-01T00:00:00+00:00"  # long ago
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        for _ in range(2):
+            mod.confirm_joins(mod.load_config(), mod.read_messages())
+        asked = [m for m in self.messages() if m["to"] == [claude]]
+        self.assertEqual(len(asked), 1, "asked once, not every tick")
+        self.assertIn("Connection check", asked[0]["text"])
+
     def test_a_half_started_agent_is_undone(self):
         # A Codex's rule stayed for an id no one held when its window did not
         # open; an agent ran in a window the room did not know of when registering it failed.
@@ -1826,7 +1928,7 @@ class RoomTest(Base):
         opened: list[str] = []
         mod = self._launch_mod("collab_launch_undo", opened)
         rules: list[tuple[str, str]] = []
-        self.enterContext(seam(mod, "installer.codex_room_rule", lambda pid, folder: "the-rule"))
+        self.enterContext(seam(mod, "installer.codex_room_rule", lambda pid, folder, label="": "the-rule"))
         self.enterContext(seam(mod, "installer.set_agent_rule", lambda room, pid, cli: rules.append((pid, cli))))
         self.enterContext(seam(mod, "agents.add_participant", lambda entry: (_ for _ in ()).throw(OSError("disk full"))))
         with self.assertRaises(OSError):
@@ -2539,7 +2641,7 @@ class RoomTest(Base):
         told = [
             m
             for m in self.messages()
-            if m["from"] == "room" and "owner" in m["to"] and "will ask you before each room reply" in m["text"]
+            if m["from"] == "room" and "owner" in m["to"] and "Codex will ask permission for every reply" in m["text"]
         ]
         self.assertEqual(len(told), 1, self.messages())
         self.assertIn("config.toml", told[0]["text"])
@@ -2548,7 +2650,7 @@ class RoomTest(Base):
         other = mod.launch_new_agent(mod.load_config(), "codex", str(project), "Коди два")
         entry = next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == other)
         self.assertIn("cli", entry)
-        self.assertEqual(len([m for m in self.messages() if "will ask you before each room reply" in m["text"]]), 1)
+        self.assertEqual(len([m for m in self.messages() if "Codex will ask permission for every reply" in m["text"]]), 1)
 
     @unittest.skipUnless(HAVE_TMUX, "tmux not installed")
     def test_a_room_started_by_an_older_python_keeps_its_windows(self):
@@ -2590,6 +2692,44 @@ class RoomTest(Base):
         )
         self.assertIn("room", windows.stdout.split(), windows.stdout + windows.stderr)
         self.assertIn("deliver", windows.stdout.split(), windows.stdout + windows.stderr)
+
+    def test_the_deliverer_gets_the_rooms_settings_not_the_tmux_servers(self):
+        # A tmux server started earlier, from another shell, keeps that shell's environment; the
+        # deliverer's window got nothing of its own and looked for Codex where that shell said.
+        fresh = tempfile.mkdtemp(prefix="cr-", dir="/tmp")  # a server of this test's own
+        socket = os.path.join(fresh, f"tmux-{os.getuid()}", "default")
+        self.addCleanup(shutil.rmtree, fresh, True)
+        self.addCleanup(subprocess.run, ["tmux", "-S", socket, "kill-server"], capture_output=True)
+        session = f"collab-dv-{uuid.uuid4().hex[:6]}"
+        self.write_config([{"id": "owner", "command": ["sh", "-c", "sleep 120"]}], session=session)
+        env = {**os.environ, "TMUX_TMPDIR": fresh, "COLLAB_ROOT": str(self.root), "COLLAB_NO_ATTACH": "1"}
+        env.pop("COLLAB_NO_AUTODELIVER", None)
+        other = {**env, "CODEX_HOME": str(self.root / "another-shells-codex")}
+        hold = ["tmux", "new-session", "-d", "-s", session, "-n", "room", "sleep", "120"]
+        subprocess.run(hold, env=other, check=True, capture_output=True)
+        mark = ["tmux", "set-option", "-t", f"={session}:", "@collab_root", os.path.realpath(self.root)]
+        subprocess.run(mark, env=other, check=True, capture_output=True)  # this room's session, not another's
+        codex = str(self.root / "room-codex")
+        env["CODEX_HOME"] = codex
+        r = subprocess.run(["python3", str(COLLAB), "start"], cwd=self.root, env=env, text=True, capture_output=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+        def deliverer():
+            # Python itself, not the shell line that starts it: that line names «deliver» too.
+            pid = subprocess.run(
+                ["tmux", "-S", socket, "list-panes", "-t", f"={session}:=deliver", "-F", "#{pane_pid}"],
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            words = (
+                subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", pid], capture_output=True, text=True).stdout.split()
+                if pid
+                else []
+            )
+            return words if "deliver" in words and os.path.basename(words[0]).lower().startswith("python") else None
+
+        self.assertTrue(self.until(deliverer), "the deliverer started")
+        self.assertIn(f"CODEX_HOME={codex}", deliverer())
 
     def test_install_on_a_real_older_python_with_codex_installed_goes_to_the_end(self):
         # Install on 3.9 deliberately goes on past the version check (it is what finds a
@@ -3134,6 +3274,7 @@ class RoomTest(Base):
 
         mod = _Loader("collab_no_brew", str(COLLAB)).load_module()
         self.enterContext(seam(mod, "tmuxio.TMUX", "/nonexistent/tmux"))
+        self.enterContext(seam(mod, "tmuxio.mac_on_intel", lambda: False))  # a new Mac: Apple Silicon
         real_access = os.access
         with (
             seam(sys, "platform", "darwin"),
@@ -3203,9 +3344,81 @@ class RoomTest(Base):
             pid = mod.launch_new_agent(mod.load_config(), "codex", str(project), "Коди")
         entry = next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == pid)
         self.assertNotIn("cli", entry, "no rule naming a Python an agent could change")
-        told = [m for m in self.messages() if m["from"] == "room" and "will ask you before each room reply" in m["text"]]
+        told = [m for m in self.messages() if m["from"] == "room" and "Codex will ask permission for every reply" in m["text"]]
         self.assertEqual(len(told), 1, self.messages())
         self.assertIn("collab install", told[0]["text"])
+
+    def test_codex_rule_and_hint_use_installed_python_across_processes(self):
+        # Two real processes start on different Pythons; both must name the installation's Python.
+        recorded = "/installed/bin/python3"
+        code = textwrap.dedent("""\
+            import importlib.machinery, importlib.util, json, shlex, sys
+            from unittest import mock
+            sys.executable = sys.argv[2]
+            loader = importlib.machinery.SourceFileLoader("collab_process", sys.argv[1])
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[loader.name] = mod
+            loader.exec_module(mod)
+            with mock.patch.object(mod, "recorded_python", return_value=sys.argv[4]), mock.patch.object(mod, "trusted_interpreter", return_value=True):
+                mod.use_room(sys.argv[3])
+                if sys.argv[5] == "rule":
+                    mod.set_agent_rule(sys.argv[3], "codex", "/safe/collab")
+                    line = next(x for x in mod.paths().agent_rules.read_text().splitlines() if x.startswith("prefix_rule(pattern="))
+                    argv, _ = json.JSONDecoder().raw_decode(line[len("prefix_rule(pattern="):])
+                else:
+                    argv = shlex.split(mod.room_cmd("say", "--from codex hi", "/safe/collab"))
+                print(json.dumps(argv[:3]))
+            """)
+        results = []
+        for process_python, action in (("/rule-process/python3", "rule"), ("/hint-process/python3", "hint")):
+            run = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", code, str(COLLAB), process_python, str(self.root), recorded, action],
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(run.returncode, 0, run.stderr)
+            results.append(json.loads(run.stdout))
+        self.assertEqual(results[0], results[1], "the hinted interpreter must match the actual saved rule")
+        self.assertEqual(results[0], [recorded, "-I", "-S"])
+
+    def test_codex_python_change_drops_obsolete_rule_and_tells_person_once(self):
+        mod = _Loader("collab_python_changed", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        inst = mod.paths()
+        inst.codex_consent.parent.mkdir(parents=True, exist_ok=True)
+        inst.codex_consent.write_text("yes\n")
+        config = mod.load_config()
+        agent = {"id": "codex", "kind": "codex", "cli": "/safe/collab"}
+        message = {"id": "m1", "from": "claude", "to": ["codex"], "text": "hello"}
+        self.enterContext(seam(mod, "boot.trusted_interpreter", lambda python: True))
+        with seam(mod, "boot.recorded_python", lambda **kw: "/first/python3"):
+            mod.set_agent_rule(str(self.root), "codex", "/safe/collab")
+            mod.set_agent_rule(str(self.root), "other", "/other/collab")
+            self.assertIn("/first/python3", mod.delivery_text(agent, message, config, {}))
+        self.assertEqual(mod.read_messages(), [], "a matching rule needs no warning")
+        with seam(mod, "boot.recorded_python", lambda **kw: "/second/python3"):
+            for _ in range(2):
+                self.assertIn("/second/python3", mod.delivery_text(agent, message, config, {}))
+        rules = inst.agent_rules.read_text()
+        self.assertNotIn("id=codex", rules, "the obsolete rule was withdrawn")
+        self.assertIn("id=other", rules, "another agent's rule stays")
+        notes = mod.read_messages()
+        self.assertEqual(len(notes), 1)
+        self.assertIn("owner", notes[0]["to"])
+        self.assertIn("different Python", notes[0]["text"])
+        self.assertIn("restart this agent", notes[0]["text"])
+
+    def test_codex_python_falls_back_when_recorded_interpreter_is_not_trusted(self):
+        mod = _Loader("collab_python_fallback", str(COLLAB)).load_module()
+        with (
+            seam(mod, "boot.recorded_python", lambda **kw: "/unsafe/python3"),
+            seam(mod, "boot.trusted_interpreter", lambda python: False),
+        ):
+            self.assertEqual(mod.rule_python(), [os.path.realpath(sys.executable), "-I", "-S"])
+        with seam(mod, "boot.recorded_python", lambda **kw: ""):
+            self.assertEqual(mod.rule_python(), [os.path.realpath(sys.executable), "-I", "-S"])
 
     def test_the_codex_rule_names_the_interpreters_real_file(self):
         # The checks looked at the real file, the rule named the link — a
@@ -3218,11 +3431,11 @@ class RoomTest(Base):
         link.symlink_to(os.path.realpath(sys.executable))
         with mock.patch.object(sys, "executable", str(link)):
             mod = _Loader("collab_rule_real", str(COLLAB)).load_module()
-        self.assertEqual(mod.RULE_PYTHON[0], os.path.realpath(sys.executable))
+        self.assertEqual(mod.rule_python()[0], os.path.realpath(sys.executable))
         self.assertNotIn(str(link), mod.room_cmd("say", "--from x hi", "/safe/collab"))
 
     def test_the_hint_a_codex_gets_is_exactly_what_its_rule_allows(self):
-        # Rule and hint are both built from RULE_PYTHON; if they ever differ, Codex asks
+        # Rule and hint are both built from rule_python(); if they ever differ, Codex asks
         # before every reply again. Checked without Codex itself: the hint starts with a rule's pattern.
         from types import SimpleNamespace
 
@@ -3255,17 +3468,21 @@ class RoomTest(Base):
 
         def fake(name, helps):
             # Its help per subcommand («» — the top level); every call is logged: only --help may run.
+            # A shell script, not Python: it answers in milliseconds under a loaded machine, well inside
+            # the 3 seconds agent_command waits (a Python one took longer to start and the test went red).
             folder = self.root / name
             folder.mkdir()
             log = folder / "calls"
             prog = folder / "codex"
+            for sub, text in helps.items():
+                (folder / f"help-{sub or 'top'}").write_text(text, encoding="utf-8")
             prog.write_text(
-                f"#!{sys.executable}\nimport sys, time\n"
-                f"open({str(log)!r}, 'a').write(repr(sys.argv[1:]) + '\\n')\n"
-                f"helps = {helps!r}\n"
-                "sub = sys.argv[1] if len(sys.argv) > 2 else ''\n"
-                "if sys.argv[-1] != '--help' or sub not in helps: time.sleep(30)\n"
-                "print(helps[sub])\n",
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+                "for last; do :; done\n"
+                "if [ $# -gt 1 ]; then sub=$1; else sub=top; fi\n"
+                f"help={shlex.quote(str(folder))}/help-$sub\n"
+                'if [ "$last" = --help ] && [ -f "$help" ]; then cat "$help"; else exec sleep 30; fi\n',
                 encoding="utf-8",
             )
             prog.chmod(0o755)
@@ -3280,7 +3497,12 @@ class RoomTest(Base):
         ]
         for name, helps, new_flags, resume_flags in cases:
             folder, log = fake(name, helps)
-            with mock.patch.dict(os.environ, {"PATH": f"{folder}{os.pathsep}{os.environ['PATH']}"}):
+            # What is checked is which help names the flag, not how fast the machine is: at the merge
+            # queue's priority even a shell script overran the 3 seconds a codex has to answer.
+            with (
+                mock.patch.dict(os.environ, {"PATH": f"{folder}{os.pathsep}{os.environ['PATH']}"}),
+                seam(mod, "agents.CODEX_HELP_WAIT", 60),
+            ):
                 prog = str(folder / "codex")
                 self.assertEqual(shlex.split(mod.agent_command("codex")), [prog, "--no-alt-screen", *new_flags], name)
                 self.assertEqual(
@@ -3289,7 +3511,7 @@ class RoomTest(Base):
                     name,
                 )
             calls = log.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(calls, ["['--help']", "['resume', '--help']"], f"{name}: only its help ran, once each")
+            self.assertEqual(calls, ["--help", "resume --help"], f"{name}: only its help ran, once each")
         folder, _ = fake("silent", {})  # answers nothing: starts as before, and soon
         with mock.patch.dict(os.environ, {"PATH": f"{folder}{os.pathsep}{os.environ['PATH']}"}):
             began = time.monotonic()
@@ -3313,10 +3535,62 @@ class RoomTest(Base):
         )
         self.assertEqual(mod.codex_room_rule("cx", str(project)), "", f"no rule when Codex may write {above}")
 
+    def test_a_homebrew_that_cannot_run_here_is_never_the_advice(self):
+        # An Apple Silicon Homebrew carried over to an Intel Mac: install said «brew install tmux» and
+        # offered «brew install python@3.12», and brew died with «Bad CPU type in executable».
+        mod = _Loader(f"collab_brew_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        folder = self.root / "dead-brew"
+        folder.mkdir()
+        brew = folder / "brew"
+        brew.write_text("#!/bin/sh\necho 'Bad CPU type in executable' >&2\nexit 126\n", encoding="utf-8")
+        brew.chmod(0o755)
+        real_access = os.access
+        with (
+            mock.patch.object(sys, "platform", "darwin"),
+            mock.patch.dict(os.environ, {"PATH": f"{folder}{os.pathsep}/usr/bin{os.pathsep}/bin"}),
+            # This computer's own Homebrew, if any, is not the case under test.
+            seam(os, "access", lambda p, m: not str(p).startswith(("/opt/homebrew/", "/usr/local/")) and real_access(p, m)),
+        ):
+            self.assertFalse(mod.tmux_install_hint().startswith("install it:"), "a brew that does not run is not advised")
+            labels = [label for label, _ in mod.python_install_ways()]
+            self.assertFalse([x for x in labels if "Homebrew" in x], labels)
+            self.assertTrue([x for x in labels if "python.org" in x], "python.org's installer is still offered")
+            with seam(mod, "tmuxio.mac_on_intel", lambda: True):
+                self.assertIn("MacPorts", mod.tmux_install_hint(), "an Intel Mac gets a way that works there")
+        # The case as it was: on an Intel Mac, Apple Silicon's /opt/homebrew/bin/brew answers --version
+        # (a shell script) and fails only later, on its arm64 Ruby — it is not advised either.
+        with (
+            seam(sys, "platform", "darwin"),
+            seam(mod, "tmuxio.mac_on_intel", lambda: True),
+            seam(shutil, "which", lambda name: "/opt/homebrew/bin/brew" if name == "brew" else None),
+            seam(subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="Homebrew 7.0.7\n")),
+        ):
+            self.assertEqual(mod.working_brew(), "")
+            self.assertIn("MacPorts", mod.tmux_install_hint())
+            self.assertFalse([x for x, _ in mod.python_install_ways() if "Homebrew" in x])
+            with seam(mod, "tmuxio.mac_on_intel", lambda: False):
+                self.assertEqual(mod.tmux_install_hint(), "install it: brew install tmux", "a brew that runs is advised")
+        # The dead brew first on PATH does not hide an Intel Homebrew that runs, at /usr/local.
+        with (
+            seam(sys, "platform", "darwin"),
+            seam(mod, "tmuxio.mac_on_intel", lambda: True),
+            seam(shutil, "which", lambda name: "/opt/homebrew/bin/brew" if name == "brew" else None),
+            seam(os, "access", lambda p, m: str(p).endswith("/bin/brew") or real_access(p, m)),
+            seam(subprocess, "run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="Homebrew 4.6.0\n")),
+        ):
+            self.assertEqual(mod.tmux_install_hint(), "install it: /usr/local/bin/brew install tmux")
+        if sys.platform == "darwin":
+            # The machine is asked the same with a PATH that has no /usr/sbin: an Intel Mac read as Apple Silicon.
+            with mock.patch.dict(os.environ, {"PATH": "/nonexistent"}):
+                bare = mod.mac_on_intel()
+            self.assertEqual(bare, mod.mac_on_intel())
+
     def test_installing_python_is_one_enter_and_checks_the_package_first(self):
         # Not «go install Python» — a command, Enter, done; then install goes on by itself.
 
         mod = _Loader("collab_pyinstall", str(COLLAB)).load_module()
+        # Which Homebrew runs here is another test's: this one counts the commands install runs.
+        self.enterContext(seam(mod, "tmuxio.working_brew", lambda: ""))
         ways = mod.python_install_ways()
         if sys.platform == "darwin":
             label, steps = next(w for w in ways if "python.org" in w[0])
@@ -3394,6 +3668,153 @@ class RoomTest(Base):
         self.assertFalse(mod._safe_mode(st(0o775, 0, 80)), "our own pointer: no group write at all")
         self.assertFalse(mod._safe_mode(st(0o757, 0, 80), group_may_write=True), "others may write")
         self.assertTrue(mod._safe_mode(st(0o755, me, 20)))
+
+    def test_install_names_each_python_it_found_and_refused_and_how_to_fix_it(self):
+        # Three python.org Pythons, root:wheel and group-writable, were refused, and install said «not
+        # found». Each is named now, with why and the command that fixes it.
+        mod = _Loader(f"collab_refused_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        folder = self.root / "Frameworks" / "bin"
+        folder.mkdir(parents=True)
+        group, anyone = folder / "python3.12", folder / "python3.13"
+        for path, mode in ((group, 0o775), (anyone, 0o757)):
+            path.write_text("#!/bin/sh\n", encoding="utf-8")
+            path.chmod(mode)
+        out = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, {"PATH": str(folder)}),
+            # As if outside home and kept, as /Library/Frameworks is: only the files' own modes refuse them.
+            seam(mod, "boot._inside", lambda *a: False),
+            seam(mod, "boot.in_temp_folder", lambda real: False),
+            seam(mod, "boot.recorded_python", lambda as_written=False: ""),
+            seam(mod, "installer.python311_version", lambda path: None),  # the running one: not 3.11+ here
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertFalse(mod.install_python_step(dry_run=True))
+        text = out.getvalue()
+        self.assertIn(f"Python {group}: found, refused — its group may change it; fix: sudo chmod g-w {group}", text)
+        self.assertIn(f"Python {anyone}: found, refused — anyone may change it; fix: sudo chmod o-w {anyone}", text)
+
+    def test_codex_rule_refusal_explains_each_check_once(self):
+        mod = _Loader("collab_rule_notice", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        inst = mod.paths()
+        inst.codex_consent.parent.mkdir(parents=True, exist_ok=True)
+        inst.codex_consent.write_text("yes\n", encoding="utf-8")
+        project = str(self.root / "project")
+        copy = self.root / "copy"
+        writes = []
+        self.enterContext(seam(mod, "installer.prune_agent_rules", lambda: None))
+        self.enterContext(seam(mod, "installer.safe_copy", lambda: copy))
+        self.enterContext(seam(mod, "installer.set_agent_rule", lambda room, pid, cli: writes.append(cli)))
+        self.enterContext(seam(mod, "boot.trusted_interpreter", lambda python: True))
+        self.enterContext(seam(mod, "installer.codex_writable_roots", lambda: []))
+        self.enterContext(seam(mod, "installer.codex_can_write", lambda path, folder: False))
+        self.enterContext(seam(mod, "installer.codex_can_touch_python", lambda python, folder: False))
+        self.enterContext(seam(mod, "boot.recorded_python", lambda **kw: "/recorded/python"))
+        self.enterContext(seam(mod, "boot.link_folders", lambda python: ["/python-link"]))
+        cases = [
+            ("installer.codex_writable_roots", lambda: None, "settings"),
+            ("boot.trusted_interpreter", lambda python: False, "interpreter safety checks"),
+            ("installer.codex_can_write", lambda path, folder: path == copy, "command copy"),
+            (
+                "installer.codex_can_write",
+                lambda path, folder: path == mod.room().paths.root.resolve().parent,
+                "room folder through its parent",
+            ),
+            (
+                "installer.codex_can_touch_python",
+                lambda python, folder: python == sys.executable,
+                "running Python installation",
+            ),
+            ("installer.codex_can_write", lambda path, folder: path == mod.room().paths.base, "room storage folder"),
+            ("installer.codex_can_write", lambda path, folder: path == inst.python_file, "file recording collab"),
+            (
+                "installer.codex_can_touch_python",
+                lambda python, folder: python == "/recorded/python",
+                "recorded Python installation",
+            ),
+            (
+                "installer.codex_can_write",
+                lambda path, folder: path == Path("/python-link"),
+                "link leading to the recorded Python",
+            ),
+        ]
+        self.assertEqual(mod.codex_room_rule("codex", project), str(copy))
+        self.assertEqual(mod.read_messages(), [])
+        for index, (name, replacement, expected) in enumerate(cases, 1):
+            with self.subTest(check=expected), contextlib.ExitStack() as stack:
+                stack.enter_context(seam(mod, name, replacement))
+                if expected == "settings":
+                    # Preserve the real dependency: unreadable settings make every path writable.
+                    stack.enter_context(seam(mod, "installer.codex_can_write", lambda path, folder: True))
+                for _ in range(2):
+                    self.assertEqual(mod.codex_room_rule("codex", project), "")
+                messages = mod.read_messages()
+                self.assertEqual(len(messages), index, "one notice per agent and refusal reason")
+                note = messages[-1]
+                self.assertEqual(note["from"], "room")
+                self.assertIn("owner", note["to"])
+                self.assertIn(expected, note["text"])
+                self.assertIn("Codex will ask permission for every reply", note["text"])
+                self.assertIn("fix:", note["text"])
+                self.assertEqual(writes[-1], "", "remove the earlier rule")
+        reloaded = _Loader("collab_rule_notice_reloaded", str(COLLAB)).load_module()
+        reloaded.use_room(str(self.root))
+        with seam(reloaded, "boot.trusted_interpreter", lambda python: False):
+            self.assertEqual(reloaded.codex_room_rule("codex", project), "")
+        self.assertEqual(len(mod.read_messages()), len(cases), "deduplication survives a fresh process")
+        with seam(mod, "boot.trusted_interpreter", lambda python: False):
+            self.assertEqual(mod.codex_room_rule("another", project), "")
+        self.assertEqual(len(mod.read_messages()), len(cases) + 1, "another agent gets its own notice")
+        inst.codex_consent.unlink()
+        with seam(mod, "boot.trusted_interpreter", lambda python: False):
+            self.assertEqual(mod.codex_room_rule("another", project), "")
+        self.assertEqual(len(mod.read_messages()), len(cases) + 1, "no notice without install consent")
+
+    def test_codex_rule_refusal_to_replace_foreign_rules_notifies(self):
+        mod = _Loader("collab_rule_foreign_notice", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        inst = mod.paths()
+        inst.codex_consent.parent.mkdir(parents=True, exist_ok=True)
+        inst.codex_consent.write_text("yes\n", encoding="utf-8")
+        self.enterContext(seam(mod, "installer.prune_agent_rules", lambda: None))
+        self.enterContext(seam(mod, "boot.trusted_interpreter", lambda python: True))
+        self.enterContext(seam(mod, "installer.codex_can_write", lambda path, folder: False))
+        self.enterContext(seam(mod, "installer.codex_can_touch_python", lambda python, folder: False))
+        inst.agent_rules.parent.mkdir(parents=True, exist_ok=True)
+        inst.agent_rules.write_text("# my own rules\n")
+        self.assertEqual(mod.codex_room_rule("codex", str(self.root)), "")
+        self.assertEqual(inst.agent_rules.read_text(), "# my own rules\n")
+        self.assertIn("not managed by collab", mod.read_messages()[-1]["text"])
+        inst.agent_rules.unlink()
+        target = self.root / "other-rules"
+        target.write_text("# other rules\n")
+        inst.agent_rules.symlink_to(target)
+        self.assertEqual(mod.codex_room_rule("codex", str(self.root)), "")
+        self.assertEqual(target.read_text(), "# other rules\n")
+        self.assertIn("symbolic link", mod.read_messages()[-1]["text"])
+        inst.agent_rules.unlink()
+        self.assertTrue(mod.codex_room_rule("codex", str(self.root)))
+        self.assertEqual(len(mod.read_messages()), 2, "successful issuance adds no notice")
+
+    def test_codex_rule_copy_refusal_removes_old_rule_and_notifies(self):
+        mod = _Loader("collab_rule_copy_notice", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        inst = mod.paths()
+        inst.codex_consent.parent.mkdir(parents=True, exist_ok=True)
+        inst.codex_consent.write_text("yes\n", encoding="utf-8")
+        self.enterContext(seam(mod, "installer.prune_agent_rules", lambda: None))
+        for error in (OSError("copy unavailable"), SystemExit(2), mod.OperationFailed("copy refused")):
+            with self.subTest(error=type(error).__name__):
+                mod.set_agent_rule(str(self.root), "codex", "/old/copy")
+
+                def refuse(error=error):
+                    raise error
+
+                with seam(mod, "installer.safe_copy", refuse):
+                    self.assertEqual(mod.codex_room_rule("codex", str(self.root)), "")
+                self.assertNotIn("/old/copy", inst.agent_rules.read_text())
+                self.assertIn("read-only collab copy", mod.read_messages()[-1]["text"])
 
     def test_a_codex_the_room_starts_answers_only_in_its_room_as_itself(self):
         # Adding Codex must be easy — it answered only after asking the person. The first
@@ -3878,13 +4299,16 @@ for i in range(400):
         try:
             env = {**os.environ, "COLLAB_ROOT": str(self.root), "COLLAB_NO_AUTODELIVER": "1"}
             try:
+                # A deliverer that got past the lock runs for ever; one that refuses exits once it has
+                # started. 60 seconds tell the two apart on a loaded machine too, where the start of the
+                # whole program alone came near 10.
                 second = subprocess.run(
                     ["python3", str(COLLAB), "deliver", "--idle-ok"],
                     cwd=self.root,
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=10,
+                    timeout=60,
                 )
             except subprocess.TimeoutExpired:
                 self.fail("a second deliverer started and kept running")
@@ -5177,6 +5601,20 @@ for i in range(400):
         mod = _Loader("collab_codex_home", str(COLLAB)).load_module()
         self.assertIn(f"CODEX_HOME={os.environ['CODEX_HOME']}", mod.pane_env())
 
+    def test_a_room_window_gets_no_active_venv(self):
+        # `collab start` from a shell with a project's venv active gave every window, the chat and
+        # delivery PATH with that venv's bin first: their python3 was the project's.
+        mod = _Loader(f"collab_venv_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        venv = self.root / "proj" / ".venv"
+        rest = os.pathsep.join(["/usr/local/bin", "/usr/bin", "/bin"])
+        with mock.patch.dict(os.environ, {"VIRTUAL_ENV": str(venv), "PATH": f"{venv}/bin{os.pathsep}{rest}"}):
+            env = mod.pane_env()
+        self.assertIn(f"PATH={rest}", env, "the rest of PATH as it was")
+        self.assertFalse([x for x in env if str(venv) in x or x.startswith("VIRTUAL_ENV")], env)
+        with mock.patch.dict(os.environ, {"PATH": rest}):
+            os.environ.pop("VIRTUAL_ENV", None)
+            self.assertIn(f"PATH={rest}", mod.pane_env(), "no venv: PATH unchanged")
+
     def test_there_is_no_join_an_agent_comes_in_only_through_add(self):
         # «remove adding a session already running somewhere» — `collab join` too.
         out = self.run_collab("join", "--as", "x", "--kind", "claude")
@@ -5305,6 +5743,77 @@ for i in range(400):
         m = {"id": "demo; printf X", "from": "codex", "to": ["all"], "text": "\n".join("l" * 20), "at": ""}
         hint = mod.ANSI.sub("", mod.pretty(config, m, 80, 5)).splitlines()[-1]
         self.assertIn("collab show 'demo; printf X'", hint)
+
+
+class TalkStopTest(Base):
+    """Agents answering each other with no word from the person: after ten the room pauses and asks."""
+
+    def setUp(self):
+        super().setUp()
+        self.mod = _Loader(f"collab_talk_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        self.mod.use_room(str(self.root))
+        self.enterContext(seam(self.mod, "tmuxio.tmux", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", "")))
+
+    def say(self, sender, to, text="x", quiet=False):
+        args = argparse.Namespace(sender=sender, to=list(to), re="", quiet=quiet)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.mod.post_message(args, text)
+        return out.getvalue()
+
+    def paused(self):
+        return bool(json.loads(self.cfg.read_text(encoding="utf-8")).get("paused"))
+
+    def test_ten_messages_between_agents_pause_the_room_and_ask_the_person(self):
+        for i in range(9):
+            self.say("claude" if i % 2 else "codex", ["claude"] if not i % 2 else ["codex"])
+        self.assertFalse(self.paused(), "nine is talk, not a loop")
+        self.assertIn("Paused", self.say("claude", ["all"]))
+        self.assertTrue(self.paused())
+        note = self.messages()[-1]
+        self.assertEqual((note["from"], note["to"]), ("room", ["owner"]))
+        self.assertIn("/resume", note["text"])
+        self.assertIn("Held", self.say("codex", ["claude"]), "what an agent says now waits")
+        self.mod.set_paused(False)
+        for _ in range(9):
+            self.say("codex", ["claude"])
+        self.assertFalse(self.paused(), "resumed: counted anew, not paused at the next word")
+
+    def test_a_word_from_the_person_starts_the_count_again_and_notes_to_the_person_do_not_count(self):
+        for _ in range(9):
+            self.say("claude", ["codex"])
+        self.mod.append_message("owner", ["claude"], "go on", sign=True)
+        for _ in range(9):
+            self.say("claude", ["codex"])
+        self.say("claude", ["owner"])  # to the person: wakes no agent
+        self.say("codex", ["claude"], quiet=True)  # a quiet note wakes nobody
+        self.assertFalse(self.paused())
+        # «From the person», but written by an agent: not the person's word.
+        self.mod.append_message("owner", ["claude"], "fake", sign=False)
+        self.mod.append_message("owner", ["claude"], "signed once", sign=True)
+        for _ in range(9):
+            self.say("claude", ["codex"])
+        self.say("codex", ["owner"], "x")
+        self.mod.append_message("owner", ["codex"], "unsigned again", sign=False)
+        self.say("codex", ["claude"])
+        self.assertTrue(self.paused(), "an unsigned «from the person» is no break")
+
+    def test_the_limit_is_the_rooms_to_set_and_zero_never_pauses(self):
+        data = json.loads(self.cfg.read_text(encoding="utf-8"))
+        self.cfg.write_text(json.dumps({**data, "talk_limit": 25}), encoding="utf-8")
+        for i in range(24):
+            self.say("claude" if i % 2 else "codex", ["codex"] if i % 2 else ["claude"])
+        self.assertFalse(self.paused(), "25 set: the 11th and on to the 24th do not pause")
+        self.say("claude", ["codex"])
+        self.assertTrue(self.paused(), "the 25th does")
+        self.mod.set_paused(False)
+        self.cfg.write_text(json.dumps({**data, "talk_limit": 0}), encoding="utf-8")
+        for _ in range(40):
+            self.say("claude", ["codex"])
+        self.assertFalse(self.paused(), "0: never")
+        for wrong in (-1, "10", True, 2.5):
+            self.cfg.write_text(json.dumps({**data, "talk_limit": wrong}), encoding="utf-8")
+            with self.assertRaises(SystemExit, msg=repr(wrong)):
+                self.mod.load_config()
 
 
 class ReportTest(Base):
@@ -5580,6 +6089,69 @@ class DeliveryTest(Base):
         finally:
             subprocess.run(["tmux", "kill-session", "-t", f"={session}"], capture_output=True)
 
+    def test_the_chat_is_started_by_the_current_collab_not_the_copy_the_room_was_made_with(self):
+        # The room's file names the copy `init` ran from; after an install put a new copy beside it,
+        # start ran the delivery on the new one and the person's chat (and its /dm) on the old.
+        session = f"collab-cur-{uuid.uuid4().hex[:6]}"
+        ran_old = self.root / "old-copy-ran"
+        old = Path(os.environ["COLLAB_SAFE_DIR"]) / "command" / uuid.uuid4().hex[:16] / "collab"
+        old.parent.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, old.parent, True)
+        old.write_text(f"import pathlib, time\npathlib.Path({str(ran_old)!r}).write_text('old')\ntime.sleep(60)\n")
+        self.write_config(
+            [{"id": "owner", "command": ["python3", str(old), "chat", "--as", "owner"], "delivery": "pull"}], session=session
+        )
+        try:
+            started = self.run_collab("start")
+            self.assertEqual(started.returncode, 0, started.stderr)
+            self.assertNotIn("besides your chat", started.stdout, "the recorded chat is still started unasked")
+
+            def chat_args():
+                pids = subprocess.run(
+                    ["tmux", "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}"], capture_output=True, text=True
+                ).stdout.split()
+                table = [
+                    ln.split(None, 2)
+                    for ln in subprocess.run(
+                        ["ps", "-ax", "-o", "pid=,ppid=,args="], capture_output=True, text=True
+                    ).stdout.splitlines()
+                ]
+                found = [
+                    row[2]
+                    for row in table
+                    if len(row) == 3 and (row[0] in pids or row[1] in pids) and " chat --as owner" in row[2]
+                ]
+                return found
+
+            found = self.until(chat_args)
+            self.assertTrue(found, "the chat window ran")
+            self.assertIn(str(COLLAB), found[0])
+            self.assertNotIn(str(old), " ".join(found))
+            self.assertFalse(ran_old.exists(), "the old copy was started")
+        finally:
+            subprocess.run(["tmux", "kill-session", "-t", f"={session}"], capture_output=True)
+
+    def test_a_room_started_in_a_venv_shell_runs_without_the_venv(self):
+        # Started from a shell with a project's venv active, the room's windows ran that venv's python3.
+        session = f"collab-venv-{uuid.uuid4().hex[:6]}"
+        out = self.root / "venv-seen"
+        venv = self.root / "proj" / ".venv"
+        (venv / "bin").mkdir(parents=True)
+        self.write_config(
+            [{"id": "owner", "command": ["sh", "-c", f'printf "%s|%s" "$PATH" "${{VIRTUAL_ENV-unset}}" > {out}; sleep 60']}],
+            session=session,
+        )
+        path = os.environ["PATH"]
+        try:
+            with mock.patch.dict(os.environ, {"VIRTUAL_ENV": str(venv), "PATH": f"{venv}/bin{os.pathsep}{path}"}):
+                started = self.run_collab("start")
+            self.assertEqual(started.returncode, 0, started.stderr)
+            self.assertIn("venv", started.stdout, "the person is told the venv stays out")
+            self.assertTrue(self.until(lambda: out.exists() and out.read_text()), "the window ran")
+            self.assertEqual(out.read_text(), f"{path}|unset")
+        finally:
+            subprocess.run(["tmux", "kill-session", "-t", f"={session}"], capture_output=True)
+
     def test_a_folder_name_is_not_a_tmux_format_in_start_directory(self):
         # tmux 3.8: -c expands formats as well — a folder «x#{session_name}y»
         # started its window in «xy» (a missing folder: in ~). Only the pane's own `cd` saved it.
@@ -5765,6 +6337,116 @@ class DeliveryTest(Base):
         self.assertLess(line.index("a real question"), line.index("Merge queue"), "the quiet ones go last")
         time.sleep(0.3)
         self.assertNotIn("→ agent", self.run_collab("deliver", "--once").stdout, "both went in that line")
+
+    def test_the_rooms_own_notes_are_never_typed_to_an_agent_and_stay_in_its_inbox(self):
+        # «X connected» and the merge queue's notes woke every idle agent — each wake re-reads its whole
+        # context, and they were most of an evening's wakes. Never typed, not even with the next message:
+        # the agent reads them in its inbox when it wakes for something else.
+        agent = self.root / "agent.sh"
+        self.write_config(
+            [
+                {"id": "owner"},
+                {"id": "agent", "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$"},
+                {"id": "other", "delivery": "pull"},
+                {
+                    "id": "newbie",
+                    "label": "Newbie",
+                    "delivery": "pull",
+                    "joined": "pending",
+                    "join_code": "ab12",
+                    "joined_at": "2000-01-01T00:00:00+00:00",
+                },
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["agent"]
+        self.assertTrue(self.wait_for(pane, "READY"))
+        self.assertEqual(self.run_collab("say", "--from", "newbie", "--to", "owner", "connected ab12").returncode, 0)
+        self.run_collab("deliver", "--once")  # the room sees the answer: «Newbie connected.»
+        self.assertIn("Newbie connected.", [m["text"] for m in self.messages() if m["from"] == "room"])
+        self.note("other", ["all"], "Merged abc into main through the merge queue", quiet=True, silent=True)
+        self.assertNotIn("→ agent", self.run_collab("deliver", "--once").stdout)
+        inbox = self.run_collab("inbox", "--for", "agent").stdout
+        self.assertIn("Newbie connected.", inbox)
+        self.assertIn("Merged abc", inbox)
+        typed = lambda: (  # the whole window, its history too: the line wraps at its width
+            subprocess.run(["tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", pane], capture_output=True, text=True).stdout
+        )
+        self.note("other", ["agent"], "a real question")
+        self.assertEqual(self.run_collab("deliver", "--once").stdout.count("→ agent"), 1)
+        self.assertTrue(self.until(lambda: "got:" in typed()), self.screen(pane))
+        time.sleep(0.3)  # READY again
+        self.assertNotIn("→ agent", self.run_collab("deliver", "--once").stdout)
+        self.assertEqual(typed().count("got:"), 1, typed())
+        self.assertIn("a real question", typed())
+        self.assertNotIn("connected", typed(), "not even with the next message")
+        self.assertNotIn("Merged", typed())
+
+    def test_an_answer_to_the_connection_check_is_not_typed_to_the_other_agents(self):
+        # «connected 7348» went to everyone: each check of one agent woke all the others.
+        agent = self.root / "agent.sh"
+        self.write_config(
+            [
+                {"id": "owner"},
+                {"id": "agent", "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$"},
+                {
+                    "id": "newbie",
+                    "delivery": "pull",
+                    "joined": "pending",
+                    "join_code": "ab12",
+                    "joined_at": "2000-01-01T00:00:00+00:00",
+                },
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["agent"]
+        self.assertTrue(self.wait_for(pane, "READY"))
+        self.assertEqual(self.run_collab("say", "--from", "newbie", "connected ab12").returncode, 0)  # to everyone
+        self.assertNotIn("→ agent", self.run_collab("deliver", "--once").stdout)
+        newbie = next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "newbie")
+        self.assertIs(newbie["joined"], True, "the room still reads the answer")
+        self.assertIn("connected ab12", self.run_collab("inbox", "--for", "agent").stdout)
+        self.assertEqual(self.run_collab("say", "--from", "newbie", "connected ab12 again").returncode, 0)
+        self.assertEqual(self.run_collab("deliver", "--once").stdout.count("→ agent"), 1, "joined, it talks as anyone")
+
+    def test_after_its_landing_a_claude_is_given_clear_when_it_is_free_and_a_codex_is_not(self):
+        # The history of a finished task was re-read on every wake of the next one. Once what an agent
+        # landed is in main, its next idle moment gets /clear — after any real message, never instead of it.
+        agent = self.root / "agent.sh"
+        self.write_config(
+            [
+                {"id": "owner"},
+                {"id": "agent", "kind": "claude", "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$"},
+                {"id": "cx", "kind": "codex", "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$"},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        panes = json.loads((self.state / "panes.json").read_text())["panes"]
+        for pid in ("agent", "cx"):
+            self.assertTrue(self.wait_for(panes[pid], "READY"))
+        typed = lambda pid: (
+            subprocess.run(
+                ["tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", panes[pid]], capture_output=True, text=True
+            ).stdout
+        )
+        mod = _Loader(f"collab_room_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        mod.clear_after_merge("agent", "abc1234")
+        mod.clear_after_merge("cx", "abc1234")
+        self.note("owner", ["agent"], "one more thing")  # a real message goes first
+        self.run_collab("deliver", "--once")
+        self.assertTrue(self.until(lambda: "got:" in typed("agent")), self.screen(panes["agent"]))
+        self.assertNotIn("/clear", typed("agent"))
+        self.assertTrue(self.until(lambda: typed("agent").rstrip().endswith("READY")))
+        self.assertIn("cleared agent", self.run_collab("deliver", "--once").stdout)
+        self.assertTrue(self.until(lambda: "got:/clear" in typed("agent")), typed("agent"))
+        time.sleep(0.3)  # READY again
+        self.assertNotIn("cleared", self.run_collab("deliver", "--once").stdout, "once per landing")
+        self.assertEqual(typed("agent").count("got:/clear"), 1)
+        self.assertNotIn("got:", typed("cx"), "a Codex keeps its conversation")
 
     def test_a_quiet_note_in_the_persons_name_still_wakes_the_agent(self):
         # A person's letter is never left waiting, marked or not — signed, or in their name unsigned (it then
@@ -5997,9 +6679,9 @@ class DeliveryTest(Base):
         """Until a chat has started and drawn its input line: one term for all of them — a start, not a step."""
         return self.wait_for(pane, needle, timeout=self.CHAT_START)
 
-    def wait_for(self, pane, needle, timeout=10.0):
-        # 10 s, not 5: under a full parallel run a chat's redraw took longer, and a step of
-        # test_esc_goes_back_one_step_everywhere failed once in a run. A pass is as fast.
+    def wait_for(self, pane, needle, timeout=30.0):
+        # 30 s, not 5 or 10: under a full parallel run at the queue's low priority a chat's redraw took
+        # longer, and steps of several chat tests failed once a run. A pass is as fast.
         end = time.time() + timeout
         while time.time() < end:
             if needle in self.screen(pane):
@@ -7636,6 +8318,56 @@ class DeliveryTest(Base):
         self.assertIn("…: Ready", bar(), "the name is cut, the state kept")
         self.assertIn("Opus 5.5", bar())
 
+    def test_a_resize_while_the_chat_starts_keeps_the_feed_above_the_input(self):
+        # tmux resets the scroll region on a resize. One that came after the chat laid out its screen,
+        # before its feed began, was never seen: the next message scrolled the whole window, the input
+        # and its rule with it. The chat is held at that moment here; a full run's load found it by chance.
+        hold, held = self.root / "hold", self.root / "held"
+        hold.touch()
+        chat = self.root / "chat.py"
+        chat.write_text(
+            "import importlib.machinery, os, sys, time\n"
+            f"c = importlib.machinery.SourceFileLoader('collab_chat', {str(COLLAB)!r}).load_module()\n"
+            "laid, border_title, read_messages = [], c.border_title, c.read_messages\n"
+            "def titled(*a, **k):\n"
+            "    laid.append(1)\n"
+            "    return border_title(*a, **k)\n"
+            "def read(*a, **k):\n"
+            "    if laid and os.path.exists(%r):\n"
+            "        size = os.get_terminal_size()\n"
+            "        open(%r, 'w').close()\n"
+            "        while os.path.exists(%r) or os.get_terminal_size() == size:  # until the resize is here\n"
+            "            time.sleep(0.05)\n"
+            "    return read_messages(*a, **k)\n"
+            "c.border_title, c.read_messages = titled, read\n"
+            "sys.argv = ['collab', 'chat', '--as', 'owner', '--interval', '0.2']\n"
+            "c.main()\n" % (str(hold), str(held), str(hold)),
+            encoding="utf-8",
+        )
+        self.write_config(
+            [
+                {"id": "owner", "label": "Андрей", "command": ["python3", str(chat)]},
+                {"id": "codex", "label": "Коди", "pane": False},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.until(held.exists, timeout=self.CHAT_START), self.screen(pane))  # laid out, feed not begun
+        subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", "100", "-y", "50"], check=True)
+        hold.unlink()
+        self.assertTrue(self.wait_chat(pane))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "\n".join(f"line-{i}" for i in range(20)))
+        self.assertTrue(self.wait_for(pane, "line-19"), self.screen(pane))
+
+        def laid_out():
+            rows = self.screen(pane).split("\n")
+            last = max(i for i, row in enumerate(rows) if "line-19" in row)
+            mine = [i for i, row in enumerate(rows) if "Андрей → Everyone" in row]
+            return bool(mine) and last < mine[0]
+
+        self.assertTrue(self.until(laid_out), "the feed above the input: " + self.screen(pane))
+
     def test_a_long_message_to_the_person_is_shown_whole(self):
         # «the message was cut — it's a bug»: 16 lines to the person became 12 and
         # «… more lines — collab show ID», which the chat can't run. To everyone — still cut.
@@ -8245,11 +8977,16 @@ class DeliveryTest(Base):
             f"*) COLLAB_ROOT={self.root} python3 {COLLAB} ack --for agent --id $id >/dev/null;; esac;"
         )
         self._silent_agent_room(mark)
-        self.owner_says("thanks")
-        self._drive(5)
+        thanks = self.owner_says("thanks")
+        # Until the agent has closed it, not for 5 s: under load it had not yet, and the test said nothing of that.
+        marks = self.state / "no-reply" / "agent.json"
+        closed = lambda: marks.exists() and thanks["id"] in json.loads(marks.read_text(encoding="utf-8"))
+        self._drive(30, until=closed)
+        self.assertTrue(closed(), "the agent closed «thanks» with no reply")
+        self._drive(2)  # past the quiet time (1 s): a wait not closed would have raised its note by now
         self.assertFalse([m for m in self.messages() if m["from"] == "room"], "a closed message raises nothing")
         self.owner_says("a question")
-        self._drive(10, until=lambda: any(m["from"] == "room" for m in self.messages()))
+        self._drive(30, until=lambda: any(m["from"] == "room" for m in self.messages()))
         notes = [m["text"] for m in self.messages() if m["from"] == "room"]
         self.assertEqual(len(notes), 1, notes)
         self.assertIn("hasn't replied", notes[0], "read but unanswered is still silence")
@@ -8428,7 +9165,9 @@ class DeliveryTest(Base):
         )
         self._silent_agent_room(reply)
         self.owner_says("a question")
-        self._drive(5)
+        # Until it answered, not for 5 s; then past the quiet time (1 s), when an open wait would raise its note.
+        self._drive(30, until=lambda: any(m["from"] == "agent" for m in self.messages()))
+        self._drive(2)
         answers = [m for m in self.messages() if m["from"] == "agent"]
         self.assertEqual(len(answers), 1)
         self.assertTrue(answers[0].get("re"))
@@ -9889,11 +10628,10 @@ class DeliveryTest(Base):
         run("deliver", "--once")
         st = json.loads((self.state / "status.json").read_text())["newbie"]["state"]
         self.assertIn(st, ("joining",), "until the check is answered it is «подключается»")
-        deadline = time.time() + 10
-        while time.time() < deadline and not any(m["text"] == "Newbie connected." for m in self.messages()):
-            run("deliver", "--once")
-            time.sleep(0.3)
-        self.assertTrue(any(m["text"] == "Newbie connected." for m in self.messages()), self.messages())
+        # Until the answer is in, not a fixed 10 s: under the queue's low priority the stand-in's own
+        # `collab say` took longer, and the check was delivered but its answer not yet counted.
+        connected = lambda: any(m["text"] == "Newbie connected." for m in self.messages())
+        self.assertTrue(self.until(lambda: run("deliver", "--once") and connected()), self.messages())
         self.assertTrue(self.wait_for(pane, "Newbie connected"))
         subprocess.run(["tmux", "send-keys", "-t", pane, "Tab"], check=True)
         self.assertTrue(self.wait_for(pane, "Андрей → Newbie"), "the new participant is in Tab without a restart")
@@ -11083,7 +11821,8 @@ class DeliveryTest(Base):
         self.assertTrue(self.wait_for(bek["target"], "fake claude here"))
         where = self.pane_cwd(bek["target"])
         self.assertEqual(os.path.realpath(where), os.path.realpath(work), "in its own folder")
-        self.assertTrue(any(m["to"] == ["bek"] and "Connection check" in m["text"] for m in self.messages()))
+        # A Claude is not asked: it joins when its window tells its session (confirm_joins).
+        self.assertFalse(any(m["to"] == ["bek"] and "Connection check" in m["text"] for m in self.messages()))
 
     def test_add_opens_its_window_in_the_session_the_room_runs_in_now(self):
         # /add took the session from the chat's copy of .collab.json; after
@@ -12456,13 +13195,14 @@ class JournalReadTest(Base):
 
     def test_another_writer_during_the_reads(self):
         # Another process says while this one reads again and again: no message lost, none twice,
-        # and a line half written at a read is not lost once it is whole.
+        # and a line half written at a read is not lost once it is whole. To the person: thirty between
+        # agents would pause the room at the tenth.
         env = {**os.environ, "COLLAB_ROOT": str(self.root), "COLLAB_NO_AUTODELIVER": "1"}
         writer = subprocess.Popen(
             [
                 "sh",
                 "-c",
-                'for i in $(seq 1 30); do "$0" "$1" say --from claude --to codex "w$i" >/dev/null; done',
+                'for i in $(seq 1 30); do "$0" "$1" say --from claude --to owner "w$i" >/dev/null; done',
                 sys.executable,
                 str(COLLAB),
             ],
@@ -12898,6 +13638,57 @@ class UsageTest(Base):
         self.assertEqual((rec["from_ts"], rec["to_ts"]), ("2099-01-01T10:00:00+00:00", "2099-01-01T10:00:00+00:00"))
         self.assertEqual(self.mod.increment(self.agent), [], "nothing new — nothing")
         self.assertNotIn("SECRET", json.dumps(got) + (self.state / "usage-cursor.json").read_text(), "numbers only")
+
+    def test_a_record_counts_its_answers_and_the_longest_context_of_one(self):
+        # Without them /clear and Sonnet cannot be measured: a context is input + cache read + cache write of one
+        # answer. One answer written in three lines is one answer.
+        self.mod.increment(self.agent)
+        line = self.answer(
+            "c2", "2099-01-01T10:01:00Z", input_tokens=4, cache_read_input_tokens=5000, cache_creation_input_tokens=600
+        )
+        self.write(
+            self.log(),
+            self.answer("c1", "2099-01-01T10:00:00Z", input_tokens=1, cache_read_input_tokens=900, cache_creation_input_tokens=99),
+            line, line, line,
+            self.answer("c3", "2099-01-01T10:02:00Z", input_tokens=2, cache_read_input_tokens=3000, cache_creation_input_tokens=0),
+        )  # fmt: skip
+        (rec,) = self.mod.increment(self.agent)
+        self.assertEqual((rec["answers"], rec["ctx_max"]), (3, 5604))
+
+    def test_a_claude_of_inits_example_has_its_session_kept_and_its_spending_read(self):
+        # `init`'s example seats every installed agent and `start` opens their windows: no /add marked them
+        # «started by the room», delivery never kept their sessions, and the report showed Codex alone.
+        from types import SimpleNamespace
+
+        seat = {"id": "claude", "label": "Петя", **json.loads(json.dumps(self.mod.PRESETS["claude"]))}
+        self.write_config([{"id": "owner", "command": ["sh"]}, seat])
+        shown = SimpleNamespace(returncode=0, stdout="❯ \n", stderr="")
+        self.enterContext(seam(self.mod, "tmuxio.tmux", lambda *a, **k: shown))
+        self.enterContext(seam(self.mod, "screen.pane_guard", lambda *a, **k: ""))
+        self.enterContext(seam(self.mod, "screen.screen_model", lambda *a, **k: ""))
+        self.enterContext(seam(self.mod, "screen.claude_session_model", lambda *a, **k: ""))
+        self.enterContext(seam(self.mod, "deliver.hold_for_limit", lambda *a, **k: False))
+        self.enterContext(seam(self.mod, "deliver.watch_for_reply", lambda *a, **k: None))
+        self.enterContext(seam(self.mod, "deliver.deliver_to", lambda *a, **k: ""))
+        windows = []
+        self.enterContext(seam(self.mod, "screen.claude_of_window", lambda home, pane: windows.append(pane) or self.SID))
+        self.mod.deliver_one(self.mod.load_config()["participants"][1], "%7", self.mod.load_config(), [])
+        self.assertEqual(windows, ["%7"], "its window is the one delivery types into")
+        agent = self.mod.load_config()["participants"][1]
+        self.assertEqual(agent.get("window_session"), self.SID)
+        self.mod.increment(agent)
+        self.write(self.log(), self.answer("i1", "2099-01-01T10:00:00Z"))
+        self.assertEqual([r["output"] for r in self.mod.increment(agent)], [10])
+
+    def test_a_seat_in_a_folder_of_its_own_is_read_from_that_folders_logs(self):
+        # `start` opens a seat's window in its «cwd»: Claude keeps its logs under that folder's name.
+        work = self.root / "work"
+        work.mkdir()
+        files = self.mod.claude_files({"id": "claude", "window_session": self.SID, "cwd": "work"})
+        expect = self.home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(work)) / f"{self.SID}.jsonl"
+        self.assertEqual(files[0], expect)
+        odd = self.mod.claude_files({"window_session": self.SID, "cwd": 5})
+        self.assertEqual(odd[0].parent, self.folder, "not a path: the project's folder")
 
     def test_one_record_per_model_and_the_iterations_when_the_top_is_zeros(self):
         self.mod.increment(self.agent)
