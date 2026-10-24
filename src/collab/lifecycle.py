@@ -20,6 +20,7 @@ import collab.log as m_log
 import collab.screen as m_screen
 import collab.installer as m_installer
 import collab.deliver as m_deliver
+import collab.telegram as m_telegram
 import collab.agents as m_agents
 
 
@@ -192,6 +193,20 @@ def start_deliverer(session: str) -> None:
             m_tmuxio.in_dir(str(rp.root), cmd),
             check=False,
         )
+
+
+def start_telegram(session: str) -> None:
+    """The room's Telegram, when it is on: in its own hidden window, like the deliverer — started anew on each start
+    (new code), gone with the room."""
+    if m_telegram.load().get("state") != "on":
+        return
+    rp = m_store.room().paths
+    cmd = f"python3 {shlex.quote(m_boot.SELF)} telegram run --room {shlex.quote(str(rp.root))}"
+    where = ["-c", m_tmuxio.tmux_dir(str(rp.root)), *m_tmuxio.pane_env(), m_tmuxio.in_dir(str(rp.root), cmd)]
+    if m_tmuxio.tmux("list-panes", "-t", f"={session}:=telegram", check=False).returncode == 0:
+        m_tmuxio.tmux("respawn-window", "-k", "-t", f"={session}:=telegram", *where, check=False)
+    else:
+        m_tmuxio.tmux("new-window", "-d", "-t", f"={session}:", "-n", "telegram", *where, check=False)
 
 
 def deliverer_outside(session: str) -> str:
@@ -819,6 +834,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         # person's chat comes back if /exit closed it.
         if not os.environ.get("COLLAB_NO_AUTODELIVER"):
             start_deliverer(session)
+            start_telegram(session)
         room_options(session)
         restore_owner_pane(session, config)
         not_running(config)
@@ -884,5 +900,6 @@ def cmd_start(args: argparse.Namespace) -> None:
             # The deliverer lives in the room's own hidden window: no second terminal to keep open,
             # and it ends with the room.
             start_deliverer(session)
+            start_telegram(session)
     m_tmuxio.tmux("select-pane", "-t", panes[own[0]["id"]], check=False)
     m_tmuxio.attach(session)

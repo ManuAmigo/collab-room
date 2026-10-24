@@ -21,6 +21,7 @@ import collab.screen as m_screen
 import collab.installer as m_installer
 import collab.ledger as m_ledger
 import collab.deliver as m_deliver
+import collab.telegram as m_telegram
 import collab.agents as m_agents
 import collab.lifecycle as m_lifecycle
 import collab.chat_base as m_chat_base
@@ -849,6 +850,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--add", action="append", metavar="KIND:NAME[:ROLE[:TOPIC]]", help="a new agent")
     s.set_defaults(func=cmd_propose)
+
+    s = sub.add_parser(
+        "telegram", help="the room's Telegram: status, off, limit N (tokens a day); /telegram in the chat connects it"
+    )
+    s.add_argument("action", nargs="?", choices=["on", "off", "unlink", "status", "run", "limit"], default="status")
+    s.add_argument("tokens", nargs="?", type=int, default=0, help="with limit: tokens a day (0 — none)")
+    s.set_defaults(func=m_telegram.cmd_telegram)
 
     s = sub.add_parser("goal", help="the lead declares the room's goal reached: its rounds stop")
     s.add_argument("action", choices=["reached"])

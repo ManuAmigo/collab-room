@@ -909,6 +909,8 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
     # free text, is never typed with it.
     role = m_store.effective(m_screen.agent_kind(p), p, config, "role")
     you = f"you: {role} · " if role in m_store.ROLES else ""
+    if m.get("via") == "telegram" and not warn:
+        warn = "(via Telegram) "  # the person writes from the phone: a short answer reads best there
     return f"[{m['from']} → {', '.join(m['to'])}] {warn}{body}" + (f"  ({you}{hint})" if p.get("reply_hint", True) else "")
 
 

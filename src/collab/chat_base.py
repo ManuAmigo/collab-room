@@ -78,6 +78,8 @@ def pretty(config: dict[str, Any], m: dict[str, Any], width: int, max_lines: int
     )
     if m_log.unsigned_person(m, config):
         head += " " + m_text.paint(m_i18n.tr("⚠ not from the chat"), "1;38;5;196")
+    elif m.get("via") == "telegram":
+        head += " " + m_text.paint(m_i18n.tr("· via Telegram"), "2")  # signed with the mark: the person wrote it there
     body: list[str] = []
     # «→» in a text is drawn «->»: only the room draws a head with «→», and a body line «Anna →
     # Everyone · 13:05» read as a head.

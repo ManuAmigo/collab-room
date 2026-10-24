@@ -68,6 +68,7 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "остановить комнату: закрыть её окна и остановить запущенных ею агентов",
     },
     "cmd.exit": {"en": "close this chat panel", "ru": "закрыть этот чат, агенты продолжат работу"},
+    "cmd.telegram": {"en": "write to the lead from Telegram", "ru": "писать ведущему из Telegram"},
     "cmd.language": {"en": "the room's language", "ru": "язык комнаты"},
     # The scenarios' picker and preview.
     "team.what": {"en": "What will we do?", "ru": "Что будем делать?"},
@@ -1146,6 +1147,122 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "this copy of collab only answers in a room: say, ack, inbox, propose, goal",
         "ru": "эта копия collab только отвечает в комнате: say, ack, inbox, propose, goal",
     },
+    "t.44b27cd811": {
+        "en": "Telegram is unlinked: the account was unlinked in the bot.",
+        "ru": "Telegram отвязан: аккаунт отвязали в боте.",
+    },
+    "t.c88b83b32f": {
+        "en": "Telegram is off: the bot refused this room's key.",
+        "ru": "Telegram выключен: бот не принял ключ этой комнаты.",
+    },
+    "t.4576180ab0": {
+        "en": "telegram: no connection to the bot ({why}); trying again",
+        "ru": "telegram: нет связи с ботом ({why}); пробую снова",
+    },
+    "t.5dcea1f2f5": {
+        "en": "The bot did not answer ({exc}). Nothing was changed in the room.",
+        "ru": "Бот не ответил ({exc}). В комнате ничего не изменено.",
+    },
+    "t.b4835437f1": {
+        "en": "Open {bot} in Telegram and send: /start {code} — the code works {minutes} min.",
+        "ru": "Откройте {bot} в Telegram и отправьте: /start {code} — код действует {minutes} мин.",
+    },
+    "t.66f4f10cc7": {
+        "en": "Telegram is on: `collab start` keeps it running in the room's window «telegram».",
+        "ru": "Telegram включён: `collab start` держит его в окне комнаты «telegram».",
+    },
+    "t.94ab42363a": {
+        "en": "Telegram is off for this room. Its link stays: `collab telegram on` turns it back on.",
+        "ru": "Telegram для этой комнаты выключен. Привязка сохранена: включить снова — `collab telegram on`.",
+    },
+    "t.a508eeed1a": {
+        "en": "The bot did not answer ({exc}). Nothing was changed.",
+        "ru": "Бот не ответил ({exc}). Ничего не изменено.",
+    },
+    "t.754bb75d3a": {
+        "en": "Telegram is unlinked from this room; messages that waited: {n}, cancelled.",
+        "ru": "Telegram отвязан от этой комнаты; ожидавших сообщений отменено: {n}.",
+    },
+    "t.2fa6aa1158": {
+        "en": "Telegram is not set up for this room: `collab telegram on`.",
+        "ru": "Telegram для этой комнаты не настроен: `collab telegram on`.",
+    },
+    "t.d209d9cd02": {
+        "en": "Telegram: {state} · server {server}",
+        "ru": "Telegram: {state} · сервер {server}",
+    },
+    "t.7c037e60d8": {
+        "en": "· via Telegram",
+        "ru": "· из Telegram",
+    },
+    "help.265b3666ee": {
+        "en": "Write to the room's lead from Telegram: connect, turn off, unlink",
+        "ru": "Писать ведущему комнаты из Telegram: подключить, выключить, отвязать",
+    },
+    "t.6499c7afe8": {
+        "en": "New code",
+        "ru": "Новый код",
+    },
+    "t.622e30c24b": {
+        "en": "Turn Telegram off",
+        "ru": "Выключить Telegram",
+    },
+    "t.1277ad1578": {
+        "en": "Unlink the account",
+        "ru": "Отвязать аккаунт",
+    },
+    "t.6dd8eed50f": {
+        "en": "Connect Telegram",
+        "ru": "Подключить Telegram",
+    },
+    "t.4af668331f": {
+        "en": "Telegram is on: write to the lead in the room's topic.",
+        "ru": "Telegram включён: пишите ведущему в теме комнаты.",
+    },
+    "t.27b4c62286": {
+        "en": "Telegram is off. Connect your account to write to this room's lead from Telegram.",
+        "ru": "Telegram выключен. Подключите свой аккаунт, чтобы писать ведущему этой комнаты из Telegram.",
+    },
+    "t.793e0cf852": {
+        "en": "collab telegram run runs only in the room's own window «telegram»: `collab start` opens it.",
+        "ru": "collab telegram run работает только в собственном окне комнаты «telegram»: его открывает `collab start`.",
+    },
+    "t.d6ac9e06a7": {
+        "en": "Telegram is the person's to set up: /telegram in their chat. An agent does not turn it on or off.",
+        "ru": "Telegram настраивает человек: /телеграм в его чате. Агент не включает и не выключает его.",
+    },
+    "t.77eea7bc12": {
+        "en": "Spent today: {spent} tokens of {limit}.",
+        "ru": "Расход за сегодня: {spent} токенов из {limit}.",
+    },
+    "t.b36fe408a7": {
+        "en": "Telegram is set up in the room's chat: /telegram there connects or unlinks it.",
+        "ru": "Telegram настраивается в чате комнаты: там /телеграм подключает и отвязывает его.",
+    },
+    "t.ec48df8bb2": {
+        "en": "The spending limit is the person's to set. An agent does not change it.",
+        "ru": "Предел расхода ставит человек. Агент его не меняет.",
+    },
+    "t.db4e86bf7d": {
+        "en": "Telegram is not set up for this room: /telegram in the room's chat.",
+        "ru": "Telegram для этой комнаты не настроен: /телеграм в чате комнаты.",
+    },
+    "t.cb26578afb": {
+        "en": "A day's limit: {n} tokens — past it, Telegram tells you once a day.",
+        "ru": "Дневной предел: {n} токенов — выше него Telegram скажет вам раз в день.",
+    },
+    "t.b0883a4854": {
+        "en": "No day's limit: Telegram does not tell you of spending.",
+        "ru": "Дневного предела нет: о расходе Telegram не сообщает.",
+    },
+    "t.f3ec24635b": {
+        "en": "Telegram is the person's to turn off: /telegram in their chat. An agent does not.",
+        "ru": "Telegram выключает человек: /телеграм в его чате. Агент — нет.",
+    },
+    "t.4c37c5c96f": {
+        "en": "Open it in Telegram — the code goes with it ({minutes} min): {link}",
+        "ru": "Откройте в Telegram — код уже в ссылке ({minutes} мин): {link}",
+    },
     "t.f2493a3e04": {
         "en": "The update at collab start is off. `collab update` still updates when you run it; --on turns it back on.",
         "ru": "Автоматическое обновление при collab start выключено. Команда `collab update` по-прежнему запускает обновление вручную. Включить автоматическое обновление: collab update --on.",
@@ -1658,6 +1775,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/stop", "/остановить"),
     ("/exit", "/выход"),
     ("/quit", "/выйти"),
+    ("/telegram", "/телеграм"),
     ("/language", "/язык"),
 ]
 SUBCOMMANDS: dict[str, dict[str, str]] = {"/dm": {"закрыть": "close"}, "/team": {"сохранить": "save"}}

@@ -128,6 +128,7 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = 
             ("/clear", "Clear the history for everyone; old messages move to an archive"),
             ("/stop", "Stop the room: its windows and the agents it started close; history stays"),
             ("Ctrl+C · /exit", "Close this chat panel (asks first); agents keep running"),
+            ("/telegram", "Write to the room's lead from Telegram: connect, turn off, unlink"),
             ("/language", "The room's language: Russian or English"),
         ]
     # In the room's language: each command by the name it shows, each line from the catalog; keys stay as they are.

@@ -5,16 +5,20 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, cast
+import time
 import collab.boot as m_boot
 import collab.text as m_text
+import collab.qr as m_qr
 import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
 import collab.screen as m_screen
 import collab.deliver as m_deliver
+import collab.telegram as m_telegram
 import collab.agents as m_agents
 import collab.lifecycle as m_lifecycle
+import collab.chat_base as m_chat_base
 
 
 @dataclass(frozen=True)
@@ -736,6 +740,61 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             from_cmd="/stop",
         )
         say_(m_i18n.tr("Stop the room? ") + m_lifecycle.describe_stop(closing, staying))
+        return
+    if line == "/telegram":
+        on = m_telegram.load().get("state") == "on"
+        ctx.wizard.clear()
+        options = (
+            [
+                (m_i18n.tr("New code"), "connect"),
+                (m_i18n.tr("Turn Telegram off"), "off"),
+                (m_i18n.tr("Unlink the account"), "unlink"),
+            ]
+            if on
+            else [(m_i18n.tr("Connect Telegram"), "connect")]
+        )
+        ctx.wizard.update(
+            step="telegram_pick",
+            from_cmd="/telegram",
+            prompt=m_i18n.tr("Telegram is on: write to the lead in the room's topic.")
+            if on
+            else m_i18n.tr("Telegram is off. Connect your account to write to this room's lead from Telegram."),
+            options=options + [(m_i18n.words_in("team.back", m_store.room_language(m_store.load_config())), "back")],
+        )
+        return
+    if ctx.wizard.get("step") == "telegram_pick":
+        ctx.wizard.clear()
+        if line == "back":
+            return
+        try:
+            if line == "connect":
+                code, expires, link = m_telegram.enable()
+                minutes = max(1, int((expires - time.time()) // 60))
+                if link:  # the link first: a tap opens the bot, its Start sends the code itself
+                    say_(
+                        m_i18n.tr(
+                            "Open it in Telegram — the code goes with it ({minutes} min): {link}", minutes=minutes, link=link
+                        )
+                    )
+                    # A phone scans it from the screen: its lines kept whole, black on white of their own.
+                    ctx.feed("\n".join(m_chat_base.WHOLE + line for line in m_qr.draw(link)))
+                say_(
+                    m_i18n.tr(
+                        "Open {bot} in Telegram and send: /start {code} — the code works {minutes} min.",
+                        bot=m_telegram.BOT,
+                        code=code,
+                        minutes=minutes,
+                    )
+                )
+                m_lifecycle.start_telegram(m_store.load_config().get("session", "collab-room"))
+            elif line == "off":
+                m_telegram.disable()
+                say_(m_i18n.tr("Telegram is off for this room. Its link stays: `collab telegram on` turns it back on."))
+            elif line == "unlink":
+                n = m_telegram.unlink()
+                say_(m_i18n.tr("Telegram is unlinked from this room; messages that waited: {n}, cancelled.", n=n))
+        except (m_telegram.Refused, OSError) as exc:
+            say_(m_i18n.tr("The bot did not answer ({exc}). Nothing was changed.", exc=exc))
         return
     if line == "/language":
         # Its own question in both: a person who cannot read the room's language still finds theirs.

@@ -172,6 +172,18 @@ Type `/` to open the command menu (↑/↓, Enter), or type a command directly.
 | `/stop` | Stop the room: close its windows and the agents it started; history stays |
 | `/exit` (or `/quit`) | Close your chat; agents keep running |
 
+### Telegram
+
+`/telegram` in the chat gives a link to the bot with a one-time code in it, the same as a QR code to scan with
+your phone, and the code itself (`/start CODE`); the room gets a topic of its own in your chat with the bot. What you write there goes to the room's lead, marked
+«via Telegram»; the lead's answers to you come back there. A message from Telegram is read and answered, never
+taken as the go-ahead for a change of the team — that stays an Enter on your computer. The room asks the bot's
+server itself (HTTPS): your computer opens no port; while it sleeps, messages wait on the server up to a day.
+`/telegram` turns it off or unlinks your account (only from the chat: an agent's command does not link
+a room to an account). In Telegram the lead's question is marked as one, an agent waiting for you in its
+window is named, and the room's pause is said; `collab telegram limit N` — past N tokens in a day, the room's
+topic gets one line a day with the spend by agent (a notice; delivery goes on).
+
 ## Agent statuses
 
 The bar above the input shows one cell per agent: its name, model, state, and how long it has been

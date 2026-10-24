@@ -37,6 +37,7 @@ ALIAS_PREFIX = "m_"
 LAYERS = [
     "boot",
     "text",
+    "qr",
     "i18n",
     "term",
     "store",
@@ -48,6 +49,7 @@ LAYERS = [
     "installer",
     "ledger",
     "deliver",
+    "telegram",
     "agents",
     "lifecycle",
     "chat_base",

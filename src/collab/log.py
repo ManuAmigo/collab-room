@@ -184,6 +184,8 @@ def append_message(
     brief: bool = False,
     proposal: dict[str, Any] | None = None,
     said: dict[str, Any] | None = None,
+    via: str = "",
+    tg: str = "",
 ) -> dict[str, Any]:
     rp = m_store.room().paths
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": m_store.now(), "from": sender, "to": to, "text": text}
@@ -199,6 +201,10 @@ def append_message(
         record["proposal"] = proposal  # a change of the team the person applies (store.proposal_card)
     if said is not None:
         record["said"] = said  # the room's own line: its English template and parameters, retold in the chat's language
+    if via:
+        record["via"] = via  # where the person wrote it (telegram): under the signature, so no one adds or drops it
+    if tg:
+        record["tg"] = tg  # the bot server's id of it: taken twice, written once
     if sign:
         record["sig"] = signature(owner_key(create=True), record)
         mark_signing(record["id"])
@@ -370,7 +376,10 @@ def owner_key(create: bool = False) -> bytes:
 
 
 def signature(key: bytes, m: dict[str, Any]) -> str:
-    data = json.dumps([m["id"], m["at"], m["from"], m["to"], m["text"], m.get("re", "")], ensure_ascii=False)
+    fields: list[Any] = [m["id"], m["at"], m["from"], m["to"], m["text"], m.get("re", "")]
+    if m.get("via"):
+        fields.append(["via", m["via"]])  # only then: what was signed before stays signed
+    data = json.dumps(fields, ensure_ascii=False)
     return hmac.new(key, data.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -475,6 +484,8 @@ def request_of(m: dict[str, Any], config: dict[str, Any], messages: list[dict[st
     req = next((x for x in messages if x.get("id") == m.get("re")), None)
     if req is None or req.get("from") not in m_store.people_ids(config) or req.get("to") != [m.get("from")]:
         return None
+    if req.get("via"):
+        return None  # written from Telegram: read and answered, never a request a change applies by (nor shown as one)
     key = owner_key()
     if not key or not hmac.compare_digest(str(req.get("sig", "")), signature(key, req)):
         return None

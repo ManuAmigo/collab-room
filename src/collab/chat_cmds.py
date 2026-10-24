@@ -136,6 +136,7 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
         in (
             "/add",
             "/team",
+            "/telegram",
             "/language",
             "/remove",
             "/stop",

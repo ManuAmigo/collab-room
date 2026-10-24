@@ -4,6 +4,15 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.13
+
+- Telegram: `/telegram` in the room's chat links your account to the room's bot — a link that opens it with the code, a QR code to scan, or the code itself; each room gets a topic of its own. · Telegram: `/телеграм` в чате комнаты привязывает ваш аккаунт к боту — ссылкой, которая открывает его с кодом, QR-кодом или самим кодом; у каждой комнаты своя тема.
+- Write to the lead from its topic, Reply to answer a question; the lead's answers, questions, proposals and the goal reached come back there. A message from Telegram is never taken as the go-ahead for a change of the team. · Пишите ведущему в теме комнаты, Reply — ответ на вопрос; ответы, вопросы и предложения ведущего и «цель достигнута» приходят туда же. Сообщение из Telegram никогда не считается разрешением менять команду.
+- «Needs you»: an agent waiting for you in its window is named in the room's topic; the room's pause is said there too. · «Нужен ты»: агент, который ждёт вас в своём окне, назван в теме комнаты; там же — о паузе комнаты.
+- `/status` in a room's topic and `/rooms` outside them show where each room is and what waits for you. · `/status` в теме комнаты и `/rooms` вне тем показывают, где каждая комната и что ждёт вас.
+- `collab telegram limit N`: past N tokens in a day, one line a day with the spend by agent. · `collab telegram limit N`: выше N токенов за день — одна строка в день с расходом по агентам.
+- When all is well the bot says nothing: a 👀 on your message once the room has it; only failures are said in words. · Когда всё в порядке, бот молчит: 👀 на вашем сообщении, когда комната его взяла; словами — только сбои.
+
 ## 0.1.12
 
 - A Codex agent can lead a room: it proposes team changes and declares the goal reached through its narrow rule; every change it proposes waits for your Enter. · Агент Codex может вести комнату: предлагает изменения команды и объявляет цель достигнутой через своё узкое правило; каждое его предложение ждёт вашего Enter.

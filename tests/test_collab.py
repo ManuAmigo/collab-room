@@ -12,6 +12,7 @@ import textwrap
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import datetime as dt
 import unittest
@@ -14425,6 +14426,61 @@ class DeliveryTest(Base):
         self.assertNotIn("topic", ann())
         self.assertIn("Your proposal is declined.", [m["text"] for m in self.messages() if m["to"] == ["lea"]])
 
+    def test_telegram_in_the_chat_gives_a_code_and_turns_off(self):
+        bot = FakeBotServer()
+        self.addCleanup(bot.server.shutdown)
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "idle": "x", "role": "lead"},
+            ],
+            session=self.session,
+        )
+        mod = _Loader(f"collab_tgchat_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        mod.enable(bot.url)  # registered with this test's server; the chat goes on with it
+        mod.disable()
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(pane))
+        keys = lambda *k: self.press(pane, *k, most=0.6)
+        keys("-l", "/telegram")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Telegram is off. Connect your account"), self.screen(pane))
+        keys("Enter")  # Connect Telegram
+        self.assertTrue(self.wait_for(pane, "/start ABCDEFGHJKMN"), self.screen(pane))
+        history = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", pane], capture_output=True, text=True
+        ).stdout
+        self.assertIn("https://t.me/Test_room_bot?start=ABCDEFGHJKMN", history, "the link first")
+        self.assertIn("▀", self.screen(pane), "and its QR code under it")
+        self.assertEqual(json.loads((self.state / "telegram.json").read_text())["state"], "on")
+        self.assertTrue(
+            self.until(
+                lambda: (
+                    subprocess.run(["tmux", "list-panes", "-t", f"={self.session}:=telegram"], capture_output=True).returncode
+                    == 0
+                )
+            ),
+            "its window runs",
+        )
+        time.sleep(2)  # a run refused would have ended by now, and its window with it
+        alive = subprocess.run(
+            ["tmux", "list-panes", "-t", f"={self.session}:=telegram", "-F", "#{pane_dead}"], capture_output=True, text=True
+        )
+        self.assertEqual((alive.returncode, alive.stdout.strip()), (0, "0"), "run runs in its own window")
+        keys("-l", "/телеграм")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Telegram is on: write to the lead"), self.screen(pane))
+        keys("Down")
+        keys("Enter")  # Turn Telegram off
+        self.assertTrue(self.wait_for(pane, "Telegram is off for this room"), self.screen(pane))
+        self.assertEqual(json.loads((self.state / "telegram.json").read_text())["state"], "off")
+
     def test_a_room_made_in_russian_speaks_russian_and_language_switches_it(self):
         # The person's default (saved at the first run) gives a new room its language; /язык changes the room's.
         (self.root / "language").write_text("ru\n", encoding="utf-8")
@@ -15911,3 +15967,317 @@ class CodexScreenTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# The QR code of a bot link at level M, by the reference implementation (Nayuki's qrcodegen 1.8.0: version 4, mask 2),
+# a row a hex number of its 33 modules; checked to read back by an independent decoder (zxing-cpp).
+QR_LINK_ROWS = [
+    "1fc0cb07f",
+    "104de9041",
+    "175abfa5d",
+    "175073f5d",
+    "175aa485d",
+    "105efd141",
+    "1fd55557f",
+    "001764d00",
+    "17c1f977c",
+    "048c5536f",
+    "0dd135016",
+    "041550cde",
+    "1d4f04da8",
+    "1935f9807",
+    "00ca4a8f2",
+    "0c9053eec",
+    "19fe8a5b9",
+    "112fdf2ed",
+    "14cea8cb6",
+    "15030ec3c",
+    "1ccb31faa",
+    "17beec00d",
+    "10d379d86",
+    "1407a0a24",
+    "117ba85f8",
+    "001d97117",
+    "1fc935756",
+    "105010b1f",
+    "1751449f8",
+    "175eb901b",
+    "175f42e6c",
+    "104c5399c",
+    "1fd0127a6",
+]
+
+
+class QrTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = _Loader(f"collab_qr_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+
+    def test_a_links_code_is_the_reference_implementations(self):
+        m = self.mod.matrix("https://t.me/Callaba_room_bot?start=ABCDEFGHJKMN")
+        self.assertEqual(len(m), 33)
+        self.assertEqual([format(int("".join("1" if x else "0" for x in row), 2), "x").rjust(9, "0") for row in m], QR_LINK_ROWS)
+
+    def test_it_is_drawn_black_on_white_in_half_blocks_with_a_quiet_zone(self):
+        lines = self.mod.draw("https://t.me/Callaba_room_bot?start=ABCDEFGHJKMN")
+        self.assertEqual(len(lines), (33 + 4 + 1) // 2)
+        self.assertTrue(all(x.startswith("\033[30;107m") and x.endswith("\033[0m") for x in lines), "its own colours")
+        plain = [x[len("\033[30;107m") : -len("\033[0m")] for x in lines]
+        self.assertEqual({len(x) for x in plain}, {37})
+        self.assertEqual(plain[0], " " * 37, "a quiet zone above")
+        self.assertTrue(set("".join(plain)) <= set(" ▀▄█"))
+
+    def test_up_to_213_bytes_and_no_more(self):
+        self.assertEqual(len(self.mod.matrix("x" * 213)), 57, "version 10")
+        with self.assertRaises(ValueError):
+            self.mod.matrix("x" * 214)
+
+
+class FakeBotServer:
+    """The bot's server as the room meets it: /v1, tokens, a queue handed out until acknowledged. In this process,
+    on a free port — no network, no bot."""
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.rooms, self.queue, self.sent, self.acked, self.events = {}, [], [], [], []
+        self.refuse = False
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+
+            def reply(self, status, body):
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def handle_any(self):
+                size = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(size) or b"{}") if size else {}
+                path = self.path.split("?")[0]
+                if path == "/v1/rooms" and self.command == "POST":
+                    rid = uuid.uuid4().hex
+                    fake.rooms[rid] = {"token": "tok-" + rid, "name": body.get("name")}
+                    return self.reply(200, {"room_id": rid, "token": fake.rooms[rid]["token"]})
+                rid = path.split("/")[3]
+                if fake.refuse or self.headers.get("Authorization") != f"Bearer {fake.rooms.get(rid, {}).get('token')}":
+                    return self.reply(401, {"error": "unauthorized"})
+                tail = path.split("/", 4)[4] if path.count("/") >= 4 else ""
+                if tail == "state":
+                    fake.rooms[rid]["state"] = body
+                    return self.reply(200, {})
+                if tail == "code":
+                    return self.reply(200, {"code": "ABCDEFGHJKMN", "expires": time.time() + 600, "bot": "Test_room_bot"})
+                if tail == "updates":
+                    waiting = [m for m in fake.queue if m["id"] not in fake.acked]
+                    events, fake.events = fake.events, []
+                    return self.reply(200, {"events": events, "messages": waiting, "after": len(events)})
+                if tail == "ack":
+                    fake.acked += body["messages"]
+                    return self.reply(200, {})
+                if tail == "messages":
+                    if body["room_msg"] not in [m["room_msg"] for m in fake.sent]:
+                        fake.sent.append(body)
+                    return self.reply(200, {})
+                if tail == "link":
+                    return self.reply(200, {"cancelled": 0})
+                return self.reply(404, {"error": "no such path"})
+
+            do_GET = do_POST = do_PUT = do_DELETE = handle_any
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+
+class TelegramTest(Base):
+    participants = [
+        {"id": "owner", "label": "Андрей"},
+        {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "idle": "x", "role": "lead"},
+        {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x"},
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.bot = FakeBotServer()
+        self.addCleanup(self.bot.server.shutdown)
+        self.mod = _Loader(f"collab_tg_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        self.mod.use_room(str(self.root))
+
+    def test_on_registers_the_room_keeps_its_token_private_and_gives_a_code(self):
+        code, _, link = self.mod.enable(self.bot.url)
+        self.assertEqual(code, "ABCDEFGHJKMN")
+        self.assertEqual(link, "https://t.me/Test_room_bot?start=ABCDEFGHJKMN", "the bot's own name, from the server")
+        path = self.state / "telegram.json"
+        self.assertEqual(oct(path.stat().st_mode & 0o777), "0o600")
+        token = json.loads(path.read_text())["token"]
+        (rid,) = self.bot.rooms
+        self.assertEqual(
+            {k: self.bot.rooms[rid]["state"][k] for k in ("name", "hint", "lead_name", "lang", "has_lead", "needs_you")},
+            {
+                "name": self.root.name,
+                "hint": self.root.parent.name,
+                "lead_name": "Lea",
+                "lang": "en",
+                "has_lead": True,
+                "needs_you": 0,
+            },
+        )
+        self.assertEqual(
+            self.bot.rooms[rid]["state"]["agents"], [{"name": "Lea", "state": "unknown"}, {"name": "Ann", "state": "unknown"}]
+        )
+        self.assertNotIn(token, (self.state / "messages.jsonl").read_text() if (self.state / "messages.jsonl").exists() else "")
+        self.mod.enable(self.bot.url)
+        self.assertEqual(len(self.bot.rooms), 1, "on again: the same room, a new code")
+
+    def test_a_message_from_telegram_is_the_persons_signed_with_its_mark_and_written_once(self):
+        state = self.mod.load() or None
+        self.mod.enable(self.bot.url)
+        self.bot.queue.append({"id": "in1", "text": "compare the two, please", "re": None, "at": 0})
+        state = self.mod.take_in(self.mod.load(), 0)
+        self.bot.acked.clear()  # the ack was lost: the server hands it out again
+        self.mod.take_in(state, 0)
+        got = [m for m in self.messages() if m.get("tg") == "in1"]
+        self.assertEqual(len(got), 1, "taken twice, written once")
+        m = got[0]
+        self.assertEqual((m["from"], m["to"], m["text"], m["via"]), ("owner", ["lea"], "compare the two, please", "telegram"))
+        self.assertFalse(self.mod.unsigned_person(m, self.mod.load_config()), "signed with the person's key")
+        stripped = {k: v for k, v in m.items() if k != "via"}
+        self.assertTrue(self.mod.unsigned_person(stripped, self.mod.load_config()), "the mark is under the signature")
+        self.assertIn("in1", self.bot.acked)
+
+    def test_a_message_from_telegram_is_never_a_request_a_change_applies_by(self):
+        self.mod.enable(self.bot.url)
+        self.bot.queue.append({"id": "in2", "text": "make Ann cheaper", "re": None, "at": 0})
+        self.mod.take_in(self.mod.load(), 0)
+        req = next(m for m in self.messages() if m.get("tg") == "in2")
+        proposal = {"id": "p1", "from": "lea", "to": ["owner"], "re": req["id"], "text": "", "proposal": {"changes": []}}
+        self.assertIsNone(self.mod.request_of(proposal, self.mod.load_config(), self.messages()))
+        chat = self.mod.append_message("owner", ["lea"], "make Ann cheaper", sign=True)
+        proposal["re"] = chat["id"]
+        self.assertIsNotNone(self.mod.request_of(proposal, self.mod.load_config(), self.messages()), "from the chat it is")
+
+    def test_the_leads_messages_to_the_person_go_to_telegram_once_and_nothing_else(self):
+        self.mod.enable(self.bot.url)
+        state = self.mod.send_out(self.mod.load())  # the first look: from now
+        self.mod.append_message("lea", ["owner"], "Which plan do you use?")
+        self.mod.append_message("lea", ["ann"], "your part: prices")
+        self.mod.append_message("ann", ["owner"], "hi from Ann")
+        self.mod.room_line(
+            ["owner"],
+            "{lead} declared the goal reached: {goal}. The lead's rounds stop; /team can continue them.",
+            lead="Lea",
+            goal="the task",
+        )
+        state = self.mod.send_out(state)
+        self.mod.send_out(state)
+        self.assertEqual(
+            [(m["kind"], m["text"][:22]) for m in self.bot.sent],
+            [("question", "Which plan do you use?"), ("goal", "Lea declared the goal ")],
+        )
+
+    def test_a_refused_key_turns_telegram_off_and_tells_the_person(self):
+        self.mod.enable(self.bot.url)
+        self.bot.refuse = True
+        self.mod.run(wait=0)
+        self.assertEqual(self.mod.load()["state"], "off")
+        self.assertIn("Telegram is off: the bot refused this room's key.", [m["text"] for m in self.messages()])
+
+    def test_what_the_server_says_reaches_the_terminal_only_by_its_shape(self):
+        # A server (another's, or a broken one) answered a code or an error with terminal escapes: they were printed.
+        self.mod.enable(self.bot.url)
+        with seam(self.mod, "telegram.call", lambda *a, **k: {"code": "\u001b]0;pwned\u0007AB", "expires": 1.0}):
+            with self.assertRaises(self.mod.Refused):
+                self.mod.enable(self.bot.url)
+        self.bot.refuse = True
+        state = self.mod.load()
+        with mock.patch.object(self.bot, "refuse", True):
+            try:
+                self.mod.call(state["server"], "GET", f"/v1/rooms/{state['room_id']}/updates", None, "x")
+            except self.mod.Refused as exc:
+                self.assertNotIn("\u001b", str(exc))
+
+    def test_an_agent_does_not_set_telegram_up_and_run_runs_only_in_its_window(self):
+        # An agent turning it on with a server of its own would have its words come back signed as the person's.
+        out = io.StringIO()
+        with seam(self.mod, "screen.caller_claude_session", lambda: "11111111-2222-3333-4444-555555555555"):
+            with mock.patch.object(sys, "argv", ["collab", "telegram", "on"]):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), self.assertRaises(SystemExit):
+                    self.mod.main()
+        self.assertIn("Telegram is set up in the room's chat", out.getvalue())
+        self.assertEqual(self.bot.rooms, {}, "nothing registered")
+        r = self.run_collab("telegram", "run")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("only in the room's own window", r.stderr)
+
+    def test_a_leads_own_message_is_a_question_its_answer_a_reply_and_a_pause_its_own_kind(self):
+        self.mod.enable(self.bot.url)
+        state = self.mod.send_out(self.mod.load())
+        asked = self.mod.append_message("owner", ["lea"], "how much?", sign=True)
+        self.mod.append_message("lea", ["owner"], "Around $12.", re_=asked["id"])
+        self.mod.append_message("lea", ["owner"], "Include the first year?")
+        self.mod.room_line(
+            ["owner"],
+            "Agents wrote {n} messages to each other in a row without you, each waking an agent with its whole context. The room is paused: what they say waits. /resume lets them go on.",
+            n=20,
+        )
+        self.mod.send_out(state)
+        self.assertEqual([(m["kind"], m["text"]) for m in self.bot.sent],
+                         [("reply", "Around $12."), ("question", "Include the first year?"), ("paused", "20")])  # fmt: skip
+
+    def test_an_agent_waiting_in_its_window_is_told_once_each_time_it_begins_to(self):
+        self.mod.enable(self.bot.url)
+        state = self.mod.send_out(self.mod.load())
+        self.mod.write_status("ann", "needs_owner", "Allow this command?", "screen")
+        state = self.mod.send_out(state)
+        state = self.mod.send_out(state)
+        self.assertEqual([(m["kind"], m["text"]) for m in self.bot.sent], [("attention", "Ann")], "once, by name only")
+        self.mod.write_status("ann", "idle", "", "screen")
+        state = self.mod.send_out(state)
+        self.mod.write_status("ann", "needs_owner", "", "screen")
+        self.mod.send_out(state)
+        self.assertEqual([m["kind"] for m in self.bot.sent], ["attention", "attention"], "again when it begins again")
+        self.assertNotIn("Allow this command", json.dumps(self.bot.sent), "nothing of its screen")
+
+    def test_past_the_persons_day_limit_telegram_tells_once_a_day_with_the_spend_by_agent(self):
+        self.mod.enable(self.bot.url)
+        state = self.mod.send_out(self.mod.load())
+        today = self.mod.now()
+        rows = [{"at": today, "pid": "lea", "agent": "Lea", "input": 600, "output": 400, "cache_read": 0, "cache_write": 0},
+                {"at": today, "pid": "ann", "agent": "Ann", "input": 1500, "output": 0, "cache_read": 0, "cache_write": 0},
+                {"at": "2000-01-01T00:00:00+00:00", "pid": "ann", "agent": "Ann", "input": 10**9}]  # fmt: skip
+        self.mod.append_usage(rows)
+        self.mod.update(limit=2000)
+        state = self.mod.send_out(self.mod.load())
+        self.mod.send_out(state)
+        limits = [m for m in self.bot.sent if m["kind"] == "limit"]
+        self.assertEqual(len(limits), 1, "once a day")
+        self.assertEqual(limits[0]["text"], "Spent today: 2 500 tokens of 2 000.\nAnn: 1 500\nLea: 1 000")
+
+    def test_telegram_is_linked_only_in_the_chat_and_an_agent_sets_no_limit(self):
+        self.mod.enable(self.bot.url)
+        r = self.run_collab("telegram", "on")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Telegram is set up in the room's chat", r.stderr)
+        out = io.StringIO()
+        with seam(self.mod, "screen.caller_claude_session", lambda: "11111111-2222-3333-4444-555555555555"):
+            with mock.patch.object(sys, "argv", ["collab", "telegram", "limit", "999999999"]):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), self.assertRaises(SystemExit):
+                    self.mod.main()
+        self.assertIn("The spending limit is the person's to set", out.getvalue())
+        self.assertEqual(self.run_collab("telegram", "limit", "5000").returncode, 0, "the person sets it")
+        self.assertEqual(self.mod.load()["limit"], 5000)
+        with seam(self.mod, "screen.caller_claude_session", lambda: "11111111-2222-3333-4444-555555555555"):
+            with mock.patch.object(sys, "argv", ["collab", "telegram", "off"]):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out), self.assertRaises(SystemExit):
+                    self.mod.main()
+        self.assertEqual(self.mod.load()["state"], "on", "an agent does not cut the person off")
+        self.assertEqual(self.run_collab("telegram", "off").returncode, 0, "the person turns it off")
+        self.assertEqual(self.mod.load()["state"], "off")
+
+    def test_only_https_or_this_machine(self):
+        with self.assertRaises(self.mod.Refused):
+            self.mod.call("http://example.org", "GET", "/healthz")

@@ -593,7 +593,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         (c, m_i18n.words_in(f"cmd.{c[1:]}", "en"))
         for c in (
             "/add", "/remove", "/mute", "/unmute", "/unlimit", "/name", "/view", "/answer", "/open", "/pause",
-            "/resume", "/clear", "/help", "/mine", "/dm", "/restart", "/team", "/language", "/stop", "/exit",
+            "/resume", "/clear", "/help", "/mine", "/dm", "/restart", "/team", "/telegram", "/language", "/stop", "/exit",
         )
     ]  # fmt: skip
     slash_commands = tuple(c for c, _ in COMMANDS) + tuple(m_i18n.shown_command(c, "ru") for c, _ in COMMANDS)
