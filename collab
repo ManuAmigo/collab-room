@@ -110,7 +110,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -2166,6 +2166,68 @@ CATALOG: dict[str, dict[str, Any]] = {
     "t.54210e4539": {"en": "{mark} {pid} {words}: {detail}", "ru": "{mark} {pid} {words}: {detail}"},
     "t.0ff603ac65": {"en": "{mark} {pid} {words}", "ru": "{mark} {pid} {words}"},
     "t.b3b8fb8245": {"en": "· {pid}: No status yet", "ru": "· {pid}: состояния пока нет"},
+    # The person's own scenarios.
+    "t.2a5cedad69": {
+        "en": "! A name of letters, digits, - and _, up to 40. Try again.",
+        "ru": "! Имя из букв, цифр, - и _, не длиннее 40. Попробуйте ещё раз.",
+    },
+    "t.e953a8b140": {"en": "! Not saved: {why}.", "ru": "! Не сохранено: {why}."},
+    "t.d075396f90": {"en": "! left out: {why}", "ru": "! пропущен: {why}"},
+    "t.f3d8933e60": {
+        "en": "A name for this team (letters, digits, - and _; Esc to go back):",
+        "ru": "Имя для этой команды (буквы, цифры, - и _; Esc — назад):",
+    },
+    "t.5c495230d2": {"en": "Replace your scenario «{name}»?", "ru": "Заменить ваш сценарий «{name}»?"},
+    "t.24f1971b57": {"en": "Save as your own scenario…", "ru": "Сохранить как свой сценарий…"},
+    "t.b82767fd9a": {
+        "en": "Saved as your scenario «{name}»: a new room offers it in «What will we do?».",
+        "ru": "Сохранено как ваш сценарий «{name}»: новая комната предложит его в «Что будем делать?».",
+    },
+    "t.b1fbc8a5fd": {
+        "en": "Saved {path}: collab team start own:{name} in a new room.",
+        "ru": "Сохранено {path}: collab team start own:{name} в новой комнате.",
+    },
+    "t.25ef35d7ad": {
+        "en": "Your scenario «{name}»: the roles and settings, not the conversations, folders or history.",
+        "ru": "Ваш сценарий «{name}»: роли и настройки, без разговоров, папок и истории.",
+    },
+    "t.8f6954d27f": {
+        "en": "collab team save takes a name of letters, digits, - and _, up to 40",
+        "ru": "collab team save принимает имя из букв, цифр, - и _, не длиннее 40",
+    },
+    "t.a8562383eb": {"en": "not saved: {why}", "ru": "не сохранено: {why}"},
+    "t.186eb65301": {"en": "your own team", "ru": "ваша собственная команда"},
+    "t.114278384a": {"en": "{name}: {p1} — your own team", "ru": "{name}: {p1} — ваша собственная команда"},
+    # The lead's rounds.
+    "t.af78f31f86": {
+        "en": "- {name} holds {task} for {mins} min and wrote nothing in this round.",
+        "ru": "- {name} держит {task} уже {mins} мин и за этот обход ничего не написал.",
+    },
+    "t.2f7f6b874b": {
+        "en": "- {name} is free with no task, and the goal is not reached.",
+        "ru": "- {name} свободен без задачи, а цель не достигнута.",
+    },
+    "t.b143e75070": {
+        "en": "- {name} handed in {task} at {at}; no answer from you yet.",
+        "ru": "- {name} сдал {task} в {at}; вашего ответа пока нет.",
+    },
+    "t.dd5b3cef88": {"en": "The team's round (every {n} min):", "ru": "Обход команды (каждые {n} мин):"},
+    "t.eefc100803": {
+        "en": "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: collab goal reached --from {lead}.",
+        "ru": "Действуйте — подтолкните, дайте задачу, проверьте, спросите пользователя — или ответьте одной строкой «идёт». Цель достигнута: collab goal reached --from {lead}.",
+    },
+    "t.5ffccc851b": {
+        "en": "only the room's lead declares the goal reached",
+        "ru": "объявить цель достигнутой может только ведущий комнаты",
+    },
+    "t.e872c7f207": {"en": "the task", "ru": "задача"},
+    "t.1eb90fe84e": {
+        "en": "{lead} declared the goal reached: {goal}. The lead's rounds stop; /team can continue them.",
+        "ru": "{lead} объявил цель достигнутой: {goal}. Обходы ведущего остановлены; продолжить их можно в /команда.",
+    },
+    "t.41ffe8ecac": {"en": "Goal reached: the rounds stop.", "ru": "Цель достигнута: обходы остановлены."},
+    "t.ee91f47e87": {"en": "Continue the lead's rounds", "ru": "Продолжить обходы ведущего"},
+    "t.1bb0846c57": {"en": "The lead's rounds go on.", "ru": "Обходы ведущего продолжаются."},
     # Scenario titles and hints.
     "scenario.development.title": {"en": "Development", "ru": "Разработка"},
     "scenario.development.hint": {
@@ -2977,6 +3039,121 @@ SCENARIOS: dict[str, dict[str, Any]] = {
 }
 
 
+# The person's own teams, saved from a running one (/team → Save as a scenario): files outside any project,
+# beside the person's other collab files, each read and checked whole when a room is made — never followed through a
+# link, never longer than OWN_LIMIT, and a bad one is named and left out. Started, a copy goes into the room's file:
+# an edit of the file afterwards changes no running team.
+OWN_PREFIX = "own:"
+OWN_LIMIT = 64 * 1024
+OWN_NAME = re.compile(r"[\w-]{1,40}")
+
+
+def scenarios_dir() -> Path:
+    return paths().welcomed_path.parent / "scenarios"
+
+
+def own_scenario_path(name: str) -> Path:
+    return scenarios_dir() / f"{name}.json"
+
+
+def read_own_scenario(path: Path, kinds: list[str]) -> tuple[dict[str, Any] | None, str]:
+    """One saved team, or None and why not."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return None, f"{path.name}: {exc.strerror or exc} (a link is not read)"
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return None, f"{path.name}: not a plain file"
+        data = f.read(OWN_LIMIT + 1)
+    if len(data) > OWN_LIMIT:
+        return None, f"{path.name}: longer than {OWN_LIMIT // 1024} KB"
+    try:
+        scenario: object = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return None, f"{path.name}: not JSON — {exc}"
+    if not isinstance(scenario, dict):
+        return None, f"{path.name}: not a scenario"
+    sc = cast("dict[str, Any]", scenario)
+    problems = scenario_problems(sc, kinds)
+    if not isinstance(sc.get("title"), str) or name_problem(sc["title"]):
+        problems.append("a title that can't be used")
+    if problems:
+        return None, f"{path.name}: {'; '.join(problems)}"
+    return {"title": sc["title"], "hint": "", "output": sc.get("output", ""), "seats": sc["seats"], "own": True}, ""
+
+
+def own_scenarios(kinds: list[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """The person's saved teams by their names (OWN_PREFIX + file name), and why each one left out was."""
+    found: dict[str, dict[str, Any]] = {}
+    problems: list[str] = []
+    try:
+        paths_ = sorted(scenarios_dir().glob("*.json"))
+    except OSError:
+        return found, problems
+    for path in paths_:
+        if not OWN_NAME.fullmatch(path.stem):
+            continue
+        scenario, why = read_own_scenario(path, kinds)
+        if scenario is None:
+            problems.append(why)
+        else:
+            found[OWN_PREFIX + path.stem] = scenario
+    return found, problems
+
+
+def scenario_of(name: object, kinds: list[str] | None = None) -> dict[str, Any] | None:
+    """A ready team by its name: a built-in one, or one of the person's own (read now, checked)."""
+    if not isinstance(name, str):
+        return None
+    if name in SCENARIOS:
+        return SCENARIOS[name]
+    if name.startswith(OWN_PREFIX) and OWN_NAME.fullmatch(name[len(OWN_PREFIX) :]):
+        scenario, _ = read_own_scenario(own_scenario_path(name[len(OWN_PREFIX) :]), kinds or ["claude", "codex"])
+        return scenario
+    return None
+
+
+def team_to_scenario(config: dict[str, Any], title: str) -> dict[str, Any]:
+    """The room's team as a scenario to save: each agent's seat with what applies to it — its program, name, role,
+    topic, model and memory — and the result file; not its conversation, its folder or the room's history."""
+    people = people_ids(config)
+    seats: list[dict[str, Any]] = []
+    taken: set[str] = set()
+    for p in config.get("participants", []):
+        if p.get("id") in people or not any(k in p for k in ("idle", "busy", "attention")):
+            continue
+        kind = str(p.get("kind") or "")
+        sid = slug(str(p.get("label") or p["id"]), list(taken), "seat")
+        taken.add(sid)
+        seat: dict[str, Any] = {"seat": sid, "kind": kind, "label": str(p.get("label") or p["id"])}
+        for key in ("role", "topic", "use_model"):
+            if (value := effective(kind, p, config, key)) is not None:
+                seat[key] = value
+        trim = effective(kind, p, config, "context_trim")
+        if trim is not None:
+            seat["context_trim"] = trim
+        seats.append(seat)
+    return {"title": title, "output": output_of(config), "seats": seats}
+
+
+def save_own_scenario(name: str, scenario: dict[str, Any]) -> Path:
+    """Write the person's own team: a new file in their own folder, replaced whole, never through a link."""
+    if not OWN_NAME.fullmatch(name):
+        raise ValueError("a name of letters, digits, - and _, up to 40")
+    folder = scenarios_dir()
+    private_dir(folder, strict=False)
+    path = own_scenario_path(name)
+    if path.is_symlink():
+        raise ValueError(f"{path.name} is a link: not written")
+    tmp = folder / f".{name}.{uuid.uuid4().hex[:6]}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(scenario, ensure_ascii=False, indent=2) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
 def scenario_problems(scenario: dict[str, Any], kinds: list[str]) -> list[str]:
     """What does not pass in a scenario: each seat's settings by the same checks as an agent's, one lead, ids
     and names that are words, a program the room knows."""
@@ -3041,17 +3218,21 @@ def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any], lang: str = 
 
 
 def scenario_title(name: str, lang: str) -> str:
-    return words_in(f"scenario.{name}.title", lang)
+    if name in SCENARIOS:
+        return words_in(f"scenario.{name}.title", lang)
+    return str((scenario_of(name) or {}).get("title") or name)  # the person's own: its title as they gave it
 
 
 def scenario_hint(name: str, lang: str) -> str:
-    return words_in(f"scenario.{name}.hint", lang)
+    if name in SCENARIOS:
+        return words_in(f"scenario.{name}.hint", lang)
+    return tr("your own team", lang)
 
 
 def scenario_preview(name: str, lang: str = "en", draft: list[dict[str, Any]] | None = None) -> list[str]:
     """What a scenario would start, before anything starts: its team as rows — as the person changed it, if they did —
     the result file, the bounds."""
-    scenario = {**SCENARIOS[name], **({"seats": draft} if draft is not None else {})}
+    scenario = {**(scenario_of(name) or {"seats": [], "output": ""}), **({"seats": draft} if draft is not None else {})}
     seats = [
         {"id": seat["seat"], "label": seat["label"], "kind": seat["kind"], "seat": seat["seat"]} for seat in scenario["seats"]
     ]
@@ -3864,7 +4045,7 @@ def proposal_problem(data: dict[str, Any], prop: dict[str, Any], kinds: list[str
         for key in SETTINGS:
             if key in a and (why := setting_problem(key, a[key], data)):
                 return why
-    if team is not None and (not isinstance(team, str) or team not in SCENARIOS or team_of(data).get("scenario")):
+    if team is not None and (scenario_of(team, kinds) is None or team_of(data).get("scenario")):
         return "a team only from the ready ones, and only to a room without one"
     if len(changes) > PROPOSAL_CHANGES or len(adds) > PROPOSAL_ADDS:
         return f"one proposal holds up to {PROPOSAL_CHANGES} changes and {PROPOSAL_ADDS} agents: split it"
@@ -3887,8 +4068,8 @@ def proposal_words(data: dict[str, Any], prop: dict[str, Any], whole: bool = Fal
         what += [f"in {tilde(str(a['folder']))}"] if a.get("folder") else []
         parts.append(f"+ {a.get('label')} ({a.get('kind')}{', ' + ' · '.join(what) if what else ''})")
     team = prop.get("team")
-    if isinstance(team, str) and team in SCENARIOS:
-        parts.append(f"start the {SCENARIOS[team]['title']} team ({len(SCENARIOS[team]['seats'])} agents)")
+    if (sc := scenario_of(team)) is not None:
+        parts.append(f"start the {sc['title']} team ({len(sc['seats'])} agents)")
     words = "; ".join(parts)
     # Never cut: a proposal longer than its card is refused (proposal_problem), not shown in part.
     return words if whole else clean_field(words, PROPOSAL_WORDS)
@@ -7986,6 +8167,7 @@ from typing import Any, cast
 
 
 
+
 def room_cmd(command: str, rest: str, cli: str = "", pid: str = "") -> str:
     """A ready-to-run command for an agent: the room named by --room right after the command, so
     the line starts with «python3 …/collab <command>» and matches a narrow permission rule. `cli` —
@@ -8387,6 +8569,8 @@ def deliver_once(config: dict[str, Any], panes: dict[str, str]) -> list[tuple[st
     tell_outside_changes(config)
     tell_setting_changes(config)
     send_briefs(config)
+    with contextlib.suppress(OperationFailed):
+        lead_round(config, read_log_tick())
     return done
 
 
@@ -8561,11 +8745,12 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
     team = team_of(config)
     name = team.get("scenario")
     lang = room_language(config)
-    title = (
-        scenario_title(name, lang)
-        if isinstance(name, str) and name in SCENARIOS
-        else words_in("team.view.none", lang)
-    )
+    if isinstance(name, str) and name in SCENARIOS:
+        title = scenario_title(name, lang)
+    elif isinstance(team.get("title"), str):
+        title = clean_field(team["title"], 60)  # the person's own, as they named it
+    else:
+        title = words_in("team.view.none", lang)
     allowed = without_person(config)
     without = "; ".join(words_in(f"without.{a}", lang) for a in allowed) or words_in("team.view.nothing", lang)
     output = output_of(config) or words_in("team.result.chat", lang)
@@ -8576,6 +8761,96 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
             f"  {visible(seat_line(agent_kind(p), p, config))}" + (f" — {state}" if state else "")
         )
     return lines if len(lines) > 1 else [*lines, "  " + words_in("team.view.empty", lang)]
+
+
+def rounds_path() -> Path:
+    return room().paths.state_dir / "rounds.json"
+
+
+def round_reasons(config: dict[str, Any], messages: list[dict[str, Any]], minutes: int, since: float) -> dict[str, str]:
+    """Why the lead is to look now — by the room's data, never by the words of messages: an agent holding a task
+    longer than a round with no word since; an agent free with no task while the goal is not reached; work handed in
+    (a task done) since the last round with no answer from the lead. Each a line of names, task ids and times."""
+    lang, lead, now_ = room_language(config), lead_of(config), time.time()
+    tasks, status = current_tasks(), read_status()
+    lines: dict[str, str] = {}  # each reason by its key: who, what, which task
+    for p in agents_of(config):
+        pid, name = p["id"], label_of(config, p["id"])
+        if pid == lead:
+            continue
+        task = tasks.get(pid)
+        if task:
+            held = now_ - at_time(str(task.get("since") or ""))
+            spoke = any(m.get("from") == pid and at_time(str(m.get("at") or "")) > now_ - minutes * 60 for m in messages)
+            if held > minutes * 60 and not spoke:
+                lines[f"hold:{pid}:{task['task']}"] = tr(
+                    "- {name} holds {task} for {mins} min and wrote nothing in this round.",
+                    lang,
+                    name=name,
+                    task=task["task"],
+                    mins=int(held // 60),
+                )
+        elif goal_of(config) and (status.get(pid) or {}).get("state") == "idle":
+            lines[f"idle:{pid}"] = tr("- {name} is free with no task, and the goal is not reached.", lang, name=name)
+    for e in task_events():
+        if e.get("event") != "done" or at_time(str(e.get("at") or "")) <= since or e.get("pid") == lead:
+            continue
+        pid = str(e.get("pid"))
+        replied = any(
+            m.get("from") == lead and pid in m.get("to", []) and str(m.get("at") or "") > str(e.get("at")) for m in messages
+        )
+        if not replied:
+            lines[f"done:{pid}:{e.get('task')}:{e.get('at')}"] = tr(
+                "- {name} handed in {task} at {at}; no answer from you yet.",
+                lang,
+                name=label_of(config, pid),
+                task=str(e.get("task")),
+                at=local_hm(str(e.get("at"))),
+            )
+    return lines
+
+
+@room_locked
+def lead_round(config: dict[str, Any], messages: list[dict[str, Any]]) -> None:
+    """The lead's round (team.round minutes; false — off): the lead is woken only when the room has a reason, one
+    summary a round, as a message from the room — delivered like any message, after its current task. None with no
+    lead, nor once the lead declared the goal reached, until the goal changes or the person continues the rounds."""
+    minutes, lead = round_of(config), lead_of(config)
+    if not minutes or not lead:
+        return
+    state = read_json(rounds_path())
+    if "reached" in state and state.get("reached") == goal_of(config):
+        return
+    now_, last = time.time(), state.get("last")
+    last = float(last) if isinstance(last, (int, float)) else 0.0
+    if not last:
+        write_json(rounds_path(), {**state, "last": now_})  # the first look starts the count
+        return
+    if now_ - last < minutes * 60:
+        return
+    reasons = round_reasons(config, messages, minutes, last)
+    # A reason told is not told again while it lasts: the lead knows it; gone and back, it is new. Only the new ones
+    # wake the lead.
+    goal = goal_of(config)
+    told = state.get("told") if isinstance(state.get("told"), list) and state.get("goal") == goal else []  # a new goal: anew
+    lines = [line for key, line in reasons.items() if key not in told]
+    kept = {k: v for k, v in state.items() if k != "reached"}
+    write_json(rounds_path(), kept | {"last": now_, "told": sorted(reasons), "goal": goal})
+    if not lines:
+        return  # nothing new to look at: the lead is not woken — each wake re-reads its whole context
+    lang = room_language(config)
+    text = "\n".join(
+        [
+            tr("The team's round (every {n} min):", lang, n=minutes),
+            *lines,
+            tr(
+                "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: collab goal reached --from {lead}.",
+                lang,
+                lead=lead,
+            ),
+        ]
+    )
+    append_message(ROOM, [lead], text)
 
 
 @room_locked
@@ -9958,12 +10233,14 @@ def start_scenario(name: str, folder: str, seats: list[dict[str, Any]] | None = 
     starts one, with only its seat recorded — its settings go by the seat. `seats`: the team as the person changed it
     before the launch; checked like the scenario's own. (started ids, «name: why» of those that did not start). One
     that failed does not stop the rest."""
-    scenario = SCENARIOS[name]
+    scenario = scenario_of(name, list(PRESETS))
+    if scenario is None:
+        raise ValueError(f"no ready team {name}")
     team_seats: list[dict[str, Any]] = json.loads(json.dumps(seats if seats is not None else scenario["seats"]))
     problems = scenario_problems({**scenario, "seats": team_seats}, list(PRESETS))
     if problems:
         raise ValueError("; ".join(problems))
-    team = {"scenario": name, "seats": team_seats, "output": scenario["output"], "without_person": []}
+    team = {"scenario": name, "title": scenario["title"], "seats": team_seats, "output": scenario["output"], "without_person": []}
     set_team(team)
     started: list[str] = []
     failed: list[str] = []
@@ -11915,7 +12192,7 @@ def open_scenarios_into(wizard: dict[str, Any], lang: str = "en") -> None:
         options=[(words_in("team.none", lang), "none")]
         + [
             (tr("{p0} — {p1}", p0=scenario_title(name, lang), p1=scenario_hint(name, lang)), name)
-            for name in SCENARIOS
+            for name in [*SCENARIOS, *own_scenarios(list(PRESETS))[0]]
         ],
     )
 
@@ -11977,7 +12254,13 @@ def open_team_menu(ctx: ChatCommandContext, cfg: dict[str, Any]) -> None:
         + [
             (tr("The room: lead, goal, result file, what is done without you…"), "room"),
             (tr("Changes — look back, undo…"), "history"),
-        ],
+        ]
+        + ([(tr("Save as your own scenario…"), "save")] if agents else [])
+        + (
+            [(tr("Continue the lead's rounds"), "rounds")]
+            if "reached" in read_json(rounds_path())
+            else []
+        ),
     )
 
 
@@ -12066,6 +12349,66 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
     """/team's steps: an agent or the room → a field → a value → «before → after» and when it acts → Save."""
     step_ = ctx.wizard.get("step")
     cfg = load_config()
+    if step_ == "team_menu" and line == "rounds":
+        ctx.wizard.clear()
+        state = read_json(rounds_path())
+        state.pop("reached", None)
+        write_json(rounds_path(), state)
+        say_(tr("The lead's rounds go on."))
+        return
+    if step_ == "team_menu" and line == "save":
+        ctx.wizard.update(
+            step="team_save", options=None, prompt=tr("A name for this team (letters, digits, - and _; Esc to go back):")
+        )
+        say_(ctx.wizard["prompt"])
+        return
+    if step_ == "team_save":
+        name = line.strip()
+        if not OWN_NAME.fullmatch(name):
+            say_(tr("! A name of letters, digits, - and _, up to 40. Try again."))
+            return
+        scenario = team_to_scenario(cfg, name)
+        why = scenario_problems(scenario, list(PRESETS))
+        if why:
+            ctx.wizard.clear()
+            say_(tr("! Not saved: {why}.", why=clean_field("; ".join(why), 200)))
+            return
+        exists = own_scenario_path(name).exists()
+        ctx.wizard.update(
+            step="team_save_confirm",
+            name=name,
+            scenario=scenario,
+            prompt=tr("Replace your scenario «{name}»?", name=name) if exists else tr("Save it?"),
+            options=[(tr("Save"), "go"), (tr("Cancel"), "back")],
+        )
+        rows = [
+            seat_line(
+                seat["kind"],
+                {"id": seat["seat"], **seat},
+                {"participants": [{"id": x["seat"], **x} for x in scenario["seats"]], "team": scenario},
+            )
+            for seat in scenario["seats"]
+        ]
+        say_(
+            tr("Your scenario «{name}»: the roles and settings, not the conversations, folders or history.", name=name)
+            + "\n"
+            + "\n".join("  " + visible(r) for r in rows)
+            + "\n" * 4
+        )
+        return
+    if step_ == "team_save_confirm":
+        if line != "go":
+            ctx.wizard_back()
+            return
+        name, scenario = ctx.wizard["name"], ctx.wizard["scenario"]
+        ctx.wizard.clear()
+        try:
+            save_own_scenario(name, scenario)
+        except (OSError, ValueError) as exc:
+            say_(tr("! Not saved: {why}.", why=clean_field(str(exc), 200)))
+            return
+        say_(tr("Saved as your scenario «{name}»: a new room offers it in «What will we do?».", name=name))
+        return
     if step_ == "team_menu":
         if line.startswith("proposal:"):
             m = next((x for x in read_messages() if x.get("id") == line.partition(":")[2]), None)
@@ -12577,9 +12920,10 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             ctx.wizard.clear()
             say_(words_in("team.none.said", lang))
             return
-        if line not in SCENARIOS:
+        scenario = scenario_of(line, list(PRESETS))
+        if scenario is None:
             return
-        ctx.wizard["draft"] = json.loads(json.dumps(SCENARIOS[line]["seats"]))  # changed here before the launch
+        ctx.wizard["draft"] = json.loads(json.dumps(scenario["seats"]))  # changed here before the launch
         ctx.wizard["scenario"] = line
         show_draft(ctx, say_, lang)
         return
@@ -15656,16 +16000,35 @@ def cmd_team(args: argparse.Namespace) -> None:
     if args.action == "scenarios":
         for name, scenario in SCENARIOS.items():
             print(tr("{name}: {p1} — {p2}", name=name, p1=scenario["title"], p2=scenario["hint"]))
+        own, problems = own_scenarios(list(PRESETS))
+        for name, scenario in own.items():
+            print(tr("{name}: {p1} — your own team", name=name, p1=scenario["title"]))
+        for why in problems:
+            print(tr("! left out: {why}", why=why), file=sys.stderr)
+        return
+    if args.action == "save":
+        name = args.scenario or ""
+        if not OWN_NAME.fullmatch(name):
+            fail(tr("collab team save takes a name of letters, digits, - and _, up to 40"))
+        scenario = team_to_scenario(config, name)
+        if why := scenario_problems(scenario, list(PRESETS)):
+            fail(tr("not saved: {why}", why="; ".join(why)))
+        try:
+            path = save_own_scenario(name, scenario)
+        except ValueError as exc:
+            fail(tr("not saved: {why}", why=str(exc)))
+        print(tr("Saved {path}: collab team start own:{name} in a new room.", path=tilde(str(path)), name=name))
         return
     if args.action == "start":
-        if args.scenario not in SCENARIOS:
-            fail(tr("collab team start takes one of: {p0}", p0=", ".join(SCENARIOS)))
+        if scenario_of(args.scenario, list(PRESETS)) is None:
+            names = [*SCENARIOS, *own_scenarios(list(PRESETS))[0]]
+            fail(tr("collab team start takes one of: {p0}", p0=", ".join(names)))
         if team_of(config).get("scenario"):
             fail(tr("this room has a team already: collab team shows it"))
         session = config.get("session", "collab-room")
         if tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
             fail(tr("the room is not running — collab start first, then collab team start"))
-        missing = scenario_unavailable(SCENARIOS[args.scenario])
+        missing = scenario_unavailable(scenario_of(args.scenario, list(PRESETS)) or {"seats": []})
         if missing:
             fail("not started: " + "; ".join(missing))
         print("\n".join(scenario_preview(args.scenario)))
@@ -15742,6 +16105,26 @@ def cmd_propose(args: argparse.Namespace) -> None:
     if sid and sid == bound:
         prop["session"] = sid
     propose(args.sender, args.re or "", prop, config)
+
+
+@room_locked
+def cmd_goal(args: argparse.Namespace) -> None:
+    """`collab goal reached --from LEAD`: the lead declares the room's goal reached — the lead's rounds stop, and the
+    person gets one line. A new goal, or «Continue the lead's rounds» in /team, starts them again."""
+    config = load_config()
+    if args.sender != lead_of(config):
+        fail(tr("only the room's lead declares the goal reached"))
+    check_name_is_mine(args.sender, config)
+    state = read_json(rounds_path())
+    write_json(rounds_path(), {**state, "reached": goal_of(config)})
+    goal = goal_of(config) or tr("the task")
+    room_line(
+        people_ids(config) or ["all"],
+        "{lead} declared the goal reached: {goal}. The lead's rounds stop; /team can continue them.",
+        lead=label_of(config, args.sender),
+        goal=goal,
+    )
+    print(tr("Goal reached: the rounds stop."))
 
 
 def cmd_brief(args: argparse.Namespace) -> None:
@@ -16089,7 +16472,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_deliver)
 
     s = sub.add_parser("team", help="the room's team: show it, list the ready teams, start one")
-    s.add_argument("action", nargs="?", choices=["show", "scenarios", "start"], default="show")
+    s.add_argument("action", nargs="?", choices=["show", "scenarios", "start", "save"], default="show")
     s.add_argument("scenario", nargs="?", help="with start: one of collab team scenarios")
     s.set_defaults(func=cmd_team)
 
@@ -16101,6 +16484,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--add", action="append", metavar="KIND:NAME[:ROLE[:TOPIC]]", help="a new agent")
     s.set_defaults(func=cmd_propose)
+
+    s = sub.add_parser("goal", help="the lead declares the room's goal reached: its rounds stop")
+    s.add_argument("action", choices=["reached"])
+    s.add_argument("--from", dest="sender", required=True)
+    s.set_defaults(func=cmd_goal)
 
     s = sub.add_parser("brief", help="an agent's assignment from the room's settings (--hook: for Claude Code's SessionStart)")
     s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))

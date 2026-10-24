@@ -477,6 +477,121 @@ SCENARIOS: dict[str, dict[str, Any]] = {
 }
 
 
+# The person's own teams, saved from a running one (/team → Save as a scenario): files outside any project,
+# beside the person's other collab files, each read and checked whole when a room is made — never followed through a
+# link, never longer than OWN_LIMIT, and a bad one is named and left out. Started, a copy goes into the room's file:
+# an edit of the file afterwards changes no running team.
+OWN_PREFIX = "own:"
+OWN_LIMIT = 64 * 1024
+OWN_NAME = re.compile(r"[\w-]{1,40}")
+
+
+def scenarios_dir() -> Path:
+    return m_boot.paths().welcomed_path.parent / "scenarios"
+
+
+def own_scenario_path(name: str) -> Path:
+    return scenarios_dir() / f"{name}.json"
+
+
+def read_own_scenario(path: Path, kinds: list[str]) -> tuple[dict[str, Any] | None, str]:
+    """One saved team, or None and why not."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return None, f"{path.name}: {exc.strerror or exc} (a link is not read)"
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return None, f"{path.name}: not a plain file"
+        data = f.read(OWN_LIMIT + 1)
+    if len(data) > OWN_LIMIT:
+        return None, f"{path.name}: longer than {OWN_LIMIT // 1024} KB"
+    try:
+        scenario: object = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        return None, f"{path.name}: not JSON — {exc}"
+    if not isinstance(scenario, dict):
+        return None, f"{path.name}: not a scenario"
+    sc = cast("dict[str, Any]", scenario)
+    problems = scenario_problems(sc, kinds)
+    if not isinstance(sc.get("title"), str) or m_text.name_problem(sc["title"]):
+        problems.append("a title that can't be used")
+    if problems:
+        return None, f"{path.name}: {'; '.join(problems)}"
+    return {"title": sc["title"], "hint": "", "output": sc.get("output", ""), "seats": sc["seats"], "own": True}, ""
+
+
+def own_scenarios(kinds: list[str]) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """The person's saved teams by their names (OWN_PREFIX + file name), and why each one left out was."""
+    found: dict[str, dict[str, Any]] = {}
+    problems: list[str] = []
+    try:
+        paths_ = sorted(scenarios_dir().glob("*.json"))
+    except OSError:
+        return found, problems
+    for path in paths_:
+        if not OWN_NAME.fullmatch(path.stem):
+            continue
+        scenario, why = read_own_scenario(path, kinds)
+        if scenario is None:
+            problems.append(why)
+        else:
+            found[OWN_PREFIX + path.stem] = scenario
+    return found, problems
+
+
+def scenario_of(name: object, kinds: list[str] | None = None) -> dict[str, Any] | None:
+    """A ready team by its name: a built-in one, or one of the person's own (read now, checked)."""
+    if not isinstance(name, str):
+        return None
+    if name in SCENARIOS:
+        return SCENARIOS[name]
+    if name.startswith(OWN_PREFIX) and OWN_NAME.fullmatch(name[len(OWN_PREFIX) :]):
+        scenario, _ = read_own_scenario(own_scenario_path(name[len(OWN_PREFIX) :]), kinds or ["claude", "codex"])
+        return scenario
+    return None
+
+
+def team_to_scenario(config: dict[str, Any], title: str) -> dict[str, Any]:
+    """The room's team as a scenario to save: each agent's seat with what applies to it — its program, name, role,
+    topic, model and memory — and the result file; not its conversation, its folder or the room's history."""
+    people = people_ids(config)
+    seats: list[dict[str, Any]] = []
+    taken: set[str] = set()
+    for p in config.get("participants", []):
+        if p.get("id") in people or not any(k in p for k in ("idle", "busy", "attention")):
+            continue
+        kind = str(p.get("kind") or "")
+        sid = m_text.slug(str(p.get("label") or p["id"]), list(taken), "seat")
+        taken.add(sid)
+        seat: dict[str, Any] = {"seat": sid, "kind": kind, "label": str(p.get("label") or p["id"])}
+        for key in ("role", "topic", "use_model"):
+            if (value := effective(kind, p, config, key)) is not None:
+                seat[key] = value
+        trim = effective(kind, p, config, "context_trim")
+        if trim is not None:
+            seat["context_trim"] = trim
+        seats.append(seat)
+    return {"title": title, "output": output_of(config), "seats": seats}
+
+
+def save_own_scenario(name: str, scenario: dict[str, Any]) -> Path:
+    """Write the person's own team: a new file in their own folder, replaced whole, never through a link."""
+    if not OWN_NAME.fullmatch(name):
+        raise ValueError("a name of letters, digits, - and _, up to 40")
+    folder = scenarios_dir()
+    private_dir(folder, strict=False)
+    path = own_scenario_path(name)
+    if path.is_symlink():
+        raise ValueError(f"{path.name} is a link: not written")
+    tmp = folder / f".{name}.{uuid.uuid4().hex[:6]}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(scenario, ensure_ascii=False, indent=2) + "\n")
+    os.replace(tmp, path)
+    return path
+
+
 def scenario_problems(scenario: dict[str, Any], kinds: list[str]) -> list[str]:
     """What does not pass in a scenario: each seat's settings by the same checks as an agent's, one lead, ids
     and names that are words, a program the room knows."""
@@ -541,17 +656,21 @@ def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any], lang: str = 
 
 
 def scenario_title(name: str, lang: str) -> str:
-    return m_i18n.words_in(f"scenario.{name}.title", lang)
+    if name in SCENARIOS:
+        return m_i18n.words_in(f"scenario.{name}.title", lang)
+    return str((scenario_of(name) or {}).get("title") or name)  # the person's own: its title as they gave it
 
 
 def scenario_hint(name: str, lang: str) -> str:
-    return m_i18n.words_in(f"scenario.{name}.hint", lang)
+    if name in SCENARIOS:
+        return m_i18n.words_in(f"scenario.{name}.hint", lang)
+    return m_i18n.tr("your own team", lang)
 
 
 def scenario_preview(name: str, lang: str = "en", draft: list[dict[str, Any]] | None = None) -> list[str]:
     """What a scenario would start, before anything starts: its team as rows — as the person changed it, if they did —
     the result file, the bounds."""
-    scenario = {**SCENARIOS[name], **({"seats": draft} if draft is not None else {})}
+    scenario = {**(scenario_of(name) or {"seats": [], "output": ""}), **({"seats": draft} if draft is not None else {})}
     seats = [
         {"id": seat["seat"], "label": seat["label"], "kind": seat["kind"], "seat": seat["seat"]} for seat in scenario["seats"]
     ]
@@ -1364,7 +1483,7 @@ def proposal_problem(data: dict[str, Any], prop: dict[str, Any], kinds: list[str
         for key in SETTINGS:
             if key in a and (why := setting_problem(key, a[key], data)):
                 return why
-    if team is not None and (not isinstance(team, str) or team not in SCENARIOS or team_of(data).get("scenario")):
+    if team is not None and (scenario_of(team, kinds) is None or team_of(data).get("scenario")):
         return "a team only from the ready ones, and only to a room without one"
     if len(changes) > PROPOSAL_CHANGES or len(adds) > PROPOSAL_ADDS:
         return f"one proposal holds up to {PROPOSAL_CHANGES} changes and {PROPOSAL_ADDS} agents: split it"
@@ -1387,8 +1506,8 @@ def proposal_words(data: dict[str, Any], prop: dict[str, Any], whole: bool = Fal
         what += [f"in {m_text.tilde(str(a['folder']))}"] if a.get("folder") else []
         parts.append(f"+ {a.get('label')} ({a.get('kind')}{', ' + ' · '.join(what) if what else ''})")
     team = prop.get("team")
-    if isinstance(team, str) and team in SCENARIOS:
-        parts.append(f"start the {SCENARIOS[team]['title']} team ({len(SCENARIOS[team]['seats'])} agents)")
+    if (sc := scenario_of(team)) is not None:
+        parts.append(f"start the {sc['title']} team ({len(sc['seats'])} agents)")
     words = "; ".join(parts)
     # Never cut: a proposal longer than its card is refused (proposal_problem), not shown in part.
     return words if whole else m_text.clean_field(words, PROPOSAL_WORDS)

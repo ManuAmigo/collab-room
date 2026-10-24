@@ -99,7 +99,7 @@ def open_scenarios_into(wizard: dict[str, Any], lang: str = "en") -> None:
         options=[(m_i18n.words_in("team.none", lang), "none")]
         + [
             (m_i18n.tr("{p0} — {p1}", p0=m_store.scenario_title(name, lang), p1=m_store.scenario_hint(name, lang)), name)
-            for name in m_store.SCENARIOS
+            for name in [*m_store.SCENARIOS, *m_store.own_scenarios(list(m_screen.PRESETS))[0]]
         ],
     )
 
@@ -161,7 +161,13 @@ def open_team_menu(ctx: ChatCommandContext, cfg: dict[str, Any]) -> None:
         + [
             (m_i18n.tr("The room: lead, goal, result file, what is done without you…"), "room"),
             (m_i18n.tr("Changes — look back, undo…"), "history"),
-        ],
+        ]
+        + ([(m_i18n.tr("Save as your own scenario…"), "save")] if agents else [])
+        + (
+            [(m_i18n.tr("Continue the lead's rounds"), "rounds")]
+            if "reached" in m_store.read_json(m_deliver.rounds_path())
+            else []
+        ),
     )
 
 
@@ -250,6 +256,66 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
     """/team's steps: an agent or the room → a field → a value → «before → after» and when it acts → Save."""
     step_ = ctx.wizard.get("step")
     cfg = m_store.load_config()
+    if step_ == "team_menu" and line == "rounds":
+        ctx.wizard.clear()
+        state = m_store.read_json(m_deliver.rounds_path())
+        state.pop("reached", None)
+        m_store.write_json(m_deliver.rounds_path(), state)
+        say_(m_i18n.tr("The lead's rounds go on."))
+        return
+    if step_ == "team_menu" and line == "save":
+        ctx.wizard.update(
+            step="team_save", options=None, prompt=m_i18n.tr("A name for this team (letters, digits, - and _; Esc to go back):")
+        )
+        say_(ctx.wizard["prompt"])
+        return
+    if step_ == "team_save":
+        name = line.strip()
+        if not m_store.OWN_NAME.fullmatch(name):
+            say_(m_i18n.tr("! A name of letters, digits, - and _, up to 40. Try again."))
+            return
+        scenario = m_store.team_to_scenario(cfg, name)
+        why = m_store.scenario_problems(scenario, list(m_screen.PRESETS))
+        if why:
+            ctx.wizard.clear()
+            say_(m_i18n.tr("! Not saved: {why}.", why=m_text.clean_field("; ".join(why), 200)))
+            return
+        exists = m_store.own_scenario_path(name).exists()
+        ctx.wizard.update(
+            step="team_save_confirm",
+            name=name,
+            scenario=scenario,
+            prompt=m_i18n.tr("Replace your scenario «{name}»?", name=name) if exists else m_i18n.tr("Save it?"),
+            options=[(m_i18n.tr("Save"), "go"), (m_i18n.tr("Cancel"), "back")],
+        )
+        rows = [
+            m_store.seat_line(
+                seat["kind"],
+                {"id": seat["seat"], **seat},
+                {"participants": [{"id": x["seat"], **x} for x in scenario["seats"]], "team": scenario},
+            )
+            for seat in scenario["seats"]
+        ]
+        say_(
+            m_i18n.tr("Your scenario «{name}»: the roles and settings, not the conversations, folders or history.", name=name)
+            + "\n"
+            + "\n".join("  " + m_text.visible(r) for r in rows)
+            + "\n" * 4
+        )
+        return
+    if step_ == "team_save_confirm":
+        if line != "go":
+            ctx.wizard_back()
+            return
+        name, scenario = ctx.wizard["name"], ctx.wizard["scenario"]
+        ctx.wizard.clear()
+        try:
+            m_store.save_own_scenario(name, scenario)
+        except (OSError, ValueError) as exc:
+            say_(m_i18n.tr("! Not saved: {why}.", why=m_text.clean_field(str(exc), 200)))
+            return
+        say_(m_i18n.tr("Saved as your scenario «{name}»: a new room offers it in «What will we do?».", name=name))
+        return
     if step_ == "team_menu":
         if line.startswith("proposal:"):
             m = next((x for x in m_log.read_messages() if x.get("id") == line.partition(":")[2]), None)
@@ -761,9 +827,10 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             ctx.wizard.clear()
             say_(m_i18n.words_in("team.none.said", lang))
             return
-        if line not in m_store.SCENARIOS:
+        scenario = m_store.scenario_of(line, list(m_screen.PRESETS))
+        if scenario is None:
             return
-        ctx.wizard["draft"] = json.loads(json.dumps(m_store.SCENARIOS[line]["seats"]))  # changed here before the launch
+        ctx.wizard["draft"] = json.loads(json.dumps(scenario["seats"]))  # changed here before the launch
         ctx.wizard["scenario"] = line
         show_draft(ctx, say_, lang)
         return

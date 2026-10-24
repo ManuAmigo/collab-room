@@ -21,6 +21,7 @@ import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
+import collab.tasks as m_tasks
 import collab.screen as m_screen
 import collab.installer as m_installer
 import collab.ledger as m_ledger
@@ -427,6 +428,8 @@ def deliver_once(config: dict[str, Any], panes: dict[str, str]) -> list[tuple[st
     tell_outside_changes(config)
     tell_setting_changes(config)
     send_briefs(config)
+    with contextlib.suppress(m_store.OperationFailed):
+        lead_round(config, m_log.read_log_tick())
     return done
 
 
@@ -601,11 +604,12 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
     team = m_store.team_of(config)
     name = team.get("scenario")
     lang = m_store.room_language(config)
-    title = (
-        m_store.scenario_title(name, lang)
-        if isinstance(name, str) and name in m_store.SCENARIOS
-        else m_i18n.words_in("team.view.none", lang)
-    )
+    if isinstance(name, str) and name in m_store.SCENARIOS:
+        title = m_store.scenario_title(name, lang)
+    elif isinstance(team.get("title"), str):
+        title = m_text.clean_field(team["title"], 60)  # the person's own, as they named it
+    else:
+        title = m_i18n.words_in("team.view.none", lang)
     allowed = m_store.without_person(config)
     without = "; ".join(m_i18n.words_in(f"without.{a}", lang) for a in allowed) or m_i18n.words_in("team.view.nothing", lang)
     output = m_store.output_of(config) or m_i18n.words_in("team.result.chat", lang)
@@ -616,6 +620,96 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
             f"  {m_text.visible(m_store.seat_line(m_screen.agent_kind(p), p, config))}" + (f" — {state}" if state else "")
         )
     return lines if len(lines) > 1 else [*lines, "  " + m_i18n.words_in("team.view.empty", lang)]
+
+
+def rounds_path() -> Path:
+    return m_store.room().paths.state_dir / "rounds.json"
+
+
+def round_reasons(config: dict[str, Any], messages: list[dict[str, Any]], minutes: int, since: float) -> dict[str, str]:
+    """Why the lead is to look now — by the room's data, never by the words of messages: an agent holding a task
+    longer than a round with no word since; an agent free with no task while the goal is not reached; work handed in
+    (a task done) since the last round with no answer from the lead. Each a line of names, task ids and times."""
+    lang, lead, now_ = m_store.room_language(config), m_store.lead_of(config), time.time()
+    tasks, status = m_tasks.current_tasks(), m_screen.read_status()
+    lines: dict[str, str] = {}  # each reason by its key: who, what, which task
+    for p in agents_of(config):
+        pid, name = p["id"], m_store.label_of(config, p["id"])
+        if pid == lead:
+            continue
+        task = tasks.get(pid)
+        if task:
+            held = now_ - m_text.at_time(str(task.get("since") or ""))
+            spoke = any(m.get("from") == pid and m_text.at_time(str(m.get("at") or "")) > now_ - minutes * 60 for m in messages)
+            if held > minutes * 60 and not spoke:
+                lines[f"hold:{pid}:{task['task']}"] = m_i18n.tr(
+                    "- {name} holds {task} for {mins} min and wrote nothing in this round.",
+                    lang,
+                    name=name,
+                    task=task["task"],
+                    mins=int(held // 60),
+                )
+        elif m_store.goal_of(config) and (status.get(pid) or {}).get("state") == "idle":
+            lines[f"idle:{pid}"] = m_i18n.tr("- {name} is free with no task, and the goal is not reached.", lang, name=name)
+    for e in m_tasks.task_events():
+        if e.get("event") != "done" or m_text.at_time(str(e.get("at") or "")) <= since or e.get("pid") == lead:
+            continue
+        pid = str(e.get("pid"))
+        replied = any(
+            m.get("from") == lead and pid in m.get("to", []) and str(m.get("at") or "") > str(e.get("at")) for m in messages
+        )
+        if not replied:
+            lines[f"done:{pid}:{e.get('task')}:{e.get('at')}"] = m_i18n.tr(
+                "- {name} handed in {task} at {at}; no answer from you yet.",
+                lang,
+                name=m_store.label_of(config, pid),
+                task=str(e.get("task")),
+                at=m_text.local_hm(str(e.get("at"))),
+            )
+    return lines
+
+
+@m_store.room_locked
+def lead_round(config: dict[str, Any], messages: list[dict[str, Any]]) -> None:
+    """The lead's round (team.round minutes; false — off): the lead is woken only when the room has a reason, one
+    summary a round, as a message from the room — delivered like any message, after its current task. None with no
+    lead, nor once the lead declared the goal reached, until the goal changes or the person continues the rounds."""
+    minutes, lead = m_store.round_of(config), m_store.lead_of(config)
+    if not minutes or not lead:
+        return
+    state = m_store.read_json(rounds_path())
+    if "reached" in state and state.get("reached") == m_store.goal_of(config):
+        return
+    now_, last = time.time(), state.get("last")
+    last = float(last) if isinstance(last, (int, float)) else 0.0
+    if not last:
+        m_store.write_json(rounds_path(), {**state, "last": now_})  # the first look starts the count
+        return
+    if now_ - last < minutes * 60:
+        return
+    reasons = round_reasons(config, messages, minutes, last)
+    # A reason told is not told again while it lasts: the lead knows it; gone and back, it is new. Only the new ones
+    # wake the lead.
+    goal = m_store.goal_of(config)
+    told = state.get("told") if isinstance(state.get("told"), list) and state.get("goal") == goal else []  # a new goal: anew
+    lines = [line for key, line in reasons.items() if key not in told]
+    kept = {k: v for k, v in state.items() if k != "reached"}
+    m_store.write_json(rounds_path(), kept | {"last": now_, "told": sorted(reasons), "goal": goal})
+    if not lines:
+        return  # nothing new to look at: the lead is not woken — each wake re-reads its whole context
+    lang = m_store.room_language(config)
+    text = "\n".join(
+        [
+            m_i18n.tr("The team's round (every {n} min):", lang, n=minutes),
+            *lines,
+            m_i18n.tr(
+                "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: collab goal reached --from {lead}.",
+                lang,
+                lead=lead,
+            ),
+        ]
+    )
+    m_log.append_message(m_text.ROOM, [lead], text)
 
 
 @m_store.room_locked

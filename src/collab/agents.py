@@ -756,12 +756,14 @@ def start_scenario(name: str, folder: str, seats: list[dict[str, Any]] | None = 
     starts one, with only its seat recorded — its settings go by the seat. `seats`: the team as the person changed it
     before the launch; checked like the scenario's own. (started ids, «name: why» of those that did not start). One
     that failed does not stop the rest."""
-    scenario = m_store.SCENARIOS[name]
+    scenario = m_store.scenario_of(name, list(m_screen.PRESETS))
+    if scenario is None:
+        raise ValueError(f"no ready team {name}")
     team_seats: list[dict[str, Any]] = json.loads(json.dumps(seats if seats is not None else scenario["seats"]))
     problems = m_store.scenario_problems({**scenario, "seats": team_seats}, list(m_screen.PRESETS))
     if problems:
         raise ValueError("; ".join(problems))
-    team = {"scenario": name, "seats": team_seats, "output": scenario["output"], "without_person": []}
+    team = {"scenario": name, "title": scenario["title"], "seats": team_seats, "output": scenario["output"], "without_person": []}
     m_store.set_team(team)
     started: list[str] = []
     failed: list[str] = []

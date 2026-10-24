@@ -365,16 +365,35 @@ def cmd_team(args: argparse.Namespace) -> None:
     if args.action == "scenarios":
         for name, scenario in m_store.SCENARIOS.items():
             print(m_i18n.tr("{name}: {p1} — {p2}", name=name, p1=scenario["title"], p2=scenario["hint"]))
+        own, problems = m_store.own_scenarios(list(m_screen.PRESETS))
+        for name, scenario in own.items():
+            print(m_i18n.tr("{name}: {p1} — your own team", name=name, p1=scenario["title"]))
+        for why in problems:
+            print(m_i18n.tr("! left out: {why}", why=why), file=sys.stderr)
+        return
+    if args.action == "save":
+        name = args.scenario or ""
+        if not m_store.OWN_NAME.fullmatch(name):
+            m_store.fail(m_i18n.tr("collab team save takes a name of letters, digits, - and _, up to 40"))
+        scenario = m_store.team_to_scenario(config, name)
+        if why := m_store.scenario_problems(scenario, list(m_screen.PRESETS)):
+            m_store.fail(m_i18n.tr("not saved: {why}", why="; ".join(why)))
+        try:
+            path = m_store.save_own_scenario(name, scenario)
+        except ValueError as exc:
+            m_store.fail(m_i18n.tr("not saved: {why}", why=str(exc)))
+        print(m_i18n.tr("Saved {path}: collab team start own:{name} in a new room.", path=m_text.tilde(str(path)), name=name))
         return
     if args.action == "start":
-        if args.scenario not in m_store.SCENARIOS:
-            m_store.fail(m_i18n.tr("collab team start takes one of: {p0}", p0=", ".join(m_store.SCENARIOS)))
+        if m_store.scenario_of(args.scenario, list(m_screen.PRESETS)) is None:
+            names = [*m_store.SCENARIOS, *m_store.own_scenarios(list(m_screen.PRESETS))[0]]
+            m_store.fail(m_i18n.tr("collab team start takes one of: {p0}", p0=", ".join(names)))
         if m_store.team_of(config).get("scenario"):
             m_store.fail(m_i18n.tr("this room has a team already: collab team shows it"))
         session = config.get("session", "collab-room")
         if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
             m_store.fail(m_i18n.tr("the room is not running — collab start first, then collab team start"))
-        missing = m_agents.scenario_unavailable(m_store.SCENARIOS[args.scenario])
+        missing = m_agents.scenario_unavailable(m_store.scenario_of(args.scenario, list(m_screen.PRESETS)) or {"seats": []})
         if missing:
             m_store.fail("not started: " + "; ".join(missing))
         print("\n".join(m_store.scenario_preview(args.scenario)))
@@ -451,6 +470,26 @@ def cmd_propose(args: argparse.Namespace) -> None:
     if sid and sid == bound:
         prop["session"] = sid
     propose(args.sender, args.re or "", prop, config)
+
+
+@m_store.room_locked
+def cmd_goal(args: argparse.Namespace) -> None:
+    """`collab goal reached --from LEAD`: the lead declares the room's goal reached — the lead's rounds stop, and the
+    person gets one line. A new goal, or «Continue the lead's rounds» in /team, starts them again."""
+    config = m_store.load_config()
+    if args.sender != m_store.lead_of(config):
+        m_store.fail(m_i18n.tr("only the room's lead declares the goal reached"))
+    m_screen.check_name_is_mine(args.sender, config)
+    state = m_store.read_json(m_deliver.rounds_path())
+    m_store.write_json(m_deliver.rounds_path(), {**state, "reached": m_store.goal_of(config)})
+    goal = m_store.goal_of(config) or m_i18n.tr("the task")
+    m_log.room_line(
+        m_store.people_ids(config) or ["all"],
+        "{lead} declared the goal reached: {goal}. The lead's rounds stop; /team can continue them.",
+        lead=m_store.label_of(config, args.sender),
+        goal=goal,
+    )
+    print(m_i18n.tr("Goal reached: the rounds stop."))
 
 
 def cmd_brief(args: argparse.Namespace) -> None:
@@ -798,7 +837,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=m_deliver.cmd_deliver)
 
     s = sub.add_parser("team", help="the room's team: show it, list the ready teams, start one")
-    s.add_argument("action", nargs="?", choices=["show", "scenarios", "start"], default="show")
+    s.add_argument("action", nargs="?", choices=["show", "scenarios", "start", "save"], default="show")
     s.add_argument("scenario", nargs="?", help="with start: one of collab team scenarios")
     s.set_defaults(func=cmd_team)
 
@@ -810,6 +849,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--add", action="append", metavar="KIND:NAME[:ROLE[:TOPIC]]", help="a new agent")
     s.set_defaults(func=cmd_propose)
+
+    s = sub.add_parser("goal", help="the lead declares the room's goal reached: its rounds stop")
+    s.add_argument("action", choices=["reached"])
+    s.add_argument("--from", dest="sender", required=True)
+    s.set_defaults(func=cmd_goal)
 
     s = sub.add_parser("brief", help="an agent's assignment from the room's settings (--hook: for Claude Code's SessionStart)")
     s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))

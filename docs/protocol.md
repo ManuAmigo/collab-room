@@ -330,6 +330,29 @@ chat. `collab team scenarios` lists them.
 assignment — Starting, Getting its assignment, Assignment acknowledged (its latest assignment closed with `ack`: it
 got it, which is not a promise to keep it), or Replied to its assignment (it answered it with `say --re`: read it).
 
+### The lead's round
+
+A room with a lead has its rounds: every `team.round` minutes (30 when not set; `false` — off) delivery looks at the
+room's data — never the words of messages — and wakes the lead only with a reason: an agent holding a task
+(`tasks.json`) longer than a round with no word in the room since; an agent free with no task while the room's goal
+is not reached; work handed in (a task done) since the last round with no answer from the lead. One summary a round,
+only of reasons not told before — a reason told is not told again while it lasts, and a new goal starts anew —
+as a message from the room to the lead — names, task ids and times only — delivered like any message, after its
+current task; it asks to act (nudge, give a task, check, ask the person) or to answer «going» in one line. No reason —
+no wake. `collab goal reached --from LEAD` declares the goal reached: the rounds stop and the person gets one line; a
+new goal, or `/team` → Continue the lead's rounds, starts them again. No lead — no rounds.
+
+### Your own scenarios
+
+A running team is saved as the person's own scenario — `/team` → Save as your own scenario…, or `collab team save
+NAME` — into `scenarios/NAME.json` beside the person's other collab files, outside any project (`0600`): each agent's
+program, name and the settings that apply to it, and the result file; not its conversation, its folder or the room's
+history. A new room's «What will we do?» offers it after the ready ones, as `own:NAME`; its preview shows its whole
+team before anything starts, and it can be changed there like a ready one. A saved file is read checked whole each
+time: not through a link, not longer than 64 KB, a scenario's checks (one lead, known programs, settings that pass);
+one that does not pass is named and left out (`collab team scenarios` lists both). Started, the team is copied into
+the room's file: an edit of the saved file later changes no running team.
+
 ### Changing a running team
 
 `/team` on a team (or on agents added one by one) shows it, then: change an agent, change the room, or look back

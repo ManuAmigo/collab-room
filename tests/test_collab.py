@@ -2347,6 +2347,67 @@ class RoomTest(Base):
         with self.assertRaises(ValueError):
             mod.start_scenario("text", str(self.root), bad)
 
+    def test_a_team_saved_as_ones_own_scenario_starts_again_as_it_was_and_a_bad_file_is_left_out(self):
+        # Saved: each agent's program, name and settings that apply, the result file — not conversations or folders.
+        # Read back checked whole: not through a link, not too long, not two leads; started, a copy, so an edit of the
+        # file later changes nothing.
+        agents = [
+            {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "idle": "x", "role": "lead", "use_model": "opus"},
+            {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x", "role": "worker", "topic": "prices",
+             "context_trim": {"do": "clear", "after": "handoff"}},
+        ]  # fmt: skip
+        cfg = {"version": 2, "session": "t", "participants": [{"id": "owner"}, *agents], "team": {"output": "notes.md"}}
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        r = self.run_collab("team", "save", "my-crm")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        path = self.root / "scenarios" / "my-crm.json"
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        saved = json.loads(path.read_text())
+        self.assertEqual([(x["label"], x.get("role"), x.get("use_model"), x.get("topic")) for x in saved["seats"]],
+                         [("Lea", "lead", "opus", None), ("Ann", "worker", None, "prices")])  # fmt: skip
+        self.assertEqual(saved["output"], "notes.md")
+        self.assertNotIn("claude_session", json.dumps(saved), "not its conversation")
+        folder = self.root / "scenarios"
+        (folder / "broken.json").write_text("{nope", encoding="utf-8")
+        (folder / "huge.json").write_text(json.dumps({**saved, "title": "huge", "pad": "x" * 70000}), encoding="utf-8")
+        (folder / "twolead.json").write_text(
+            json.dumps({**saved, "title": "two", "seats": [saved["seats"][0], {**saved["seats"][0], "seat": "b"}]}),
+            encoding="utf-8",
+        )
+        outside = self.root / "outside.json"
+        outside.write_text(json.dumps({**saved, "title": "linked"}), encoding="utf-8")
+        (folder / "linked.json").symlink_to(outside)
+        r = self.run_collab("team", "scenarios")
+        self.assertIn("own:my-crm: my-crm — your own team", r.stdout)
+        for bad in ("broken", "huge", "twolead", "linked"):
+            self.assertNotIn(f"own:{bad}", r.stdout, bad)
+            self.assertIn(f"{bad}.json", r.stderr, f"{bad}: named, not hidden")
+        mod = _Loader(f"collab_own_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        commands: list[str] = []
+
+        def tmux(*argv, **_):
+            if argv[0] == "new-window":
+                commands.append(argv[-1])
+                return SimpleNamespace(stdout=f"%{len(commands) + 10} 4{len(commands)}\n", returncode=0, stderr="")
+            return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        self.enterContext(mock.patch.object(shutil, "which", lambda name: f"/usr/local/bin/{name}"))
+        self.cfg.write_text(json.dumps({"version": 2, "session": "t", "participants": [{"id": "owner"}]}), encoding="utf-8")
+        started, failed = mod.start_scenario("own:my-crm", str(self.root))
+        self.assertEqual((len(started), failed), (2, []))
+        self.assertIn("--model opus", commands[0])
+        team = json.loads(self.cfg.read_text())["team"]
+        self.assertEqual((team["scenario"], team["title"], team["output"]), ("own:my-crm", "my-crm", "notes.md"))
+        path.write_text(
+            json.dumps({**saved, "seats": [{**saved["seats"][0], "use_model": "haiku"}, saved["seats"][1]]}), encoding="utf-8"
+        )
+        self.assertEqual(
+            json.loads(self.cfg.read_text())["team"]["seats"][0].get("use_model"), "opus", "a running team keeps its copy"
+        )
+
     def test_collab_team_shows_where_each_agent_is_with_its_assignment(self):
         # Acknowledged: its latest brief closed with ack. Replied: it answered it — the person reads that.
         # Acknowledged means it got the assignment, not that it keeps it.
@@ -7455,6 +7516,77 @@ class DeliveryTest(Base):
         self.assertEqual(len(said()), 4, "named once")
         mod.deliver_once({"participants": seats, "team": {**team, "round": "often"}}, {})
         self.assertEqual(said()[-1][1], "Setting ignored — the lead's round must be minutes from 1 to 1440, or false.")
+
+    def test_the_leads_round_wakes_it_only_with_a_reason_once_a_round_and_stops_when_the_goal_is_reached(self):
+        # By the room's data, not by the words of messages: a task held with no word, an agent free with no task while
+        # the goal is not reached, work handed in with no answer. No reason — the lead is not woken; one summary a
+        # round; none without a lead, with rounds off, or once the goal is declared reached — until it changes.
+        mod = _Loader(f"collab_rounds_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.state.mkdir(parents=True, exist_ok=True)
+        seats = [{"id": "owner"}, {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "idle": "x", "role": "lead"},
+                 {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x", "role": "worker"},
+                 {"id": "bob", "label": "Bob", "kind": "claude", "pane": False, "idle": "x", "role": "worker"}]  # fmt: skip
+        cfg = {"version": 2, "session": self.session, "participants": seats, "team": {"round": 30}}
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        rounds = lambda: [
+            m["text"] for m in self.messages() if m["from"] == "room" and m["to"] == ["lea"] and "round" in m["text"]
+        ]
+        ago = lambda minutes: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        back = lambda: (self.state / "rounds.json").write_text(
+            json.dumps({**json.loads((self.state / "rounds.json").read_text()), "last": time.time() - 31 * 60})
+        )
+        tick = lambda c=None: mod.deliver_once(c or json.loads(self.cfg.read_text()), {})
+        tick()  # the first look only starts the count
+        back()
+        tick()
+        self.assertEqual(rounds(), [], "no reason: the lead is not woken")
+        (self.state / "tasks.json").write_text(
+            json.dumps({"ann": {"task": "T-1", "kind": "research", "lane": "", "by": "", "since": ago(45)}})
+        )
+        back()
+        tick()
+        tick()
+        self.assertEqual(len(rounds()), 1, "once a round, not each tick")
+        self.assertIn("Ann holds T-1 for 45 min", rounds()[0])
+        self.note("ann", ["lea"], "still on it")  # a word in this round: no longer a reason
+        with (self.state / "tasks.jsonl").open("a") as f:
+            f.write(json.dumps({"at": ago(1), "event": "done", "pid": "bob", "task": "T-2", "commit": ""}) + "\n")
+        back()
+        tick()
+        self.assertEqual(len(rounds()), 2)
+        self.assertNotIn("Ann holds", rounds()[-1])
+        self.assertIn("Bob handed in T-2", rounds()[-1])
+        self.assertNotIn("still on it", rounds()[-1], "no words of anyone's messages")
+        self.note("lea", ["bob"], "thanks, merged")  # answered
+        cfg["team"]["goal"] = "Pick a CRM."
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        mod.write_status("bob", "idle", "", "self")
+        back()
+        tick()
+        self.assertIn("Bob is free with no task, and the goal is not reached.", rounds()[-1])
+        self.assertNotIn("handed in", rounds()[-1], "answered by the lead")
+        r = self.run_collab("goal", "reached", "--from", "lea")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotEqual(self.run_collab("goal", "reached", "--from", "ann").returncode, 0, "only the lead")
+        n = len(rounds())
+        back()
+        tick()
+        self.assertEqual(len(rounds()), n, "goal reached: the rounds stop")
+        self.assertTrue(any(m["text"].startswith("Lea declared the goal reached: Pick a CRM.") for m in self.messages()))
+        cfg["team"]["goal"] = "Pick a CRM and a backup."
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        back()
+        tick()
+        self.assertEqual(len(rounds()), n + 1, "a new goal: the rounds go on")
+        for off in (
+            {**cfg, "team": {**cfg["team"], "round": False}},
+            {**cfg, "team": {"round": 30}, "participants": [s_ for s_ in seats if s_["id"] != "lea"]},
+        ):
+            self.cfg.write_text(json.dumps(off), encoding="utf-8")
+            back()
+            tick()
+        self.assertEqual(len(rounds()), n + 1, "off, or no lead: no round")
 
     def test_a_quiet_note_in_the_persons_name_still_wakes_the_agent(self):
         # A person's letter is never left waiting, marked or not — signed, or in their name unsigned (it then
@@ -14150,6 +14282,43 @@ class DeliveryTest(Base):
         keys("-l", "/продолжить")
         keys("Enter")
         self.assertTrue(self.wait_for(pane, "Доставка возобновлена"), self.screen(pane))
+
+    def test_a_team_is_saved_in_the_chat_and_a_new_room_offers_it(self):
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "idle": "x", "role": "lead"},
+                {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x", "role": "worker", "topic": "facts"},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(pane))
+        keys = lambda *k: (subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True), time.sleep(0.2))
+        keys("-l", "/team")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Save as your own scenario…"), self.screen(pane))
+        keys("Down", "Down", "Down", "Down")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "A name for this team"), self.screen(pane))
+        keys("-l", "fact-team")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Ann · worker · facts"), self.screen(pane))
+        keys("Enter")  # Save
+        self.assertTrue(self.wait_for(pane, "Saved as your scenario «fact-team»"), self.screen(pane))
+        self.assertTrue((self.root / "scenarios" / "fact-team.json").exists())
+        subprocess.run(["tmux", "kill-session", "-t", f"={self.session}"], capture_output=True)
+        self.cfg.unlink()
+        self.assertEqual(self.run_collab("start", "--session", self.session).returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_for(pane, "The room calls you"), self.screen(pane))
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+        self.assertTrue(self.wait_for(pane, "fact-team — your own team"), self.screen(pane))
 
     def test_first_visit_welcomes_once_and_sends_nothing(self):
         # «the user must learn all this easily».

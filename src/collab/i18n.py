@@ -1341,6 +1341,68 @@ CATALOG: dict[str, dict[str, Any]] = {
     "t.54210e4539": {"en": "{mark} {pid} {words}: {detail}", "ru": "{mark} {pid} {words}: {detail}"},
     "t.0ff603ac65": {"en": "{mark} {pid} {words}", "ru": "{mark} {pid} {words}"},
     "t.b3b8fb8245": {"en": "· {pid}: No status yet", "ru": "· {pid}: состояния пока нет"},
+    # The person's own scenarios.
+    "t.2a5cedad69": {
+        "en": "! A name of letters, digits, - and _, up to 40. Try again.",
+        "ru": "! Имя из букв, цифр, - и _, не длиннее 40. Попробуйте ещё раз.",
+    },
+    "t.e953a8b140": {"en": "! Not saved: {why}.", "ru": "! Не сохранено: {why}."},
+    "t.d075396f90": {"en": "! left out: {why}", "ru": "! пропущен: {why}"},
+    "t.f3d8933e60": {
+        "en": "A name for this team (letters, digits, - and _; Esc to go back):",
+        "ru": "Имя для этой команды (буквы, цифры, - и _; Esc — назад):",
+    },
+    "t.5c495230d2": {"en": "Replace your scenario «{name}»?", "ru": "Заменить ваш сценарий «{name}»?"},
+    "t.24f1971b57": {"en": "Save as your own scenario…", "ru": "Сохранить как свой сценарий…"},
+    "t.b82767fd9a": {
+        "en": "Saved as your scenario «{name}»: a new room offers it in «What will we do?».",
+        "ru": "Сохранено как ваш сценарий «{name}»: новая комната предложит его в «Что будем делать?».",
+    },
+    "t.b1fbc8a5fd": {
+        "en": "Saved {path}: collab team start own:{name} in a new room.",
+        "ru": "Сохранено {path}: collab team start own:{name} в новой комнате.",
+    },
+    "t.25ef35d7ad": {
+        "en": "Your scenario «{name}»: the roles and settings, not the conversations, folders or history.",
+        "ru": "Ваш сценарий «{name}»: роли и настройки, без разговоров, папок и истории.",
+    },
+    "t.8f6954d27f": {
+        "en": "collab team save takes a name of letters, digits, - and _, up to 40",
+        "ru": "collab team save принимает имя из букв, цифр, - и _, не длиннее 40",
+    },
+    "t.a8562383eb": {"en": "not saved: {why}", "ru": "не сохранено: {why}"},
+    "t.186eb65301": {"en": "your own team", "ru": "ваша собственная команда"},
+    "t.114278384a": {"en": "{name}: {p1} — your own team", "ru": "{name}: {p1} — ваша собственная команда"},
+    # The lead's rounds.
+    "t.af78f31f86": {
+        "en": "- {name} holds {task} for {mins} min and wrote nothing in this round.",
+        "ru": "- {name} держит {task} уже {mins} мин и за этот обход ничего не написал.",
+    },
+    "t.2f7f6b874b": {
+        "en": "- {name} is free with no task, and the goal is not reached.",
+        "ru": "- {name} свободен без задачи, а цель не достигнута.",
+    },
+    "t.b143e75070": {
+        "en": "- {name} handed in {task} at {at}; no answer from you yet.",
+        "ru": "- {name} сдал {task} в {at}; вашего ответа пока нет.",
+    },
+    "t.dd5b3cef88": {"en": "The team's round (every {n} min):", "ru": "Обход команды (каждые {n} мин):"},
+    "t.eefc100803": {
+        "en": "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: collab goal reached --from {lead}.",
+        "ru": "Действуйте — подтолкните, дайте задачу, проверьте, спросите пользователя — или ответьте одной строкой «идёт». Цель достигнута: collab goal reached --from {lead}.",
+    },
+    "t.5ffccc851b": {
+        "en": "only the room's lead declares the goal reached",
+        "ru": "объявить цель достигнутой может только ведущий комнаты",
+    },
+    "t.e872c7f207": {"en": "the task", "ru": "задача"},
+    "t.1eb90fe84e": {
+        "en": "{lead} declared the goal reached: {goal}. The lead's rounds stop; /team can continue them.",
+        "ru": "{lead} объявил цель достигнутой: {goal}. Обходы ведущего остановлены; продолжить их можно в /команда.",
+    },
+    "t.41ffe8ecac": {"en": "Goal reached: the rounds stop.", "ru": "Цель достигнута: обходы остановлены."},
+    "t.ee91f47e87": {"en": "Continue the lead's rounds", "ru": "Продолжить обходы ведущего"},
+    "t.1bb0846c57": {"en": "The lead's rounds go on.", "ru": "Обходы ведущего продолжаются."},
     # Scenario titles and hints.
     "scenario.development.title": {"en": "Development", "ru": "Разработка"},
     "scenario.development.hint": {
