@@ -24,6 +24,7 @@ import collab.deliver as m_deliver
 import collab.telegram as m_telegram
 import collab.agents as m_agents
 import collab.lifecycle as m_lifecycle
+import collab.doctor as m_doctor
 import collab.chat_base as m_chat_base
 import collab.chat as m_chat
 import collab.dm as m_dm
@@ -857,6 +858,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("action", nargs="?", choices=["on", "off", "unlink", "status", "run", "limit"], default="status")
     s.add_argument("tokens", nargs="?", type=int, default=0, help="with limit: tokens a day (0 — none)")
     s.set_defaults(func=m_telegram.cmd_telegram)
+
+    s = sub.add_parser("doctor", help="what runs where — versions, each room's chat and delivery — as text to paste")
+    s.add_argument("--fix", action="store_true", help="offer, one yes/no each, what a stale room needs")
+    s.set_defaults(func=m_doctor.cmd_doctor)
 
     s = sub.add_parser("goal", help="the lead declares the room's goal reached: its rounds stop")
     s.add_argument("action", choices=["reached"])

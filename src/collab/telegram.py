@@ -35,6 +35,7 @@ CODE = re.compile(r"[A-Z0-9]{4,32}")  # also Telegram's start parameter: A-Za-z0
 BOT_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
 ROOM_ID = re.compile(r"[0-9a-f]{32}")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{20,128}")
+AGENT_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")  # an agent's id as the server takes it, to write to it by
 
 
 class Refused(Exception):
@@ -123,6 +124,29 @@ def waiting_agents(config: dict[str, Any]) -> list[str]:
     return [p["id"] for p in config["participants"] if status.get(p["id"], {}).get("state") == "needs_owner"]
 
 
+def role_shown(config: dict[str, Any], pid: str) -> str:
+    """An agent's role in the room's words, as the person reads it under its name: «lead», «reviewer»…"""
+    if pid == m_store.lead_of(config):
+        role = "lead"
+    else:
+        p = next((q for q in config["participants"] if q["id"] == pid), {})
+        role = m_store.effective(p.get("kind", ""), p, config, "role")
+    if not isinstance(role, str) or not role:
+        return ""
+    lang = m_store.room_language(config)
+    shown = m_i18n.words_in(f"role.{role}", lang) if role in ("lead", "worker", "reviewer") else role
+    return m_text.clean_field(shown, 40)
+
+
+def author(config: dict[str, Any], pid: str) -> dict[str, str]:
+    """Who wrote a message the bot shows: its id (a Reply to it goes back to that agent), name and role."""
+    return {
+        "from": pid if AGENT_ID.fullmatch(pid) else "",
+        "from_name": m_text.clean_field(m_store.label_of(config, pid), 80),
+        "role": role_shown(config, pid),
+    }
+
+
 def room_state(config: dict[str, Any]) -> dict[str, Any]:
     """What the bot shows of the room: its name (and its project folder's parent, to tell a twin apart), its lead's,
     its language, whether there is a lead to write to; its agents' states, today's spend, how many wait for the person."""
@@ -132,11 +156,14 @@ def room_state(config: dict[str, Any]) -> dict[str, Any]:
     people = set(m_store.people_ids(config))
     agents = [
         {
+            "id": p["id"],  # what the person chooses in /dm: the message goes to this id, never to a name
             "name": m_text.clean_field(m_store.label_of(config, p["id"]), 40),
             "state": str(status.get(p["id"], {}).get("state") or "unknown")[:40],
+            "role": role_shown(config, p["id"]),
+            "lead": p["id"] == lead,
         }
         for p in config["participants"]
-        if p["id"] not in people
+        if p["id"] not in people and AGENT_ID.fullmatch(p["id"])
     ][:20]
     pending = len(m_store.pending_proposals(m_log.read_messages()[-500:]))
     return {
@@ -192,54 +219,81 @@ def unlink() -> int:
 
 
 @m_store.room_locked
-def take(msg: dict[str, Any], config: dict[str, Any]) -> bool:
-    """One message from Telegram into the room: from the person, to the lead, signed with the person's key and marked
-    via telegram under the signature, its server id kept — taken twice, written once. False — no lead to write to."""
-    lead = m_store.lead_of(config)
+def take(msg: dict[str, Any], config: dict[str, Any]) -> str:
+    """One message from Telegram into the room: from the person, to the agent it was written to — the lead when none
+    — signed with the person's key and marked via telegram under the signature, its server id kept: taken twice,
+    written once. "taken"; "refused" — its agent is no longer in the room (never another instead); "" — no lead to
+    write to yet: it waits."""
     people = m_store.people_ids(config)
     mid = str(msg.get("id") or "")
-    if not lead or not people or not mid:
-        return False
+    to = str(msg.get("to") or "")
+    agents = {p["id"] for p in config["participants"]} - set(people)
+    if to and to not in agents:
+        return "refused"
+    to = to or m_store.lead_of(config) or ""
+    if not to or not people or not mid:
+        return ""
     if any(m.get("tg") == mid for m in m_log.read_messages()[-500:]):
-        return True
+        return "taken"
     text = m_text.visible(str(msg.get("text") or ""))[:TEXT_MAX]
     re_ = str(msg.get("re") or "")
     known = re_ and any(m.get("id") == re_ for m in m_log.read_messages()[-2000:])
-    m_log.append_message(people[0], [lead], text, re_=re_ if known else "", sign=True, via="telegram", tg=mid)
-    return True
+    m_log.append_message(people[0], [to], text, re_=re_ if known else "", sign=True, via="telegram", tg=mid)
+    return "taken"
 
 
-def outgoing(config: dict[str, Any], messages: list[dict[str, Any]], after: str) -> list[tuple[str, str, str]]:
-    """What goes to Telegram since the message `after`: the lead's messages to the person, its proposals (to apply on
-    the computer), the goal reached. (room message id, kind, text)."""
+def outgoing(config: dict[str, Any], messages: list[dict[str, Any]], after: str) -> list[tuple[str, str, str, dict[str, str]]]:
+    """What goes to Telegram since the message `after`: the agents' messages to the person — the same as the
+    computer's direct tab shows (dm_talk): to the person, or to everyone answering the person's own — the lead's
+    proposals (to apply on the computer), the goal reached, and the person's own words written on the computer.
+    (room message id, kind, text, its author)."""
     lead = m_store.lead_of(config)
     people = set(m_store.people_ids(config))
+    agents = {p["id"] for p in config["participants"]} - people
     # START — from the log's beginning (it was empty at the first look); an id gone (the history cleared) — from it too.
     start = 0 if after == START else next((i + 1 for i, m in enumerate(messages) if m.get("id") == after), 0)
     by_id = {str(m.get("id")): m for m in messages}
-    out: list[tuple[str, str, str]] = []
+    out: list[tuple[str, str, str, dict[str, str]]] = []
     for m in messages[start:]:
         to = set(m.get("to") or [])
-        if m.get("from") == lead and lead and to & people and not m.get("quiet"):
+        sender = str(m.get("from") or "")
+        mine = by_id.get(str(m.get("re") or ""), {})
+        # The person's only when signed with their key: a line in the log under their id is not their word for it.
+        mine = {} if mine.get("from") in people and m_log.unsigned_person(mine, config) else mine
+        answers = "all" in to and mine.get("from") in people and ("all" in mine.get("to", []) or sender in mine.get("to", []))
+        if sender in agents and (to & people or answers) and not m.get("quiet"):
             if isinstance(m.get("proposal"), dict):
-                out.append((m["id"], "proposal", m_store.proposal_words(config, m["proposal"])))
+                if sender == lead:
+                    out.append((m["id"], "proposal", m_store.proposal_words(config, m["proposal"]), author(config, sender)))
             else:
-                # By what it is, not by its words: an answer to the person's message is a reply; one the lead begins
+                # By what it is, not by its words: an answer to the person's message is a reply; one an agent begins
                 # itself asks the person something — a question.
-                answered = by_id.get(str(m.get("re") or ""), {}).get("from") in people
-                out.append((m["id"], "reply" if answered else "question", str(m.get("text") or "")))
+                kind = "reply" if mine.get("from") in people else "question"
+                out.append((m["id"], kind, str(m.get("text") or ""), author(config, sender)))
+        elif (
+            sender in people
+            and m.get("via") != "telegram"
+            and not m.get("quiet")
+            and not m.get("proposal")
+            and not m_log.unsigned_person(m, config)
+        ):
+            # The person's own words on the computer: shown in the topic as theirs, so the talk reads whole there too.
+            # From Telegram — the person has them already.
+            named = m.get("to") or []
+            whom = m_text.clean_field(m_store.label_of(config, named[0]), 80) if len(named) == 1 and named[0] in agents else ""
+            out.append((m["id"], "own", str(m.get("text") or ""), {"to_name": whom}))
         elif (
             m.get("from") == m_text.ROOM
             and to & people
             and str((m.get("said") or {}).get("t", "")).startswith("{lead} declared the goal reached")
         ):
-            out.append((m["id"], "goal", str(m.get("text") or "")))
+            out.append((m["id"], "goal", str(m.get("text") or ""), {}))
         elif (
             m.get("from") == m_text.ROOM
             and to & people
             and str((m.get("said") or {}).get("t", "")).startswith("Agents wrote {n}")
         ):
-            out.append((m["id"], "paused", str(((m.get("said") or {}).get("p") or {}).get("n") or "")))
+            out.append((m["id"], "paused", str(((m.get("said") or {}).get("p") or {}).get("n") or ""), {}))
     return out
 
 
@@ -249,13 +303,13 @@ def send_out(state: dict[str, Any]) -> dict[str, Any]:
     messages = m_log.read_messages()
     if not state.get("sent"):
         state = update(sent=messages[-1]["id"] if messages else START)  # from now: the past is not sent
-    for mid, kind, text in outgoing(config, messages, str(state.get("sent") or "")):
+    for mid, kind, text, who in outgoing(config, messages, str(state.get("sent") or "")):
         if text.strip():
             call(
                 state["server"],
                 "POST",
                 f"/v1/rooms/{state['room_id']}/messages",
-                {"room_msg": mid, "kind": kind, "text": text},
+                {"room_msg": mid, "kind": kind, "text": text, **who},
                 state["token"],
             )
         state = update(sent=mid)
@@ -307,9 +361,11 @@ def take_in(state: dict[str, Any], wait: float) -> dict[str, Any]:
         state = update(state="off", after=int(got.get("after") or 0))
         m_log.room_line(m_store.people_ids(config), "Telegram is unlinked: the account was unlinked in the bot.", silent=True)
         return state
-    taken = [str(m["id"]) for m in got.get("messages") or [] if isinstance(m, dict) and take(m, config)]
-    if taken:
-        call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/ack", {"messages": taken}, state["token"])
+    done = [(str(m["id"]), take(m, config)) for m in got.get("messages") or [] if isinstance(m, dict)]
+    taken, refused = [i for i, how in done if how == "taken"], [i for i, how in done if how == "refused"]
+    if taken or refused:
+        body = {"messages": taken, "refused": refused}
+        call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/ack", body, state["token"])
     return update(after=int(got.get("after") or 0))
 
 

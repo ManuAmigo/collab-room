@@ -52,6 +52,7 @@ LAYERS = [
     "telegram",
     "agents",
     "lifecycle",
+    "doctor",
     "chat_base",
     "chat_help",
     "chat_menu",

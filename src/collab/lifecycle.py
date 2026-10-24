@@ -1,7 +1,9 @@
 from __future__ import annotations
 import argparse
+import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -760,6 +762,64 @@ def open_room_windows(
     return kept
 
 
+def old_chat(config: dict[str, Any]) -> None:
+    """Back to a running room whose chat was opened by an older collab: said, and — in a terminal — offered to start it
+    again from this one (the chat comes back with the room's history). Its menu lacked what was added since."""
+    owner = next((p for p in config.get("participants", []) if m_store.is_chat_command(p.get("command"))), None)
+    pane = (m_store.read_panes().get("panes") or {}).get(owner["id"]) if owner else None
+    if not owner or not pane:
+        return
+    shown = m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_pid}", check=False).stdout.strip()
+    pids = (
+        [shown, *subprocess.run(["pgrep", "-P", shown], capture_output=True, text=True).stdout.split()] if shown.isdigit() else []
+    )
+    version = ""
+    for pid in pids:
+        words = subprocess.run(["ps", "-ww", "-o", "command=", "-p", pid], capture_output=True, text=True).stdout.split()
+        for i, word in enumerate(words[:-1]):
+            if re.fullmatch(r"collab(-[0-9a-f]{16})?", Path(word).name) and words[i + 1] == "chat":
+                with contextlib.suppress(OSError):
+                    found = re.search(rb'^VERSION = "([0-9.]+)"$', Path(word).read_bytes()[: 1 << 20], re.M)
+                    version = found.group(1).decode() if found else ""
+    if not version or version == m_boot.VERSION:
+        return
+    print(
+        m_i18n.tr(
+            "The room's chat is open on collab {old}; this is {new} — its menu lacks what came since.",
+            old=version,
+            new=m_boot.VERSION,
+        )
+    )
+    if sys.stdin.isatty() and m_term.confirm(
+        m_i18n.tr("Restart the chat on collab {new}? Its history stays.", new=m_boot.VERSION)
+    ):
+        cmd = m_store.current_chat_command(owner["command"])
+        program = " ".join(shlex.quote(x) for x in [shutil.which(cmd[0]) or cmd[0], *cmd[1:]])
+        m_tmuxio.tmux("respawn-pane", "-k", "-t", pane, m_tmuxio.in_dir(str(m_store.room().paths.root), program), check=False)
+
+
+def stray_chat(config: dict[str, Any]) -> None:
+    """A room made from another collab's folder (a clone) starts its chat from that file for good: the chat stays on
+    its version while delivery runs the installed one. Said in one line — it was silent."""
+    owner = next((p for p in config.get("participants", []) if m_store.is_chat_command(p.get("command"))), None)
+    if owner is None or m_store.trusted_chat_command(owner["command"]):
+        return
+    cmd = owner["command"]
+    path = str(cmd[1] if re.fullmatch(r"python[0-9.]*", Path(cmd[0]).name) else cmd[0])
+    try:
+        found = re.search(rb'^VERSION = "([0-9.]+)"$', Path(path).read_bytes()[: 1 << 20], re.M)
+    except OSError:
+        found = None
+    print(
+        m_i18n.tr(
+            "This room's chat starts from {path} (collab {v}), not this collab ({this}): collab doctor --fix starts it from the installed one.",
+            path=m_text.tilde(path),
+            v=found.group(1).decode() if found else "?",
+            this=m_boot.VERSION,
+        )
+    )
+
+
 def cmd_start(args: argparse.Namespace) -> None:
     rp = m_store.room().paths
     if shutil.which(m_tmuxio.TMUX) is None:
@@ -795,6 +855,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     refresh_codex_rules()
     m_installer.update_in_background(str(rp.root))
     config = m_store.load_config()
+    stray_chat(config)
     if not m_tmuxio.tmux_can_read(rp.root):
         m_store.fail(
             m_i18n.tr(
@@ -837,6 +898,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             start_telegram(session)
         room_options(session)
         restore_owner_pane(session, config)
+        old_chat(config)
         not_running(config)
         # The person lands on the chat: restarting the deliverer made its window the current one,
         # and every terminal of the room showed an empty screen.

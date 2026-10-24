@@ -4,6 +4,14 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.14
+
+- Telegram: write to any agent of the room, not only the lead — `/dm` lists them; Reply to an agent's answer goes to that agent. Plain text still goes to the lead. Every agent's words to you come to the room's topic, signed; what you write from the computer is shown there too. · Telegram: пишите любому агенту комнаты, не только ведущему — `/dm` показывает список; Reply на ответ агента уходит этому агенту. Обычный текст — по-прежнему ведущему. Всё, что агенты пишут вам, приходит в тему комнаты с подписью; написанное вами с компьютера тоже видно там.
+- `collab doctor`: what runs where — the command, the chats and windows of each room, their versions — as text to paste; `--fix` repairs what it can, asking yes for each. An open chat older than the installed collab is named, with a restart offered. · `collab doctor`: что где запущено — команда, чаты и окна каждой комнаты, их версии — текстом, который можно вставить; `--fix` чинит, что может, спрашивая «да» на каждое. Открытый чат старее установленного collab назван, предложен перезапуск.
+- «Lead» in an agent's card makes it the room's lead. · «Ведущий» в карточке агента делает его ведущим комнаты.
+- `/language` applies at once; «and for new rooms» is a separate choice. In a Russian room the labels around delivered messages are Russian. · `/язык` применяется сразу; «и для новых комнат» — отдельный пункт. В русской комнате подписи вокруг доставленных сообщений — на русском.
+- A question's hint is shown above the menu it opens, never hidden under it. · Подсказка вопроса — над меню, которое он открывает, а не под ним.
+
 ## 0.1.13
 
 - Telegram: `/telegram` in the room's chat links your account to the room's bot — a link that opens it with the code, a QR code to scan, or the code itself; each room gets a topic of its own. · Telegram: `/телеграм` в чате комнаты привязывает ваш аккаунт к боту — ссылкой, которая открывает его с кодом, QR-кодом или самим кодом; у каждой комнаты своя тема.

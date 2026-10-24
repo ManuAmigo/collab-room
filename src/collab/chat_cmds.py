@@ -18,6 +18,8 @@ def chat_add_wizard(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
     before = {k: v for k, v in ctx.wizard.items() if k != "back"}
     back = list(ctx.wizard.get("back", []))
     ctx.run_wizard_step(line)
+    if ctx.wizard.pop("went_back", False):
+        return  # the step itself went back a step: nothing to remember of the one it left
     if before.get("step") == "exit_confirm":
         return  # «Stay» put back what was there; the question itself is no step to return to
     if ctx.wizard and before.get("step") and ctx.wizard.get("step") != before.get("step"):

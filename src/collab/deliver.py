@@ -877,22 +877,23 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
     """The line typed into the agent's window for one message: its head, the text, the ready commands."""
     # The room is named in the command itself: an agent working in another folder (or with
     # another room in its COLLAB_ROOT) must still answer here.
+    lang = m_store.room_language(config)  # the labels in the room's language — the commands stay as they are
+    w = lambda key, **kw: m_i18n.words_in(key, lang, **kw)
     if m["from"] == m_text.ROOM and m.get("brief") is True:
         # An assignment is taken, not discussed: closed with ack; a question about it goes to the lead or the person.
-        hint = "if no answer is needed: " + room_cmd(
-            "ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"]
-        )
+        hint = w("hint.no_answer") + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"])
     elif m["from"] == m_text.ROOM:
-        hint = "reply in room: " + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), p["id"])
+        hint = w("hint.reply_room") + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), p["id"])
     else:
         # Both ways to close it, ready to run.
         hint = (
-            "answer: "
+            w("hint.answer")
             + room_cmd("say", f"--from {p['id']} --to {m['from']} --re {m['id']} {reply_body(p)}", p.get("cli", ""), p["id"])
-            + " · if no answer is needed: "
+            + " · "
+            + w("hint.no_answer")
             + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"])
         )
-    warn = (UNSIGNED + " ") if m_log.unsigned_person(m, config) else ""
+    warn = (w("hint.unsigned") + " ") if m_log.unsigned_person(m, config) else ""
     body = " ".join(m_text.body_text(m["text"]).split())  # no head of another inside
     limit = min(LONG_MESSAGE, int(rules.get("paste_limit") or LONG_MESSAGE))
     if len(body.encode("utf-8")) > limit:
@@ -900,17 +901,13 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
         # A long message is read by the agent itself.
         # Read through inbox: a room-started Codex may run only say/ack/inbox, through its
         # read-only copy — `show` there was refused. inbox prints it in full.
-        body = (
-            f"(long message, {len(body)} characters — read it in full: "
-            + room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"])
-            + ")"
-        )
+        body = w("hint.long", n=len(body), cmd=room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"]))
     # Its role, one word of a closed list, reminds an agent whose context was cut of its assignment; the topic,
     # free text, is never typed with it.
     role = m_store.effective(m_screen.agent_kind(p), p, config, "role")
-    you = f"you: {role} · " if role in m_store.ROLES else ""
+    you = w("hint.you", role=w(f"role.{role}")) if role in m_store.ROLES else ""
     if m.get("via") == "telegram" and not warn:
-        warn = "(via Telegram) "  # the person writes from the phone: a short answer reads best there
+        warn = w("hint.via_telegram")  # the person writes from the phone: a short answer reads best there
     return f"[{m['from']} → {', '.join(m['to'])}] {warn}{body}" + (f"  ({you}{hint})" if p.get("reply_hint", True) else "")
 
 

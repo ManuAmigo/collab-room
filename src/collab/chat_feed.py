@@ -175,6 +175,10 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
             ctx.shown_state[pid] = news
             if state in ("needs_owner", "lost", "draft"):
                 out.append(m_text.paint(shown_line.replace(pid, m_store.label_of(ctx.config, pid), 1), "1;38;5;196"))
+    if ctx.stale_chat():
+        # Kept in the bar while it lasts: said once in the feed, it scrolled away, and the person took a chat that
+        # lacked /team and /telegram for the room's own.
+        parts.insert(0, m_text.paint(m_i18n.tr("Old chat — reopen: /exit, then collab"), "1;38;5;214"))
     if m_store.load_config().get("paused"):
         n = m_log.held_count()
         parts.insert(0, m_text.paint(m_i18n.tr("Paused") + (m_i18n.tr(" · {n} waiting", n=n) if n else ""), "1;38;5;214"))

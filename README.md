@@ -275,6 +275,14 @@ How delivery decides and what it can get wrong: [docs/delivery.md](docs/delivery
 Run `collab COMMAND --help` for the arguments. Commands that act on a room take `--room
 <project-folder>`; without it they use `COLLAB_ROOT`, then the current folder.
 
+### Something looks off
+
+`collab doctor` prints, as text to paste for whoever helps you: the versions (collab, its Claude plugin, Claude
+Code, Codex), each room's chat, delivery, panel and Telegram and the copy of collab each runs, and the update's
+last lines — never a key or a message's words, your home folder as `~`. `collab doctor --fix` offers, one yes/no
+each, what a room needs: its chat started from the installed collab, an older chat or delivery restarted.
+Agents are never touched.
+
 ## Limits and privacy
 
 - **Local only.** One computer. Room files live under `~/.collab-room/`, outside your project; do

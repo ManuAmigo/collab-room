@@ -424,12 +424,21 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
             say_(ctx.wizard["prompt"])
             return
         after = line if step_ == "team_typed" else chosen_value(key, line, cfg)
-        if who != "room" and key == "role" and (after == "lead") != (who == m_store.lead_of(cfg)):
-            # One lead: who leads changes in the room's card, where the one before is given another role.
+        lead = m_store.lead_of(cfg)
+        if who != "room" and key == "role" and after == "lead" and who != lead:
+            # «Lead» for another agent is the room's change of lead — the one way a team keeps one lead: the new one
+            # leads, the one before becomes a worker, in one record (it asked the same question again, unsaid why).
+            who, key, after = "room", "lead", who
+        elif who != "room" and key == "role" and who == lead and after != "lead":
+            # The lead itself: no team is left without one — said, and back to its card, never the same question.
+            ctx.wizard_back()
+            ctx.wizard["went_back"] = True  # the history as wizard_back left it: Esc from the card goes on back
             say_(
-                m_i18n.tr("! The room has one lead: change who leads in /team → The room → Lead.")
-                + "\n" * (len(ctx.wizard.get("options") or []) + 2)
-            )
+                m_i18n.tr(
+                    "! {name} leads the room: to give the lead to another, choose «lead» in that agent's card.",
+                    name=m_store.label_of(cfg, who),
+                )
+            )  # above the card's menu by the one rule (chat_run_wizard_step)
             return
         why = m_store.change_problem(cfg, who, key, after)
         if why:
@@ -486,10 +495,23 @@ def team_step(ctx: ChatCommandContext, line: str, say_: Callable[[str], None]) -
 
 
 def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
+    """One step of a question, and one rule for what it said: a line printed while a menu is open goes above the menu,
+    never under it — a refusal under the menu was covered by it, and the same question looked asked again unsaid."""
+    said: list[str] = []
+    wizard_step(ctx, line, said)
+    rows = len(ctx.wizard.get("options") or []) + 2 if ctx.wizard.get("options") else 0
+    if said and rows:
+        # The feed's last lines are what the menu covers: blank ones as many as it takes, minus those said already.
+        blank = len(said[-1]) - len(said[-1].rstrip("\n"))
+        if blank < rows:
+            ctx.feed("\n" * (rows - blank - 1))
+
+
+def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
     """/add, /remove, /mute, /name, /exit and the others: every answer is chosen in the menu;
     only what has to be written — a name, a path as the last resort — is typed."""
     rp = m_store.room().paths
-    say_ = lambda text: ctx.feed(m_text.paint(text, "38;5;252"))
+    say_ = lambda text: (said.append(text), ctx.feed(m_text.paint(text, "38;5;252")))[1]
     if line in ("/exit", "/quit"):
         ctx.wizard.clear()
         ctx.wizard.update(
@@ -797,42 +819,29 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             say_(m_i18n.tr("The bot did not answer ({exc}). Nothing was changed.", exc=exc))
         return
     if line == "/language":
-        # Its own question in both: a person who cannot read the room's language still finds theirs.
+        # Its own question in both: a person who cannot read the room's language still finds theirs. Applied at once
+        # (a choice made and not confirmed was lost; another /language takes it back); «and for new rooms» is a choice
+        # of its own in the same list.
         ctx.wizard.clear()
-        ctx.wizard.update(
-            step="language_pick",
-            from_cmd="/language",
-            prompt=m_i18n.words_in("lang.choose"),
-            options=[(m_i18n.LANG_NAMES[x], x) for x in m_i18n.LANGS],
-        )
+        options: list[tuple[str, str]] = []
+        for x in m_i18n.LANGS:
+            options.append((m_i18n.LANG_NAMES[x], x))
+            options.append((m_i18n.words_in("lang.and_new", x, language=m_i18n.LANG_NAMES[x]), x + ":new"))
+        ctx.wizard.update(step="language_pick", from_cmd="/language", prompt=m_i18n.words_in("lang.choose"), options=options)
         return
     if ctx.wizard.get("step") == "language_pick":
-        if line not in m_i18n.LANGS:
+        target, _, new = line.partition(":")
+        if target not in m_i18n.LANGS:
             return
-        target = line
-        ctx.wizard.update(
-            step="language_confirm",
-            target=target,
-            prompt=m_i18n.words_in("lang.change.question", target, language=m_i18n.LANG_NAMES[target]),
-            options=[
-                (m_i18n.words_in("lang.change.apply", target), "go"),
-                (m_i18n.words_in("lang.change.apply", target) + " · " + m_i18n.words_in("lang.change.also_new", target), "also"),
-                (m_i18n.words_in("lang.change.cancel", target), "back"),
-            ],
-        )
-        return
-    if ctx.wizard.get("step") == "language_confirm":
-        target = ctx.wizard["target"]
         ctx.wizard.clear()
-        if line not in ("go", "also"):
-            say_(m_i18n.words_in("lang.unchanged", m_store.room_language(ctx.config)))
-            return
         m_store.set_room_language(target)
         m_i18n.speak(target)
-        if line == "also":
+        if new:
             m_store.set_user_language(target)
         ctx.refresh_people()  # the room's file changed: the chat reads it again, its menu and help follow
         say_(m_i18n.words_in("lang.changed", target))
+        if new:
+            say_(m_i18n.words_in("lang.new_rooms", target))
         return
     if line == "/team":
         ctx.wizard.clear()

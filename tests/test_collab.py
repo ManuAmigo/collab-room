@@ -2065,6 +2065,37 @@ class RoomTest(Base):
                 entry = mod.CATALOG.get(mod.topic_key(seat["topic"]))
                 self.assertTrue(entry and entry["en"] == seat["topic"] and entry["ru"], f"{name}: {seat['topic']}")
 
+    def test_in_a_russian_room_the_labels_around_a_delivered_message_are_russian_and_its_commands_the_same(self):
+        # The person sees them in an agent's window too: «answer: … · if no answer is needed: …» stayed English.
+        mod = _Loader(f"collab_hints_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        agent = {"id": "ann", "label": "Ann", "kind": "claude", "role": "worker"}
+        msg = {"id": "m1", "from": "lea", "to": ["ann"], "text": "prices, please", "at": mod.now()}
+        line = lambda lang, m=msg: mod.delivery_text(agent, m, {"participants": [agent], "language": lang}, {})
+        ru, en = line("ru"), line("en")
+        self.assertIn("(вы: исполнитель · ответ: ", ru)
+        self.assertIn(" · если ответ не нужен: ", ru)
+        self.assertIn("(you: worker · answer: ", en, "an English room as it was")
+        self.assertIn(" · if no answer is needed: ", en)
+        commands = lambda text: re.findall(r"python3 \S+ (?:say|ack) --room \S+ [^·)]*", text)
+        self.assertEqual(
+            [c.split("--room")[0] for c in commands(ru)], [c.split("--room")[0] for c in commands(en)], "the same commands"
+        )
+        brief = {"id": "b1", "from": "room", "to": ["ann"], "text": "assignment", "at": mod.now(), "brief": True}
+        self.assertIn("(вы: исполнитель · если ответ не нужен: ", line("ru", brief))
+        long = {**msg, "text": "x" * 20000}
+        self.assertIn("(длинное сообщение, 20000 знаков — прочтите целиком: ", line("ru", long))
+        people = [
+            {"id": "owner", "label": "Андрей"},
+            {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "role": "lead"},
+        ]
+        self.cfg.write_text(json.dumps({"version": 2, "session": "t", "participants": people, "team": {}, "language": "ru"}))
+        r = self.run_collab("brief", "--as", "lea")
+        self.assertIn(
+            "- Перед публикацией, отправкой сообщений вне комнаты или расходованием денег спросите разрешение пользователя.",
+            r.stdout,
+        )
+
     def test_a_russian_room_briefs_its_agents_in_russian_and_an_old_room_stays_english(self):
         people = [
             {"id": "owner", "label": "Андрей"},
@@ -10717,11 +10748,38 @@ class DeliveryTest(Base):
             f.write("\n# a newer collab\n")  # collab on disk changed under the open chat
         self.assertTrue(self.wait_for(pane, "Your chat runs an older collab", timeout=20), self.screen(pane))
         self.assertEqual(self.screen(pane).count("Your chat runs an older collab"), 1, "said once")
+        bar = lambda: "\n".join(self.screen(pane).splitlines()[-3:])
+        self.assertTrue(self.until(lambda: "Old chat — reopen: /exit, then collab" in bar()), bar())
+        self.run_collab("say", "--from", "owner", "--to", "all", "\n".join(f"line {i}" for i in range(40)))
+        time.sleep(1)
+        self.assertIn("Old chat — reopen", bar(), "kept in the bar while it lasts: the feed's line scrolled away")
         keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
         keys("-l", "/add")
         keys("Enter")
         self.assertTrue(self.wait_for(pane, "! Your chat runs an older collab"), self.screen(pane))
         self.assertNotIn("Which agent to start?", self.screen(pane), "nothing is started from old code")
+
+    def test_back_to_a_room_whose_chat_runs_an_older_collab_says_so(self):
+        # The owner's second computer: 0.1.13 installed, an old chat open — no /team, no /telegram — and nothing said.
+        old = self.root / "old" / "collab"
+        old.parent.mkdir()
+        old.write_text('VERSION = "0.1.1"\nimport time\ntime.sleep(60)\n', encoding="utf-8")
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", self.session, "-n", "room", f"python3 {old} chat --as owner"], check=True
+        )
+        pane = subprocess.run(["tmux", "display-message", "-p", "-t", f"={self.session}:=room", "#{pane_id}"],
+                              capture_output=True, text=True).stdout.strip()  # fmt: skip
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "panes.json").write_text(json.dumps({"session": self.session, "panes": {"owner": pane}}))
+        mod = _Loader(f"collab_oldchat_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        config = {"participants": [{"id": "owner", "command": ["python3", str(COLLAB), "chat", "--as", "owner"]}]}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mod.old_chat(config)
+        self.assertIn(f"The room's chat is open on collab 0.1.1; this is {mod.VERSION}", out.getvalue())
+        alive = subprocess.run(["tmux", "list-panes", "-t", pane, "-F", "#{pane_dead}"], capture_output=True, text=True).stdout
+        self.assertEqual(alive.strip(), "0", "without a terminal to ask in, nothing is restarted")
 
     def test_a_folder_name_without_access_reaches_the_menu_as_text(self):
         # A folder the chat cannot open was named raw in the /add menu's header — its rows were
@@ -14317,8 +14375,21 @@ class DeliveryTest(Base):
         self.assertTrue(self.wait_for(pane, "› lead"), self.screen(pane))
         keys("Down")
         keys("Enter")  # worker
-        self.assertTrue(self.wait_for(pane, "The room has one lead"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "! Ann leads the room: to give the lead to another"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "Change Ann: which?"), "back to its card — never the same question again")
         self.assertEqual(cfg()["team"]["lead"], "ann", "no team left without its lead")
+        keys("Escape")
+        self.assertTrue(self.wait_for(pane, "Change the team?  ↑↓"), self.screen(pane))
+        keys("Down")
+        keys("Enter")  # Change Lea…, a worker now
+        self.assertTrue(self.wait_for(pane, "Change Lea: which?"), self.screen(pane))
+        keys("Enter")  # Role
+        self.assertTrue(self.wait_for(pane, "› lead"), self.screen(pane))
+        keys("Enter")  # lead: the room's change of lead, in one record
+        self.assertTrue(self.wait_for(pane, "the room — lead: Ann → Lea."), self.screen(pane))
+        keys("Enter")  # Save
+        self.assertTrue(self.until(lambda: cfg().get("team", {}).get("lead") == "lea"), self.screen(pane))
+        self.assertEqual({p["id"]: p.get("role") for p in cfg()["participants"]}, {"owner": None, "ann": "worker", "lea": "lead"})
 
     def test_a_proposals_card_opens_after_what_came_before_it_is_on_the_screen(self):
         # A message that came while the chat was judging the proposal was held by the card it opened, and poured
@@ -14500,12 +14571,18 @@ class DeliveryTest(Base):
         keys("-l", "/язык")
         keys("Enter")
         self.assertTrue(self.wait_for(pane, "Выберите язык / Choose language"), self.screen(pane))
-        keys("Enter")  # English, first
-        self.assertTrue(self.wait_for(pane, "Change this room's language to English?"), self.screen(pane))
-        keys("Enter")  # Apply
+        self.assertIn("Русский — и для новых комнат", self.screen(pane), "«and for new rooms» in the same list")
+        keys("Enter")  # English, first: applied at once — a choice not confirmed was lost
         self.assertTrue(self.until(lambda: json.loads(self.cfg.read_text()).get("language") == "en"), self.screen(pane))
         self.assertTrue(self.wait_for(pane, "The room speaks English now"), self.screen(pane))
-        self.assertEqual((self.root / "language").read_text().strip(), "ru", "the default for new rooms is not changed by Apply")
+        self.assertEqual((self.root / "language").read_text().strip(), "ru", "the default for new rooms is not changed")
+        keys("-l", "/language")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "English — and for new rooms"), self.screen(pane))
+        keys("Down")
+        keys("Enter")  # English — and for new rooms
+        self.assertTrue(self.until(lambda: (self.root / "language").read_text().strip() == "en"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "New rooms will speak English too."), self.screen(pane))
 
     def test_a_ready_team_is_changed_before_its_launch_and_nothing_starts_meanwhile(self):
         # «Chose a template — can change it before the launch»: an agent's model, one removed, one added; the lead
@@ -16032,6 +16109,60 @@ class QrTest(unittest.TestCase):
             self.mod.matrix("x" * 214)
 
 
+class DoctorTest(Base):
+    participants = [{"id": "owner", "label": "Андрей", "command": ["python3", "/x/collab", "chat", "--as", "owner"]}]
+
+    def setUp(self):
+        super().setUp()
+        self.mod = _Loader(f"collab_doctor_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        self.mod.use_room(str(self.root))
+        # A room made from a clone of collab in the person's home: its chat command names that clone's file.
+        self.clone = Path(os.environ["HOME"]) / "code" / "collab-room" / "collab"
+        self.clone.parent.mkdir(parents=True)
+        self.clone.write_text('VERSION = "0.1.9"\n', encoding="utf-8")
+        cfg = json.loads(self.cfg.read_text())
+        cfg["participants"][0]["command"] = ["python3", str(self.clone), "chat", "--as", "owner"]
+        cfg["language"] = "ru"
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        rooms = Path(os.environ["COLLAB_ROOMS"])
+        rooms.write_text(json.dumps({str(self.root): self.mod.now()}), encoding="utf-8")
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "telegram.json").write_text(
+            json.dumps({"server": "https://x", "room_id": "0" * 32, "token": "SECRET-TOKEN-" + "a" * 30, "state": "on"})
+        )
+
+    def test_the_report_says_where_a_rooms_chat_starts_from_and_no_secret(self):
+        text, fixes = self.mod.doctor_report()
+        self.assertIn(f"its chat starts from ~/code/collab-room/collab, version 0.1.9 (installed {self.mod.VERSION})", text)
+        self.assertIn("  language: ru", text)
+        self.assertIn("  Telegram: on", text)
+        self.assertNotIn("SECRET-TOKEN", text, "never a key")
+        self.assertNotIn(os.environ["HOME"], text, "the home folder as ~")
+        self.assertEqual(fixes[0]["chat_command"], "owner")
+
+    def test_fix_with_the_persons_yes_starts_the_chat_from_the_installed_collab(self):
+        _, fixes = self.mod.doctor_report()
+        with seam(self.mod, "term.confirm", lambda q: False):
+            self.mod.fix_room(fixes[0])
+        self.assertIn(str(self.clone), json.dumps(json.loads(self.cfg.read_text())), "no yes, no change")
+        with seam(self.mod, "term.confirm", lambda q: True):
+            said = self.mod.fix_room(fixes[0])
+        cmd = next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "owner")["command"]
+        self.assertEqual(cmd[1:], [str(self.mod.installed_collab()), "chat", "--as", "owner"])
+        self.assertTrue(self.mod.trusted_chat_command(cmd), "now the room's own chat, started by this collab")
+        self.assertTrue(said)
+
+    def test_start_says_in_one_line_that_the_chat_starts_from_another_collab(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.mod.stray_chat(self.mod.load_config())
+        self.assertEqual(out.getvalue().count("\n"), 1)
+        self.assertIn(
+            "This room's chat starts from ~/code/collab-room/collab (collab 0.1.9)",
+            out.getvalue().replace(os.environ["HOME"], "~"),
+        )
+
+
 class FakeBotServer:
     """The bot's server as the room meets it: /v1, tokens, a queue handed out until acknowledged. In this process,
     on a free port — no network, no bot."""
@@ -16040,6 +16171,7 @@ class FakeBotServer:
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
         self.rooms, self.queue, self.sent, self.acked, self.events = {}, [], [], [], []
+        self.refused: list[str] = []
         self.refuse = False
         fake = self
 
@@ -16077,6 +16209,7 @@ class FakeBotServer:
                     return self.reply(200, {"events": events, "messages": waiting, "after": len(events)})
                 if tail == "ack":
                     fake.acked += body["messages"]
+                    fake.refused += body.get("refused", [])
                     return self.reply(200, {})
                 if tail == "messages":
                     if body["room_msg"] not in [m["room_msg"] for m in fake.sent]:
@@ -16127,7 +16260,12 @@ class TelegramTest(Base):
             },
         )
         self.assertEqual(
-            self.bot.rooms[rid]["state"]["agents"], [{"name": "Lea", "state": "unknown"}, {"name": "Ann", "state": "unknown"}]
+            self.bot.rooms[rid]["state"]["agents"],
+            [
+                {"id": "lea", "name": "Lea", "state": "unknown", "role": "lead", "lead": True},
+                {"id": "ann", "name": "Ann", "state": "unknown", "role": "", "lead": False},
+            ],
+            "by id: what /dm in Telegram writes to",
         )
         self.assertNotIn(token, (self.state / "messages.jsonl").read_text() if (self.state / "messages.jsonl").exists() else "")
         self.mod.enable(self.bot.url)
@@ -16160,12 +16298,13 @@ class TelegramTest(Base):
         proposal["re"] = chat["id"]
         self.assertIsNotNone(self.mod.request_of(proposal, self.mod.load_config(), self.messages()), "from the chat it is")
 
-    def test_the_leads_messages_to_the_person_go_to_telegram_once_and_nothing_else(self):
+    def test_the_agents_messages_to_the_person_go_to_telegram_once_signed_and_nothing_else(self):
         self.mod.enable(self.bot.url)
         state = self.mod.send_out(self.mod.load())  # the first look: from now
         self.mod.append_message("lea", ["owner"], "Which plan do you use?")
         self.mod.append_message("lea", ["ann"], "your part: prices")
         self.mod.append_message("ann", ["owner"], "hi from Ann")
+        self.mod.append_message("ann", ["lea"], "prices: done")
         self.mod.room_line(
             ["owner"],
             "{lead} declared the goal reached: {goal}. The lead's rounds stop; /team can continue them.",
@@ -16175,8 +16314,41 @@ class TelegramTest(Base):
         state = self.mod.send_out(state)
         self.mod.send_out(state)
         self.assertEqual(
-            [(m["kind"], m["text"][:22]) for m in self.bot.sent],
-            [("question", "Which plan do you use?"), ("goal", "Lea declared the goal ")],
+            [(m["kind"], m["text"][:22], m.get("from", "")) for m in self.bot.sent],
+            [
+                ("question", "Which plan do you use?", "lea"),
+                ("question", "hi from Ann", "ann"),
+                ("goal", "Lea declared the goal ", ""),
+            ],
+        )
+        self.assertEqual({k: self.bot.sent[1][k] for k in ("from_name", "role")}, {"from_name": "Ann", "role": ""})
+
+    def test_a_message_from_telegram_goes_to_the_agent_it_was_written_to_and_to_a_gone_one_never(self):
+        self.mod.enable(self.bot.url)
+        self.bot.queue += [
+            {"id": "in3", "text": "check the prices", "re": None, "at": 0, "to": "ann"},
+            {"id": "in4", "text": "and you", "re": None, "at": 0, "to": "gone"},
+            {"id": "in5", "text": "to the lead", "re": None, "at": 0, "to": ""},
+        ]
+        self.mod.take_in(self.mod.load(), 0)
+        got = {m["tg"]: m["to"] for m in self.messages() if m.get("tg")}
+        self.assertEqual(got, {"in3": ["ann"], "in5": ["lea"]}, "never the lead nor anyone else instead of a gone one")
+        self.assertEqual((sorted(self.bot.acked), self.bot.refused), (["in3", "in5"], ["in4"]))
+
+    def test_an_agents_answer_to_the_persons_message_to_everyone_goes_and_its_own_words_say_to_whom(self):
+        self.mod.enable(self.bot.url)
+        state = self.mod.send_out(self.mod.load())
+        everyone = self.mod.append_message("owner", ["all"], "who has the numbers?", sign=True)
+        self.mod.append_message("ann", ["all"], "I do.", re_=everyone["id"])
+        self.mod.append_message("owner", ["ann"], "send them", sign=True)
+        self.mod.append_message("owner", ["lea"], "from Telegram", sign=True, via="telegram", tg="x1")
+        forged = self.mod.append_message("owner", ["all"], "not the person's: unsigned")
+        self.mod.append_message("ann", ["all"], "answering the forged one", re_=forged["id"])
+        self.mod.send_out(state)
+        self.assertEqual(
+            [(m["kind"], m["text"], m.get("to_name", m.get("from"))) for m in self.bot.sent],
+            [("own", "who has the numbers?", ""), ("reply", "I do.", "ann"), ("own", "send them", "Ann")],
+            "what came from Telegram is not sent back",
         )
 
     def test_a_refused_key_turns_telegram_off_and_tells_the_person(self):
@@ -16226,7 +16398,8 @@ class TelegramTest(Base):
         )
         self.mod.send_out(state)
         self.assertEqual([(m["kind"], m["text"]) for m in self.bot.sent],
-                         [("reply", "Around $12."), ("question", "Include the first year?"), ("paused", "20")])  # fmt: skip
+                         [("own", "how much?"), ("reply", "Around $12."), ("question", "Include the first year?"),
+                          ("paused", "20")])  # fmt: skip
 
     def test_an_agent_waiting_in_its_window_is_told_once_each_time_it_begins_to(self):
         self.mod.enable(self.bot.url)

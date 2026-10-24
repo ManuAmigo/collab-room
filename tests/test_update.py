@@ -45,7 +45,7 @@ class UpdateTest(unittest.TestCase):
         self.env["TMUX_TMPDIR"] = tmux_dir
         self.socket = os.path.join(tmux_dir, f"tmux-{os.getuid()}", "default")
         self.addCleanup(shutil.rmtree, tmux_dir, True)
-        self.addCleanup(subprocess.run, ["tmux", "-S", self.socket, "kill-server"], capture_output=True)
+        self.addCleanup(self.stop_tmux)
         self.bin = self.root / "bin"
         self.clone = self.root / "clone"
         self.public = self.root / "public.git"
@@ -56,6 +56,26 @@ class UpdateTest(unittest.TestCase):
         r = self.collab(str(self.clone / "collab"), "install", "--bin-dir", str(self.bin))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.version(), OLD)
+
+    def stop_tmux(self) -> None:
+        """This test's tmux server gone, and what ran in its windows with it: kill-server only signals them, and a
+        delivery still writing into the room's folder would keep that folder from being removed."""
+        panes = subprocess.run(
+            ["tmux", "-S", self.socket, "list-panes", "-a", "-F", "#{pane_pid}"], capture_output=True, text=True
+        )
+        pids = [int(x) for x in panes.stdout.split() if x.isdigit()]
+        for pid in list(pids):  # and what they started: a shell's program
+            kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True).stdout.split()
+            pids += [int(x) for x in kids if x.isdigit()]
+        subprocess.run(["tmux", "-S", self.socket, "kill-server"], capture_output=True)
+        end = time.monotonic() + 10
+        for pid in pids:
+            while time.monotonic() < end:
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+                time.sleep(0.1)
 
     def git(self, *args: str, cwd=None) -> str:
         run = subprocess.run(["git", *args], cwd=cwd or self.root, env=self.env, check=True, capture_output=True, text=True)
