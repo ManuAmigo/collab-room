@@ -5,6 +5,7 @@ network. Each test has a public repository of its own (a local bare one): no tes
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -145,7 +146,69 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.version(), NEW, "the collab command runs the new release")
         self.assertEqual(self.head(), self.released(NEW))
         r = self.update()
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, f"collab {NEW} is the newest"))
+        self.assertEqual((r.returncode, r.stdout.splitlines()[0]), (0, f"collab {NEW} is the newest"))
+
+    def fake_claude(self, fails: str = "") -> Path:
+        """A claude of the test's own on PATH: it writes down each call, lists the plugin at the version in a file
+        and moves it to NEW on `plugin update`; `fails`: the call that exits 1 instead. Never the real one."""
+        calls = self.root / "claude-calls"
+        version = self.root / "claude-plugin-version"
+        version.write_text(OLD, encoding="utf-8")
+        script = self.root / "tools" / "claude"
+        script.write_text(
+            "#!/bin/sh\n"
+            f'echo "$*" >> {shlex.quote(str(calls))}\n'
+            f'if [ "$*" = {shlex.quote(fails)} ]; then echo "no source here" >&2; exit 1; fi\n'
+            'case "$*" in\n'
+            f'  \'plugin list --json\') printf \'[{{"id": "collab-room@collab-room", "version": "%s"}}]\' '
+            f'"$(cat {shlex.quote(str(version))})" ;;\n'
+            f"  'plugin update collab-room@collab-room') echo {NEW} > {shlex.quote(str(version))} ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return calls
+
+    def test_the_update_moves_the_claude_plugin_too_and_says_its_agents_need_a_restart(self):
+        calls = self.fake_claude()
+        self.release(NEW)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        made = calls.read_text(encoding="utf-8").splitlines()
+        self.assertIn("plugin marketplace update collab-room", made)
+        self.assertIn("plugin update collab-room@collab-room", made)
+        self.assertLess(made.index("plugin marketplace update collab-room"), made.index("plugin update collab-room@collab-room"))
+        said = [x for x in r.stdout.splitlines() if "Claude plugin" in x]
+        self.assertEqual(len(said), 1, r.stdout)
+        self.assertIn(f"from {OLD} to {NEW}", said[0])
+        self.assertIn("/restart", said[0], "the person learns the running Claude agents keep the old hooks")
+
+    def test_a_claude_plugin_that_does_not_update_is_one_line_and_the_update_goes_on(self):
+        self.fake_claude(fails="plugin marketplace update collab-room")
+        self.release(NEW)
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.version(), NEW, "collab is updated all the same")
+        said = [x for x in r.stdout.splitlines() if "Claude plugin" in x]
+        self.assertEqual(len(said), 1, r.stdout)
+        self.assertIn("no source here", said[0])
+        self.assertNotIn("/restart", said[0])
+        (self.root / "tools" / "claude").unlink()
+        r = self.update()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len([x for x in r.stdout.splitlines() if "Claude Code not found" in x]), 1, r.stdout)
+
+    def test_the_update_beside_a_start_tells_the_room_the_plugin_moved(self):
+        project = self.room()
+        self.fake_claude()
+        self.release(NEW)
+        r = self.update("--auto", "--room", str(project))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        said = self.told(project)
+        self.assertEqual(len(said), 1, said)
+        self.assertIn(f"collab updated from {OLD} to {NEW}.", said[0])
+        self.assertIn(f"Claude plugin updated from {OLD} to {NEW}", said[0])
+        self.assertIn("/restart", said[0])
 
     def test_a_clone_with_changes_of_its_own_is_left_as_it_is(self):
         self.release(NEW)
@@ -160,7 +223,7 @@ class UpdateTest(unittest.TestCase):
     def test_a_tag_made_in_the_clone_is_not_a_release(self):
         self.git("tag", "-a", f"v{NEW}", "-m", "made here", cwd=self.clone)
         r = self.update()
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, f"collab {OLD} is the newest"))
+        self.assertEqual((r.returncode, r.stdout.splitlines()[0]), (0, f"collab {OLD} is the newest"))
 
     def test_a_clone_a_codex_may_write_is_not_installed_from(self):
         # By hand the person runs install from it; by itself, at each start, it would run outside the

@@ -477,6 +477,20 @@ SCENARIOS: dict[str, dict[str, Any]] = {
 }
 
 
+# A ready team's own topics, by seat: said in the room's language (catalog topic.<hash of the English>). Only the
+# text the scenario gave — a topic the person set or typed is theirs and is said as they wrote it.
+BUILTIN_TOPICS = {(str(seat["seat"]), str(seat["topic"])) for sc in SCENARIOS.values() for seat in sc["seats"]}
+
+
+def topic_shown(kind: object, p: dict[str, Any], config: dict[str, Any], lang: str = "") -> str | None:
+    """The topic that applies to an agent as the room says it: a ready team's own one in the room's language."""
+    topic = effective(kind, p, config, "topic")
+    seat = seat_of(p, config)
+    if isinstance(topic, str) and "topic" not in p and seat.get("topic") == topic and (seat.get("seat"), topic) in BUILTIN_TOPICS:
+        return m_i18n.words_in(m_i18n.topic_key(topic), lang or room_language(config))
+    return topic
+
+
 # The person's own teams, saved from a running one (/team → Save as a scenario): files outside any project,
 # beside the person's other collab files, each read and checked whole when a room is made — never followed through a
 # link, never longer than OWN_LIMIT, and a bad one is named and left out. Started, a copy goes into the room's file:
@@ -638,7 +652,8 @@ def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any], lang: str = 
     """One row of a team: name · role · topic · model · memory · reports to — what applies, by the layers, in the
     room's language."""
     lang = lang or room_language(config)
-    role, topic, model = (effective(kind, p, config, k) for k in ("role", "topic", "use_model"))
+    role, model = effective(kind, p, config, "role"), effective(kind, p, config, "use_model")
+    topic = topic_shown(kind, p, config, lang)
     trim = effective(kind, p, config, "context_trim") if kind in TRIM_KINDS else None
     to = reports_to(kind, p, config)
     return " · ".join(
@@ -705,7 +720,7 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
     if p is None:
         return ""
     kind = p.get("kind", "")
-    role, topic = effective(kind, p, config, "role"), effective(kind, p, config, "topic")
+    role, topic = effective(kind, p, config, "role"), topic_shown(kind, p, config)
     if not role and not topic and not team_of(config) and not any(k in p for k in ("reports_to", "seat")):
         return ""
     lead, to = lead_of(config), reports_to(kind, p, config)
@@ -738,7 +753,7 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
             parts: list[str] = []
             for q in team:
                 r = effective(q.get("kind", ""), q, config, "role")
-                topic_ = effective(q.get("kind", ""), q, config, "topic")
+                topic_ = topic_shown(q.get("kind", ""), q, config)
                 parts.append(
                     f"{label_of(config, q['id'])} — {t(f'role.{r}') if r else t('agent.word')}"
                     + (f", {topic_}" if topic_ else "")

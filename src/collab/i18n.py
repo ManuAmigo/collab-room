@@ -1,5 +1,7 @@
 from __future__ import annotations
 import hashlib
+import os
+import re
 import unicodedata
 from typing import Any
 
@@ -1028,6 +1030,114 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "The tmux session name was another room's ({p0}); this room now uses {session}.",
         "ru": "Имя сессии tmux принадлежало другой комнате ({p0}); эта комната теперь использует {session}.",
     },
+    "t.9ff3748e83": {
+        "en": "Claude Code not found — its plugin is not updated.",
+        "ru": "Claude Code не найден — его плагин не обновлён.",
+    },
+    "t.f0473f76ec": {
+        "en": "Claude Code has no collab-room plugin — `collab install` adds it.",
+        "ru": "В Claude Code нет плагина collab-room — его ставит `collab install`.",
+    },
+    "t.582f1b1a14": {
+        "en": "The Claude plugin is not updated: claude plugin {p0} said: {p1}",
+        "ru": "Плагин Claude не обновлён: claude plugin {p0} ответил: {p1}",
+    },
+    "t.cb75161c85": {
+        "en": "The Claude plugin is not updated: {p0}",
+        "ru": "Плагин Claude не обновлён: {p0}",
+    },
+    "t.f90ccbb730": {
+        "en": "The Claude plugin {p0} is the newest.",
+        "ru": "Плагин Claude {p0} — последний.",
+    },
+    "t.3871a30053": {
+        "en": "The Claude plugin updated from {p0} to {p1}: Claude agents take its new hooks after /restart.",
+        "ru": "Плагин Claude обновлён с {p0} до {p1}: агенты Claude возьмут новые хуки после /restart.",
+    },
+    "t.2b442e315c": {
+        "en": "✓ Use this folder — {p0}",
+        "ru": "✓ Выбрать эту папку — {p0}",
+    },
+    "t.de7eb62f4d": {
+        "en": "↑ Parent folder",
+        "ru": "↑ Папка выше",
+    },
+    "t.fb219b5cbd": {
+        "en": "  {p0} — no access",
+        "ru": "  {p0} — нет доступа",
+    },
+    "t.c97ff9e019": {
+        "en": "↑/↓ Move · Enter Open or select · Esc Back",
+        "ru": "↑/↓ — выбор · Enter — открыть или выбрать · Esc — назад",
+    },
+    "t.a1d1224904": {
+        "en": "THIS FOLDER",
+        "ru": "ЭТА ПАПКА",
+    },
+    "t.9203aabbe5": {
+        "en": "New room — {p0}",
+        "ru": "Новая комната — {p0}",
+    },
+    "t.8ff673cbe0": {
+        "en": "YOUR ROOMS",
+        "ru": "ВАШИ КОМНАТЫ",
+    },
+    "t.69a793863f": {
+        "en": "Open room — {p0}",
+        "ru": "Открыть комнату — {p0}",
+    },
+    "t.be88a5afdf": {
+        "en": "CREATE A ROOM",
+        "ru": "СОЗДАТЬ КОМНАТУ",
+    },
+    "t.28828b3251": {
+        "en": "Choose another project folder…",
+        "ru": "Выбрать другую папку проекта…",
+    },
+    "t.7b52603bb2": {
+        "en": "What would you like to do?",
+        "ru": "Что вы хотите сделать?",
+    },
+    "t.f4b3f4fbee": {
+        "en": "Choose an existing room, or create one for a project.",
+        "ru": "Выберите комнату или создайте новую для проекта.",
+    },
+    "t.25566e0923": {
+        "en": "↑/↓ Move · Enter Select · Esc Cancel",
+        "ru": "↑/↓ — выбор · Enter — выбрать · Esc — отмена",
+    },
+    "t.b53c0a24a5": {
+        "en": "A new room asks only for your name. Add agents later with /add.",
+        "ru": "Новая комната спросит только ваше имя. Агентов добавите потом через /добавить.",
+    },
+    "t.0d0735214d": {
+        "en": "↑/↓ choose · Enter · Esc — No",
+        "ru": "↑/↓ — выбор · Enter · Esc — нет",
+    },
+    "t.c5c275d5ec": {
+        "en": "No Python 3.11 or newer was found. collab needs one, so that Codex agents can answer in the room without asking each time.",
+        "ru": "Python 3.11 или новее не найден. Он нужен collab, чтобы агенты Codex отвечали в комнате, не спрашивая каждый раз.",
+    },
+    "t.35b9758fdd": {
+        "en": "{room} · Room chat",
+        "ru": "{room} · Чат комнаты",
+    },
+    "t.5ae8515b53": {
+        "en": "Direct messages · {name}",
+        "ru": "Личные сообщения · {name}",
+    },
+    "t.e7596a0986": {
+        "en": "Direct messages",
+        "ru": "Личные сообщения",
+    },
+    "t.ff03d50cc9": {
+        "en": "DM · {name}",
+        "ru": "ЛС · {name}",
+    },
+    "t.05a3b9fa04": {
+        "en": "DM",
+        "ru": "ЛС",
+    },
     "t.f2493a3e04": {
         "en": "The update at collab start is off. `collab update` still updates when you run it; --on turns it back on.",
         "ru": "Автоматическое обновление при collab start выключено. Команда `collab update` по-прежнему запускает обновление вручную. Включить автоматическое обновление: collab update --on.",
@@ -1404,6 +1514,25 @@ CATALOG: dict[str, dict[str, Any]] = {
     "t.ee91f47e87": {"en": "Continue the lead's rounds", "ru": "Продолжить обходы ведущего"},
     "t.1bb0846c57": {"en": "The lead's rounds go on.", "ru": "Обходы ведущего продолжаются."},
     # Scenario titles and hints.
+    # A ready team's own topics (store.topic_shown): by the English words the scenario gives.
+    "topic.c242f8bba1": {"en": "coordination", "ru": "координация"},
+    "topic.9ecc8459ea": {"en": "frontend", "ru": "фронтенд"},
+    "topic.754a08ddf8": {"en": "backend", "ru": "бэкенд"},
+    "topic.773e94c5f1": {"en": "tests and security", "ru": "тесты и безопасность"},
+    "topic.05535ecff7": {"en": "summary", "ru": "итоговая сводка"},
+    "topic.331f5ae803": {"en": "prices and terms", "ru": "цены и условия"},
+    "topic.cbffc617cd": {"en": "reviews and risks", "ru": "отзывы и риски"},
+    "topic.c49ece765b": {"en": "fact checking", "ru": "проверка фактов"},
+    "topic.f64cd8e32f": {"en": "author", "ru": "написание текста"},
+    "topic.9781e3e48c": {"en": "editing and tone", "ru": "редактура и тон"},
+    "topic.d0c18034a8": {"en": "recommendation", "ru": "рекомендация"},
+    "topic.c95259de1f": {"en": "money", "ru": "деньги"},
+    "topic.ac723defad": {"en": "risks", "ru": "риски"},
+    "topic.70ef1c723d": {"en": "customers", "ru": "клиенты"},
+    "topic.3b11cf8c6b": {"en": "devil's advocate", "ru": "адвокат дьявола"},
+    "topic.7b6486d2b5": {"en": "running the project", "ru": "ведение проекта"},
+    "topic.d65297b64d": {"en": "the project's topic", "ru": "тема проекта"},
+    "topic.d5a63c95d4": {"en": "everything", "ru": "всё"},
     "scenario.development.title": {"en": "Development", "ru": "Разработка"},
     "scenario.development.hint": {
         "en": "Split the work, check the changes, get code",
@@ -1547,12 +1676,21 @@ def lang_of(value: object) -> str:
     return value if isinstance(value, str) and value in LANGS else "en"
 
 
+def pseudo(text: str) -> str:
+    """With COLLAB_PSEUDO set — a check for whoever makes the screens, never a language of a room — each line of the
+    catalog's text a third longer and in ⟦ ⟧: a line the screen cuts loses its ⟧, a line that went past the catalog
+    has no ⟦ at all."""
+    if not os.environ.get("COLLAB_PSEUDO"):
+        return text
+    return "\n".join(f"⟦{x}{'·' * (len(x) // 3)}⟧" if x.strip() else x for x in text.split("\n"))
+
+
 def words_in(key: str, lang: str = "en", **params: Any) -> str:
     """The text for a key in a language, its parameters put in whole. A count named `n` takes its form."""
     entry = CATALOG[key][lang_of(lang)]
     if isinstance(entry, dict):
         entry = entry[plural(lang_of(lang), int(params.get("n", 0)))]
-    return str(entry).format(**params) if params else str(entry)
+    return pseudo(str(entry).format(**params) if params else str(entry))
 
 
 def command(line: str) -> str:
@@ -1588,6 +1726,11 @@ def shown_commands(text: str, lang: str) -> str:
     return " ".join(shown_command(w, lang) if w.startswith("/") else w for w in text.split(" "))
 
 
+def topic_key(en: str) -> str:
+    """A ready team's topic in the catalog, by its English words."""
+    return "topic." + hashlib.sha1(en.encode("utf-8")).hexdigest()[:10]
+
+
 def tr_key(en: str) -> str:
     return "t." + hashlib.sha1(en.encode("utf-8")).hexdigest()[:10]
 
@@ -1608,7 +1751,9 @@ def tr(en: str, lang: str = "", **params: Any) -> str:
     lang = lang_of(lang or SPOKEN["lang"])
     entry = CATALOG.get(tr_key(en))
     text = en if lang == "en" or entry is None else str(entry[lang])
-    return text.format(**params) if params else text
+    said = text.format(**params) if params else text
+    # A template of marks and places only («{who} → {to} › ») lays a line out: no words of its own to check.
+    return pseudo(said) if any(c.isalpha() for c in re.sub(r"\{\w*\}", "", en)) else said
 
 
 def status_word(en: str, lang: str = "") -> str:

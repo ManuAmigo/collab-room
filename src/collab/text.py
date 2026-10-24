@@ -93,24 +93,26 @@ def wrap_kept(line: str, width: int) -> list[str]:
     plain = ANSI.sub("", line)
     indent = len(plain) - len(plain.lstrip(" "))
     if not indent or indent >= width - 1 or text_cols(plain) <= width:
-        return wrap_visible(line, width)
+        return wrap_visible(line, width, words=True)
     cut, codes = 0, ""
     for _ in range(indent):  # the indent's spaces themselves, past any colour code before them
         while m := ANSI.match(line, cut):
             codes, cut = codes + m.group(0), m.end()
         cut += 1
-    return [codes + " " * indent + piece for piece in wrap_visible(line[cut:], width - indent)]
+    return [codes + " " * indent + piece for piece in wrap_visible(line[cut:], width - indent, words=True)]
 
 
-def wrap_visible(line: str, width: int) -> list[str]:
+def wrap_visible(line: str, width: int, words: bool = False) -> list[str]:
     """Split a line into pieces of at most `width` visible characters, keeping colour codes
-    with the text they colour. Words stay whole when possible; nothing is ever dropped."""
+    with the text they colour; nothing is ever dropped. `words`: a piece ends after a space when one is
+    there (only a space the break itself falls on is not drawn) — a Russian line in a window 60 wide broke «/от|ветить»."""
     # In columns, not characters: «日本» is four, and a line of them ran past the window and over
     # the status rows.
     if text_cols(ANSI.sub("", line)) <= width:
         return [line]
     pieces: list[str]
     pieces, cur, cur_w, i = [], "", 0, 0
+    space, space_w = 0, 0  # where the piece may end at a word: after its last space, and the columns up to there
     while i < len(line):
         m = ANSI.match(line, i)
         if m:
@@ -119,10 +121,22 @@ def wrap_visible(line: str, width: int) -> list[str]:
             continue
         cw = char_cols(line[i], line[i - 1] if i else "")
         if cur_w + cw > width and cur_w:
-            pieces.append(cur)
-            cur, cur_w = "", 0
+            if words and line[i] == " ":
+                i += 1  # the space the break falls on: past the width, it is not drawn
+                pieces.append(cur)
+                cur, cur_w, space, space_w = "", 0, 0, 0
+                continue
+            if words and space:
+                pieces.append(cur[:space])
+                cur, cur_w = cur[space:], cur_w - space_w
+            else:
+                pieces.append(cur)
+                cur, cur_w = "", 0
+            space, space_w = 0, 0
         cur += line[i]
         cur_w += cw
+        if words and line[i] == " " and cur.strip(" "):
+            space, space_w = len(cur), cur_w
         i += 1
     if cur:
         pieces.append(cur)
@@ -353,6 +367,19 @@ def fit_cols(text: str, width: int) -> str:
             return out + "…" + " " * (width - used - 1)
         out, used = out + c, used + cols(c)
     return out + " " * (width - used)
+
+
+def shorten_cols(text: str, width: int) -> str:
+    """Text cut to at most `width` columns with «…». A path gives way in its middle — its end is the folder's
+    name, the part that tells two apart; words keep their start (a scenario's line lost its start's meaning
+    when cut in its middle: «Разделить работ…ить изменения»)."""
+    if text_cols(text) <= width:
+        return text
+    if width < 2:
+        return cut_cols(text, width)
+    if re.search(r"[~\w.-]*/[^ /]+/", text):
+        return cut_cols(text, width // 2) + "…" + cut_cols(text, width - width // 2 - 1, from_end=True)
+    return cut_cols(text, width - 1).rstrip() + "…"
 
 
 def until_hm(until: float) -> str:

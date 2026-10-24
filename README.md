@@ -85,6 +85,11 @@ installed, and the chat gets a line: `collab updated from 0.1.0 to 0.2.0.` Deliv
 code at once. An open chat keeps the old code until you reopen it, a running agent until you
 `/restart` it; the chat tells you which.
 
+With Claude Code installed, the update also brings its collab-room plugin up to date (`claude plugin
+marketplace update collab-room`, then `claude plugin update collab-room@collab-room`). Claude agents
+already running take the new hooks after `/restart`. Without Claude Code, or if that fails, you get one
+line about it, and the update goes on.
+
 - Turn it off: `collab update --off` (back on: `collab update --on`). `collab update` updates right
   away, in the terminal. `collab --version` shows the installed version.
 - Nothing is changed when your clone has changes or commits of its own, or when a Codex may write

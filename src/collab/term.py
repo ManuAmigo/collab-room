@@ -4,6 +4,7 @@ import shutil
 import sys
 from typing import Any, Callable
 import collab.text as m_text
+import collab.i18n as m_i18n
 
 
 def ask_line(prompt: str) -> str:
@@ -24,7 +25,8 @@ def confirm(question: str) -> bool:
     """A yes/no in the terminal, chosen with arrows like everything else («all from the
     menu, yes and no too; the line only for what must be typed»). No is first and is what Esc
     means: a question that guards a stop or a clear must be hard to answer yes by accident."""
-    return pick([question], [("No", False), ("Yes", True)], ["↑/↓ choose · Enter · Esc — No"]) is True
+    rows = [(m_i18n.tr("No"), False), (m_i18n.tr("Yes"), True)]
+    return pick([question], rows, [m_i18n.tr("↑/↓ choose · Enter · Esc — No")]) is True
 
 
 def pick(intro: list[str], rows: list[tuple[str, Any]], outro: list[str], erase: Any = False) -> Any:
@@ -46,12 +48,15 @@ def pick(intro: list[str], rows: list[tuple[str, Any]], outro: list[str], erase:
         return None
     sel = 0
     width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)
-    # Cut the middle, not the end: the end of a path is the folder's name, the one thing that
-    # tells two long paths apart (two rooms showed as the same «…/T/tmpn…»).
-    fit: Callable[[str], str] = lambda t: t if len(t) <= width else t[: width // 2 - 1] + "…" + t[-(width - width // 2) :]
+    # A row is cut, a path in its middle: the end of a path is the folder's name, the one thing that
+    # tells two long paths apart (two rooms showed as the same «…/T/tmpn…»). What is said around the rows
+    # wraps by words — cut, a sentence lost its middle in a window 60 wide.
+    fit: Callable[[str], str] = lambda t: m_text.shorten_cols(t, width)
+    said: Callable[[list[str]], list[str]] = lambda lines: [x for line in lines for x in (m_text.wrap_cols(line, width) or [""])]
+    intro, outro = said(intro), said(outro)
     old = termios.tcgetattr(fd)
     for line in intro:
-        print(fit(line))
+        print(line)
     height = max(3, shutil.get_terminal_size((80, 24)).lines - len(intro) - len(outro) - 1)
     shown = min(len(rows), height)
 
@@ -68,7 +73,7 @@ def pick(intro: list[str], rows: list[tuple[str, Any]], outro: list[str], erase:
                 text = fit(f"   {label}")
             sys.stdout.write("\r\033[2K" + text + "\n")
         for line in outro:
-            sys.stdout.write("\r\033[2K" + m_text.paint(fit(line), "2") + "\n")
+            sys.stdout.write("\r\033[2K" + m_text.paint(line, "2") + "\n")
         sys.stdout.flush()
 
     chosen = None

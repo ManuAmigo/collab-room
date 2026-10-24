@@ -143,11 +143,20 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = 
     body = [f"{k.ljust(key_w)}   {v}" for k, v in rows_]
     title = " " + m_i18n.help_words("Room guide · {me}", lang, me=me) + " "
     inner = max(max(m_text.text_cols(b) for b in body) + 4, m_text.text_cols(title) + 4)  # columns: a CJK name
-    if inner + 2 > shutil.get_terminal_size((100, 24)).columns:
-        return "\n".join(
-            [m_text.paint(title.strip(), "1;37")]
-            + ["  " + m_text.paint(k.ljust(key_w), "1;38;5;75") + "   " + v for k, v in rows_]
-        )
+    cols = shutil.get_terminal_size((100, 24)).columns
+    if inner + 2 > cols:
+        # No frame: each explanation wraps by words under its own column (a narrow window broke them mid-word
+        # at its edge), or under its key when that column leaves too little room.
+        room_ = cols - 2 - (2 + key_w + 3)
+        out_ = [m_text.paint(title.strip(), "1;37")]
+        for k, v in rows_:
+            key = "  " + m_text.paint(k.ljust(key_w) if room_ >= 24 else k, "1;38;5;75")
+            if room_ >= 24:
+                lines_ = m_text.wrap_cols(v, room_) or [""]
+                out_ += [key + "   " + lines_[0]] + [" " * (2 + key_w + 3) + x for x in lines_[1:]]
+            else:
+                out_ += [key] + ["      " + x for x in m_text.wrap_cols(v, max(10, cols - 8))]
+        return "\n".join(out_)
     frame = lambda t: m_text.paint(t, "38;5;240")
     out = [frame("╭─") + m_text.paint(title, "1;37") + frame("─" * (inner - m_text.text_cols(title) - 1) + "╮")]
     for k, v in rows_:

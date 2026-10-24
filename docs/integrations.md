@@ -36,7 +36,7 @@ Each step prints what it did, skipped or refused (`✓`, `–`, `✗`). Conflict
 
 **Updating.** `collab start` updates by itself: it fetches your clone's `origin`, moves the clone
 to the newest release tag and runs install from it, beside the room (see [Updates](../README.md#updates);
-`collab update --off` turns it off). By hand: the `collab` command runs the copy, not your clone. After
+`collab update --off` turns it off). It updates the Claude Code plugin too; running Claude agents take its new hooks after `/restart`. By hand: the `collab` command runs the copy, not your clone. After
 `git pull`, run `python3 /absolute/path/to/collab-room/collab install` again to refresh the copy. Running
 `collab install` through the installed copy refuses and names the clone to use.
 

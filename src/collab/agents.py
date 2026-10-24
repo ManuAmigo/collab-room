@@ -182,9 +182,9 @@ def folder_rows(cur: Path) -> list[tuple[str, str]]:
     a path is the last resort»): use this one, go up, go into a subfolder, or type a path. Values:
     "use", "up", "in:<name>", "type", "denied:<name>". A folder that can't be opened says so
     (chosen anyway, its agent died at once with no reason given)."""
-    rows = [(f"✓ Use this folder — {m_text.tilde(str(cur))}", "use")]
+    rows = [(m_i18n.tr("✓ Use this folder — {p0}", p0=m_text.tilde(str(cur))), "use")]
     if cur.parent != cur:
-        rows.append(("↑ Parent folder", "up"))
+        rows.append((m_i18n.tr("↑ Parent folder"), "up"))
     try:
         subs = sorted((d.name for d in cur.iterdir() if not d.name.startswith(".") and d.is_dir()), key=str.lower)
     except OSError:
@@ -193,10 +193,10 @@ def folder_rows(cur: Path) -> list[tuple[str, str]]:
     rows += [
         (f"  {shown[name]}/", "in:" + name)
         if os.access(cur / name, os.R_OK | os.X_OK)
-        else (f"  {shown[name]} — no access", "denied:" + name)
+        else (m_i18n.tr("  {p0} — no access", p0=shown[name]), "denied:" + name)
         for name in subs
     ]
-    return rows + [("Enter path manually…", "type")]
+    return rows + [(m_i18n.tr("Enter path manually…"), "type")]
 
 
 def folder_problem(folder: Path) -> str:
@@ -665,9 +665,9 @@ def browse_folder(start: Path) -> str | None:
     cur = start
     while True:
         choice = m_term.pick(
-            [f"Folder: {m_text.tilde(str(cur))}", ""],
+            [m_i18n.tr("Folder: {p0}", p0=m_text.tilde(str(cur))), ""],
             folder_rows(cur),
-            ["", "↑/↓ Move · Enter Open or select · Esc Back"],
+            ["", m_i18n.tr("↑/↓ Move · Enter Open or select · Esc Back")],
             erase=True,
         )
         if choice is None:

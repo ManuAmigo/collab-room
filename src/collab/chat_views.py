@@ -136,7 +136,9 @@ def reading_frame(
                         "2",
                     )
                 )
-        body += [piece for line in pretty(config, m, w - 1, 0).split("\n") for piece in m_text.wrap_visible(line, w - 1)]
+        body += [
+            piece for line in pretty(config, m, w - 1, 0).split("\n") for piece in m_text.wrap_visible(line, w - 1, words=True)
+        ]
     area = max(1, h - 4)
     title = f" /mine · {reading['at'] + 1} of {len(reading['ids'])} "
     if len(body) > area - 1 and m is not None:

@@ -181,9 +181,10 @@ def cmd_dm(args: argparse.Namespace) -> None:
         )
         head = m_chat_base.input_head(config, owner, state["active"] or None)
         name = m_store.label_of(config, state["active"]) if state["active"] else ""
-        title = m_chat_base.BORDER_DM.format(name=name) if name else "Direct messages"
+        # The top border (not «Private» — the log is shared; «Direct messages» says how they are addressed, «DM» where it is tight).
+        title = m_i18n.tr("Direct messages · {name}", name=name) if name else m_i18n.tr("Direct messages")
         if m_text.text_cols(title) + 4 > w:
-            title = m_chat_base.BORDER_DM_SHORT.format(name=name) if name else "DM"
+            title = m_i18n.tr("DM · {name}", name=name) if name else m_i18n.tr("DM")
         if titled[0] != title:  # by the text: a /name or a narrower panel changes it too
             titled[0] = title
             m_agents.border_title(title)
@@ -209,7 +210,7 @@ def cmd_dm(args: argparse.Namespace) -> None:
                 body += [
                     piece
                     for line in m_chat_base.pretty(config, m, w - 1, 0).split("\n")
-                    for piece in m_text.wrap_visible(line, w - 1)
+                    for piece in m_text.wrap_visible(line, w - 1, words=True)
                 ]
             laid.update(made=made, body=body, starts=starts)
         body, starts = laid["body"], laid["starts"]

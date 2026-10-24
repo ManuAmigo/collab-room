@@ -45,15 +45,6 @@ CURSOR_BLINK, CURSOR_PLAIN = "\033[5 q", "\033[0 q"
 WHOLE = "\x1e"  # a feed line that starts so is never cut into lines: a command to copy
 
 
-# The top border of the chat and of its /dm panel (not «Private» — the log is shared; «Direct messages»
-# says how they are addressed, «DM» where the border is tight).
-BORDER_CHAT, BORDER_DM, BORDER_DM_SHORT = (
-    "{room} · Room chat",
-    "Direct messages · {name}",
-    "DM · {name}",
-)
-
-
 def input_head(config: dict[str, Any], me: str, to: str | None, limit: int = 0) -> str:
     """The start of a person's input line, «Anna → Bob › »: names bold in their colours, the marks
     dim. One for the chat and its /dm panel — the two inputs look alike. With `limit`,

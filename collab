@@ -110,7 +110,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.7"
+VERSION = "0.1.10"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -556,24 +556,26 @@ def wrap_kept(line: str, width: int) -> list[str]:
     plain = ANSI.sub("", line)
     indent = len(plain) - len(plain.lstrip(" "))
     if not indent or indent >= width - 1 or text_cols(plain) <= width:
-        return wrap_visible(line, width)
+        return wrap_visible(line, width, words=True)
     cut, codes = 0, ""
     for _ in range(indent):  # the indent's spaces themselves, past any colour code before them
         while m := ANSI.match(line, cut):
             codes, cut = codes + m.group(0), m.end()
         cut += 1
-    return [codes + " " * indent + piece for piece in wrap_visible(line[cut:], width - indent)]
+    return [codes + " " * indent + piece for piece in wrap_visible(line[cut:], width - indent, words=True)]
 
 
-def wrap_visible(line: str, width: int) -> list[str]:
+def wrap_visible(line: str, width: int, words: bool = False) -> list[str]:
     """Split a line into pieces of at most `width` visible characters, keeping colour codes
-    with the text they colour. Words stay whole when possible; nothing is ever dropped."""
+    with the text they colour; nothing is ever dropped. `words`: a piece ends after a space when one is
+    there (only a space the break itself falls on is not drawn) — a Russian line in a window 60 wide broke «/от|ветить»."""
     # In columns, not characters: «日本» is four, and a line of them ran past the window and over
     # the status rows.
     if text_cols(ANSI.sub("", line)) <= width:
         return [line]
     pieces: list[str]
     pieces, cur, cur_w, i = [], "", 0, 0
+    space, space_w = 0, 0  # where the piece may end at a word: after its last space, and the columns up to there
     while i < len(line):
         m = ANSI.match(line, i)
         if m:
@@ -582,10 +584,22 @@ def wrap_visible(line: str, width: int) -> list[str]:
             continue
         cw = char_cols(line[i], line[i - 1] if i else "")
         if cur_w + cw > width and cur_w:
-            pieces.append(cur)
-            cur, cur_w = "", 0
+            if words and line[i] == " ":
+                i += 1  # the space the break falls on: past the width, it is not drawn
+                pieces.append(cur)
+                cur, cur_w, space, space_w = "", 0, 0, 0
+                continue
+            if words and space:
+                pieces.append(cur[:space])
+                cur, cur_w = cur[space:], cur_w - space_w
+            else:
+                pieces.append(cur)
+                cur, cur_w = "", 0
+            space, space_w = 0, 0
         cur += line[i]
         cur_w += cw
+        if words and line[i] == " " and cur.strip(" "):
+            space, space_w = len(cur), cur_w
         i += 1
     if cur:
         pieces.append(cur)
@@ -818,6 +832,19 @@ def fit_cols(text: str, width: int) -> str:
     return out + " " * (width - used)
 
 
+def shorten_cols(text: str, width: int) -> str:
+    """Text cut to at most `width` columns with «…». A path gives way in its middle — its end is the folder's
+    name, the part that tells two apart; words keep their start (a scenario's line lost its start's meaning
+    when cut in its middle: «Разделить работ…ить изменения»)."""
+    if text_cols(text) <= width:
+        return text
+    if width < 2:
+        return cut_cols(text, width)
+    if re.search(r"[~\w.-]*/[^ /]+/", text):
+        return cut_cols(text, width // 2) + "…" + cut_cols(text, width - width // 2 - 1, from_end=True)
+    return cut_cols(text, width - 1).rstrip() + "…"
+
+
 def until_hm(until: float) -> str:
     """When a limit ends: «00:42» today, «23.11 00:42» another day — «until 00:42» read late in the
     evening looked like a time already past."""
@@ -825,6 +852,8 @@ def until_hm(until: float) -> str:
     return at.strftime("%H:%M") if at.date() == dt.date.today() else at.strftime("%d.%m %H:%M")
 
 import hashlib
+import os
+import re
 import unicodedata
 from typing import Any
 
@@ -1853,6 +1882,114 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "The tmux session name was another room's ({p0}); this room now uses {session}.",
         "ru": "Имя сессии tmux принадлежало другой комнате ({p0}); эта комната теперь использует {session}.",
     },
+    "t.9ff3748e83": {
+        "en": "Claude Code not found — its plugin is not updated.",
+        "ru": "Claude Code не найден — его плагин не обновлён.",
+    },
+    "t.f0473f76ec": {
+        "en": "Claude Code has no collab-room plugin — `collab install` adds it.",
+        "ru": "В Claude Code нет плагина collab-room — его ставит `collab install`.",
+    },
+    "t.582f1b1a14": {
+        "en": "The Claude plugin is not updated: claude plugin {p0} said: {p1}",
+        "ru": "Плагин Claude не обновлён: claude plugin {p0} ответил: {p1}",
+    },
+    "t.cb75161c85": {
+        "en": "The Claude plugin is not updated: {p0}",
+        "ru": "Плагин Claude не обновлён: {p0}",
+    },
+    "t.f90ccbb730": {
+        "en": "The Claude plugin {p0} is the newest.",
+        "ru": "Плагин Claude {p0} — последний.",
+    },
+    "t.3871a30053": {
+        "en": "The Claude plugin updated from {p0} to {p1}: Claude agents take its new hooks after /restart.",
+        "ru": "Плагин Claude обновлён с {p0} до {p1}: агенты Claude возьмут новые хуки после /restart.",
+    },
+    "t.2b442e315c": {
+        "en": "✓ Use this folder — {p0}",
+        "ru": "✓ Выбрать эту папку — {p0}",
+    },
+    "t.de7eb62f4d": {
+        "en": "↑ Parent folder",
+        "ru": "↑ Папка выше",
+    },
+    "t.fb219b5cbd": {
+        "en": "  {p0} — no access",
+        "ru": "  {p0} — нет доступа",
+    },
+    "t.c97ff9e019": {
+        "en": "↑/↓ Move · Enter Open or select · Esc Back",
+        "ru": "↑/↓ — выбор · Enter — открыть или выбрать · Esc — назад",
+    },
+    "t.a1d1224904": {
+        "en": "THIS FOLDER",
+        "ru": "ЭТА ПАПКА",
+    },
+    "t.9203aabbe5": {
+        "en": "New room — {p0}",
+        "ru": "Новая комната — {p0}",
+    },
+    "t.8ff673cbe0": {
+        "en": "YOUR ROOMS",
+        "ru": "ВАШИ КОМНАТЫ",
+    },
+    "t.69a793863f": {
+        "en": "Open room — {p0}",
+        "ru": "Открыть комнату — {p0}",
+    },
+    "t.be88a5afdf": {
+        "en": "CREATE A ROOM",
+        "ru": "СОЗДАТЬ КОМНАТУ",
+    },
+    "t.28828b3251": {
+        "en": "Choose another project folder…",
+        "ru": "Выбрать другую папку проекта…",
+    },
+    "t.7b52603bb2": {
+        "en": "What would you like to do?",
+        "ru": "Что вы хотите сделать?",
+    },
+    "t.f4b3f4fbee": {
+        "en": "Choose an existing room, or create one for a project.",
+        "ru": "Выберите комнату или создайте новую для проекта.",
+    },
+    "t.25566e0923": {
+        "en": "↑/↓ Move · Enter Select · Esc Cancel",
+        "ru": "↑/↓ — выбор · Enter — выбрать · Esc — отмена",
+    },
+    "t.b53c0a24a5": {
+        "en": "A new room asks only for your name. Add agents later with /add.",
+        "ru": "Новая комната спросит только ваше имя. Агентов добавите потом через /добавить.",
+    },
+    "t.0d0735214d": {
+        "en": "↑/↓ choose · Enter · Esc — No",
+        "ru": "↑/↓ — выбор · Enter · Esc — нет",
+    },
+    "t.c5c275d5ec": {
+        "en": "No Python 3.11 or newer was found. collab needs one, so that Codex agents can answer in the room without asking each time.",
+        "ru": "Python 3.11 или новее не найден. Он нужен collab, чтобы агенты Codex отвечали в комнате, не спрашивая каждый раз.",
+    },
+    "t.35b9758fdd": {
+        "en": "{room} · Room chat",
+        "ru": "{room} · Чат комнаты",
+    },
+    "t.5ae8515b53": {
+        "en": "Direct messages · {name}",
+        "ru": "Личные сообщения · {name}",
+    },
+    "t.e7596a0986": {
+        "en": "Direct messages",
+        "ru": "Личные сообщения",
+    },
+    "t.ff03d50cc9": {
+        "en": "DM · {name}",
+        "ru": "ЛС · {name}",
+    },
+    "t.05a3b9fa04": {
+        "en": "DM",
+        "ru": "ЛС",
+    },
     "t.f2493a3e04": {
         "en": "The update at collab start is off. `collab update` still updates when you run it; --on turns it back on.",
         "ru": "Автоматическое обновление при collab start выключено. Команда `collab update` по-прежнему запускает обновление вручную. Включить автоматическое обновление: collab update --on.",
@@ -2229,6 +2366,25 @@ CATALOG: dict[str, dict[str, Any]] = {
     "t.ee91f47e87": {"en": "Continue the lead's rounds", "ru": "Продолжить обходы ведущего"},
     "t.1bb0846c57": {"en": "The lead's rounds go on.", "ru": "Обходы ведущего продолжаются."},
     # Scenario titles and hints.
+    # A ready team's own topics (store.topic_shown): by the English words the scenario gives.
+    "topic.c242f8bba1": {"en": "coordination", "ru": "координация"},
+    "topic.9ecc8459ea": {"en": "frontend", "ru": "фронтенд"},
+    "topic.754a08ddf8": {"en": "backend", "ru": "бэкенд"},
+    "topic.773e94c5f1": {"en": "tests and security", "ru": "тесты и безопасность"},
+    "topic.05535ecff7": {"en": "summary", "ru": "итоговая сводка"},
+    "topic.331f5ae803": {"en": "prices and terms", "ru": "цены и условия"},
+    "topic.cbffc617cd": {"en": "reviews and risks", "ru": "отзывы и риски"},
+    "topic.c49ece765b": {"en": "fact checking", "ru": "проверка фактов"},
+    "topic.f64cd8e32f": {"en": "author", "ru": "написание текста"},
+    "topic.9781e3e48c": {"en": "editing and tone", "ru": "редактура и тон"},
+    "topic.d0c18034a8": {"en": "recommendation", "ru": "рекомендация"},
+    "topic.c95259de1f": {"en": "money", "ru": "деньги"},
+    "topic.ac723defad": {"en": "risks", "ru": "риски"},
+    "topic.70ef1c723d": {"en": "customers", "ru": "клиенты"},
+    "topic.3b11cf8c6b": {"en": "devil's advocate", "ru": "адвокат дьявола"},
+    "topic.7b6486d2b5": {"en": "running the project", "ru": "ведение проекта"},
+    "topic.d65297b64d": {"en": "the project's topic", "ru": "тема проекта"},
+    "topic.d5a63c95d4": {"en": "everything", "ru": "всё"},
     "scenario.development.title": {"en": "Development", "ru": "Разработка"},
     "scenario.development.hint": {
         "en": "Split the work, check the changes, get code",
@@ -2372,12 +2528,21 @@ def lang_of(value: object) -> str:
     return value if isinstance(value, str) and value in LANGS else "en"
 
 
+def pseudo(text: str) -> str:
+    """With COLLAB_PSEUDO set — a check for whoever makes the screens, never a language of a room — each line of the
+    catalog's text a third longer and in ⟦ ⟧: a line the screen cuts loses its ⟧, a line that went past the catalog
+    has no ⟦ at all."""
+    if not os.environ.get("COLLAB_PSEUDO"):
+        return text
+    return "\n".join(f"⟦{x}{'·' * (len(x) // 3)}⟧" if x.strip() else x for x in text.split("\n"))
+
+
 def words_in(key: str, lang: str = "en", **params: Any) -> str:
     """The text for a key in a language, its parameters put in whole. A count named `n` takes its form."""
     entry = CATALOG[key][lang_of(lang)]
     if isinstance(entry, dict):
         entry = entry[plural(lang_of(lang), int(params.get("n", 0)))]
-    return str(entry).format(**params) if params else str(entry)
+    return pseudo(str(entry).format(**params) if params else str(entry))
 
 
 def command(line: str) -> str:
@@ -2413,6 +2578,11 @@ def shown_commands(text: str, lang: str) -> str:
     return " ".join(shown_command(w, lang) if w.startswith("/") else w for w in text.split(" "))
 
 
+def topic_key(en: str) -> str:
+    """A ready team's topic in the catalog, by its English words."""
+    return "topic." + hashlib.sha1(en.encode("utf-8")).hexdigest()[:10]
+
+
 def tr_key(en: str) -> str:
     return "t." + hashlib.sha1(en.encode("utf-8")).hexdigest()[:10]
 
@@ -2433,7 +2603,9 @@ def tr(en: str, lang: str = "", **params: Any) -> str:
     lang = lang_of(lang or SPOKEN["lang"])
     entry = CATALOG.get(tr_key(en))
     text = en if lang == "en" or entry is None else str(entry[lang])
-    return text.format(**params) if params else text
+    said = text.format(**params) if params else text
+    # A template of marks and places only («{who} → {to} › ») lays a line out: no words of its own to check.
+    return pseudo(said) if any(c.isalpha() for c in re.sub(r"\{\w*\}", "", en)) else said
 
 
 def status_word(en: str, lang: str = "") -> str:
@@ -2468,6 +2640,7 @@ from typing import Any, Callable
 
 
 
+
 def ask_line(prompt: str) -> str:
     """input() that survives a terminal without UTF-8 line editing (macOS Terminal often): there
     Backspace erases one byte of a Cyrillic letter, the other byte stays, and writing the name
@@ -2486,7 +2659,8 @@ def confirm(question: str) -> bool:
     """A yes/no in the terminal, chosen with arrows like everything else («all from the
     menu, yes and no too; the line only for what must be typed»). No is first and is what Esc
     means: a question that guards a stop or a clear must be hard to answer yes by accident."""
-    return pick([question], [("No", False), ("Yes", True)], ["↑/↓ choose · Enter · Esc — No"]) is True
+    rows = [(tr("No"), False), (tr("Yes"), True)]
+    return pick([question], rows, [tr("↑/↓ choose · Enter · Esc — No")]) is True
 
 
 def pick(intro: list[str], rows: list[tuple[str, Any]], outro: list[str], erase: Any = False) -> Any:
@@ -2508,12 +2682,15 @@ def pick(intro: list[str], rows: list[tuple[str, Any]], outro: list[str], erase:
         return None
     sel = 0
     width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)
-    # Cut the middle, not the end: the end of a path is the folder's name, the one thing that
-    # tells two long paths apart (two rooms showed as the same «…/T/tmpn…»).
-    fit: Callable[[str], str] = lambda t: t if len(t) <= width else t[: width // 2 - 1] + "…" + t[-(width - width // 2) :]
+    # A row is cut, a path in its middle: the end of a path is the folder's name, the one thing that
+    # tells two long paths apart (two rooms showed as the same «…/T/tmpn…»). What is said around the rows
+    # wraps by words — cut, a sentence lost its middle in a window 60 wide.
+    fit: Callable[[str], str] = lambda t: shorten_cols(t, width)
+    said: Callable[[list[str]], list[str]] = lambda lines: [x for line in lines for x in (wrap_cols(line, width) or [""])]
+    intro, outro = said(intro), said(outro)
     old = termios.tcgetattr(fd)
     for line in intro:
-        print(fit(line))
+        print(line)
     height = max(3, shutil.get_terminal_size((80, 24)).lines - len(intro) - len(outro) - 1)
     shown = min(len(rows), height)
 
@@ -2530,7 +2707,7 @@ def pick(intro: list[str], rows: list[tuple[str, Any]], outro: list[str], erase:
                 text = fit(f"   {label}")
             sys.stdout.write("\r\033[2K" + text + "\n")
         for line in outro:
-            sys.stdout.write("\r\033[2K" + paint(fit(line), "2") + "\n")
+            sys.stdout.write("\r\033[2K" + paint(line, "2") + "\n")
         sys.stdout.flush()
 
     chosen = None
@@ -3039,6 +3216,20 @@ SCENARIOS: dict[str, dict[str, Any]] = {
 }
 
 
+# A ready team's own topics, by seat: said in the room's language (catalog topic.<hash of the English>). Only the
+# text the scenario gave — a topic the person set or typed is theirs and is said as they wrote it.
+BUILTIN_TOPICS = {(str(seat["seat"]), str(seat["topic"])) for sc in SCENARIOS.values() for seat in sc["seats"]}
+
+
+def topic_shown(kind: object, p: dict[str, Any], config: dict[str, Any], lang: str = "") -> str | None:
+    """The topic that applies to an agent as the room says it: a ready team's own one in the room's language."""
+    topic = effective(kind, p, config, "topic")
+    seat = seat_of(p, config)
+    if isinstance(topic, str) and "topic" not in p and seat.get("topic") == topic and (seat.get("seat"), topic) in BUILTIN_TOPICS:
+        return words_in(topic_key(topic), lang or room_language(config))
+    return topic
+
+
 # The person's own teams, saved from a running one (/team → Save as a scenario): files outside any project,
 # beside the person's other collab files, each read and checked whole when a room is made — never followed through a
 # link, never longer than OWN_LIMIT, and a bad one is named and left out. Started, a copy goes into the room's file:
@@ -3200,7 +3391,8 @@ def seat_line(kind: str, p: dict[str, Any], config: dict[str, Any], lang: str = 
     """One row of a team: name · role · topic · model · memory · reports to — what applies, by the layers, in the
     room's language."""
     lang = lang or room_language(config)
-    role, topic, model = (effective(kind, p, config, k) for k in ("role", "topic", "use_model"))
+    role, model = effective(kind, p, config, "role"), effective(kind, p, config, "use_model")
+    topic = topic_shown(kind, p, config, lang)
     trim = effective(kind, p, config, "context_trim") if kind in TRIM_KINDS else None
     to = reports_to(kind, p, config)
     return " · ".join(
@@ -3267,7 +3459,7 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
     if p is None:
         return ""
     kind = p.get("kind", "")
-    role, topic = effective(kind, p, config, "role"), effective(kind, p, config, "topic")
+    role, topic = effective(kind, p, config, "role"), topic_shown(kind, p, config)
     if not role and not topic and not team_of(config) and not any(k in p for k in ("reports_to", "seat")):
         return ""
     lead, to = lead_of(config), reports_to(kind, p, config)
@@ -3300,7 +3492,7 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
             parts: list[str] = []
             for q in team:
                 r = effective(q.get("kind", ""), q, config, "role")
-                topic_ = effective(q.get("kind", ""), q, config, "topic")
+                topic_ = topic_shown(q.get("kind", ""), q, config)
                 parts.append(
                     f"{label_of(config, q['id'])} — {t(f'role.{r}') if r else t('agent.word')}"
                     + (f", {topic_}" if topic_ else "")
@@ -7187,11 +7379,12 @@ def install_python311() -> tuple[str, str] | None:
     try:
         choice = pick(
             [
-                "No Python 3.11 or newer was found. collab needs one, so that Codex agents can answer",
-                "in the room without asking each time.",
+                tr(
+                    "No Python 3.11 or newer was found. collab needs one, so that Codex agents can answer in the room without asking each time."
+                )
             ],
-            [("No", None), *ways],
-            ["↑/↓ choose · Enter · Esc — No"],
+            [(tr("No"), None), *ways],
+            [tr("↑/↓ choose · Enter · Esc — No")],
         )
     except (EOFError, KeyboardInterrupt):
         return None
@@ -7530,6 +7723,58 @@ def run_update(source: Path) -> tuple[str, str]:
     return "updated", f"collab updated from {VERSION} to {newest}."
 
 
+PLUGIN = "collab-room@collab-room"
+PLUGIN_WAIT = 120  # seconds for each `claude plugin` call; beside the room, so the start never waits for it
+
+
+def claude_plugin_version(claude: str) -> str | None:
+    """The version of collab-room's plugin Claude Code has installed; None when it has none or does not say."""
+    listed = subprocess.run(
+        [claude, "plugin", "list", "--json"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=PLUGIN_WAIT
+    )
+    try:
+        plugins = json.loads(listed.stdout)
+    except ValueError:
+        return None
+    mine = [x for x in plugins if isinstance(x, dict) and x.get("id") == PLUGIN] if isinstance(plugins, list) else []
+    return (str(mine[0].get("version") or "") or None) if mine else None
+
+
+def update_claude_plugin() -> tuple[str, str]:
+    """After the update: Claude Code reads collab-room's plugin source again and moves the plugin to its version.
+    (outcome, line): «updated», «current», «skipped» (no Claude Code, no plugin) or «failed» — one line each,
+    and nothing it meets stops the update. A plugin Claude Code does not have is not installed here: that is
+    `collab install`'s, which says it."""
+    claude = shutil.which("claude")
+    if not claude:
+        return "skipped", tr("Claude Code not found — its plugin is not updated.")
+    try:
+        was = claude_plugin_version(claude)
+        if was is None:
+            return "skipped", tr("Claude Code has no collab-room plugin — `collab install` adds it.")
+        for command in (["marketplace", "update", "collab-room"], ["update", PLUGIN]):
+            done = subprocess.run(
+                [claude, "plugin", *command],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=PLUGIN_WAIT,
+            )
+            if done.returncode:
+                said = (done.stderr.strip() or done.stdout.strip()).splitlines() or ["exit " + str(done.returncode)]
+                return "failed", tr(
+                    "The Claude plugin is not updated: claude plugin {p0} said: {p1}", p0=command[0], p1=said[-1][:200]
+                )
+        moved = claude_plugin_version(claude)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "failed", tr("The Claude plugin is not updated: {p0}", p0=str(e)[:200])
+    if moved == was:
+        return "current", tr("The Claude plugin {p0} is the newest.", p0=was)
+    return "updated", tr(
+        "The Claude plugin updated from {p0} to {p1}: Claude agents take its new hooks after /restart.", p0=was, p1=moved or "?"
+    )
+
+
 def update_in_background(root: str) -> None:
     """`collab start`: look for a newer collab beside the room — the start never waits for the network.
     Not from a --dev install, not when switched off."""
@@ -7589,19 +7834,26 @@ def auto_update(starter: int) -> None:
         except OSError:
             return  # another room's start is updating already
         outcome, line = run_update(source)
+        # The plugin follows the clone it is read from: after an update, and at a start with nothing newer
+        # (a plugin left behind catches up). Said with the update; alone only when the plugin moved.
+        plugin, plugin_line = update_claude_plugin() if outcome in ("updated", "current") else ("", "")
+        print(line)
+        if plugin_line:
+            print(plugin_line)
         try:
             told = json.loads(inst.update_state.read_text(encoding="utf-8")).get("told", "")
         except (OSError, ValueError, AttributeError):
             told = ""
         tell = outcome == "updated" or (outcome == "blocked" and line != told)
-        state = {"at": now(), "outcome": outcome, "line": line, "told": line if tell else told}
+        state = {"at": now(), "outcome": outcome, "line": line, "told": line if tell else told, "plugin": plugin}
         write_private(inst.update_state, json.dumps(state, ensure_ascii=False))
-    if not tell:
+    if not tell and plugin != "updated":
         return
     config = config_now()
     if outcome == "updated":
         line += UPDATED_IN_ROOM
-    append_message(ROOM, people_ids(config), line)
+    said = " ".join(x for x in (line if tell else "", plugin_line if outcome == "updated" or plugin == "updated" else "") if x)
+    append_message(ROOM, people_ids(config), said)
     link = read_private(inst.installed_file)
     session = config.get("session", "collab-room")
     if outcome == "updated" and link and wait_for_room(session, starter):
@@ -7633,6 +7885,8 @@ def cmd_update(args: argparse.Namespace) -> None:
         fail(why)
     outcome, line = run_update(source)
     print(line)
+    if outcome in ("updated", "current"):
+        print(update_claude_plugin()[1])
     if outcome == "updated":
         print(
             tr(
@@ -9659,9 +9913,9 @@ def folder_rows(cur: Path) -> list[tuple[str, str]]:
     a path is the last resort»): use this one, go up, go into a subfolder, or type a path. Values:
     "use", "up", "in:<name>", "type", "denied:<name>". A folder that can't be opened says so
     (chosen anyway, its agent died at once with no reason given)."""
-    rows = [(f"✓ Use this folder — {tilde(str(cur))}", "use")]
+    rows = [(tr("✓ Use this folder — {p0}", p0=tilde(str(cur))), "use")]
     if cur.parent != cur:
-        rows.append(("↑ Parent folder", "up"))
+        rows.append((tr("↑ Parent folder"), "up"))
     try:
         subs = sorted((d.name for d in cur.iterdir() if not d.name.startswith(".") and d.is_dir()), key=str.lower)
     except OSError:
@@ -9670,10 +9924,10 @@ def folder_rows(cur: Path) -> list[tuple[str, str]]:
     rows += [
         (f"  {shown[name]}/", "in:" + name)
         if os.access(cur / name, os.R_OK | os.X_OK)
-        else (f"  {shown[name]} — no access", "denied:" + name)
+        else (tr("  {p0} — no access", p0=shown[name]), "denied:" + name)
         for name in subs
     ]
-    return rows + [("Enter path manually…", "type")]
+    return rows + [(tr("Enter path manually…"), "type")]
 
 
 def folder_problem(folder: Path) -> str:
@@ -10142,9 +10396,9 @@ def browse_folder(start: Path) -> str | None:
     cur = start
     while True:
         choice = pick(
-            [f"Folder: {tilde(str(cur))}", ""],
+            [tr("Folder: {p0}", p0=tilde(str(cur))), ""],
             folder_rows(cur),
-            ["", "↑/↓ Move · Enter Open or select · Esc Back"],
+            ["", tr("↑/↓ Move · Enter Open or select · Esc Back")],
             erase=True,
         )
         if choice is None:
@@ -10460,6 +10714,8 @@ def cmd_home(args: argparse.Namespace) -> None:
     project; no paths to type, no environment to clear."""
     rp = room().paths
     choose_language()
+    # What comes before a room — this menu, the folders, the name — in the language the person chose.
+    speak(room_language(read_config_raw()) if rp.config_path.is_file() else user_language())
     if rp.config_path.is_file():
         cmd_start(args)
         return
@@ -10473,17 +10729,23 @@ def cmd_home(args: argparse.Namespace) -> None:
     rows: list[tuple[str, Any]] = []
     if here not in (os.path.realpath(str(Path.home())), "/") and here not in map(os.path.realpath, rooms):
         fresh = [f for f in fresh if os.path.realpath(f) != here]
-        rows += [("THIS FOLDER", None), (f"New room — {tilde(here)}", ("new", here))]
+        rows += [(tr("THIS FOLDER"), None), (tr("New room — {p0}", p0=tilde(here)), ("new", here))]
     if rooms:
-        rows += [("YOUR ROOMS", None)] + [(f"Open room — {tilde(r)}", ("open", r)) for r in rooms]
+        rows += [(tr("YOUR ROOMS"), None)]
+        rows += [(tr("Open room — {p0}", p0=tilde(r)), ("open", r)) for r in rooms]
     if fresh:
-        rows += [("CREATE A ROOM", None)] + [(f"New room — {tilde(f)}", ("new", f)) for f in fresh]
-    rows += [("Choose another project folder…", ("other", ""))]
+        rows += [(tr("CREATE A ROOM"), None)]
+        rows += [(tr("New room — {p0}", p0=tilde(f)), ("new", f)) for f in fresh]
+    rows += [(tr("Choose another project folder…"), ("other", ""))]
     while True:
         choice = pick(
-            ["What would you like to do?", "Choose an existing room, or create one for a project.", ""],
+            [tr("What would you like to do?"), tr("Choose an existing room, or create one for a project."), ""],
             rows,
-            ["", "↑/↓ Move · Enter Select · Esc Cancel", "A new room asks only for your name. Add agents later with /add."],
+            [
+                "",
+                tr("↑/↓ Move · Enter Select · Esc Cancel"),
+                tr("A new room asks only for your name. Add agents later with /add."),
+            ],
             erase=lambda v: v is None or v[0] == "other",
         )  # the chosen room stays on screen
         if choice is None:
@@ -11313,15 +11575,6 @@ CURSOR_BLINK, CURSOR_PLAIN = "\033[5 q", "\033[0 q"
 WHOLE = "\x1e"  # a feed line that starts so is never cut into lines: a command to copy
 
 
-# The top border of the chat and of its /dm panel (not «Private» — the log is shared; «Direct messages»
-# says how they are addressed, «DM» where the border is tight).
-BORDER_CHAT, BORDER_DM, BORDER_DM_SHORT = (
-    "{room} · Room chat",
-    "Direct messages · {name}",
-    "DM · {name}",
-)
-
-
 def input_head(config: dict[str, Any], me: str, to: str | None, limit: int = 0) -> str:
     """The start of a person's input line, «Anna → Bob › »: names bold in their colours, the marks
     dim. One for the chat and its /dm panel — the two inputs look alike. With `limit`,
@@ -11779,11 +12032,20 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = 
     body = [f"{k.ljust(key_w)}   {v}" for k, v in rows_]
     title = " " + help_words("Room guide · {me}", lang, me=me) + " "
     inner = max(max(text_cols(b) for b in body) + 4, text_cols(title) + 4)  # columns: a CJK name
-    if inner + 2 > shutil.get_terminal_size((100, 24)).columns:
-        return "\n".join(
-            [paint(title.strip(), "1;37")]
-            + ["  " + paint(k.ljust(key_w), "1;38;5;75") + "   " + v for k, v in rows_]
-        )
+    cols = shutil.get_terminal_size((100, 24)).columns
+    if inner + 2 > cols:
+        # No frame: each explanation wraps by words under its own column (a narrow window broke them mid-word
+        # at its edge), or under its key when that column leaves too little room.
+        room_ = cols - 2 - (2 + key_w + 3)
+        out_ = [paint(title.strip(), "1;37")]
+        for k, v in rows_:
+            key = "  " + paint(k.ljust(key_w) if room_ >= 24 else k, "1;38;5;75")
+            if room_ >= 24:
+                lines_ = wrap_cols(v, room_) or [""]
+                out_ += [key + "   " + lines_[0]] + [" " * (2 + key_w + 3) + x for x in lines_[1:]]
+            else:
+                out_ += [key] + ["      " + x for x in wrap_cols(v, max(10, cols - 8))]
+        return "\n".join(out_)
     frame = lambda t: paint(t, "38;5;240")
     out = [frame("╭─") + paint(title, "1;37") + frame("─" * (inner - text_cols(title) - 1) + "╮")]
     for k, v in rows_:
@@ -11829,7 +12091,7 @@ def chat_feed_rows(ctx: ChatMenuContext, n: int, w: int) -> list[str]:
     a command to copy left whole; blank rows on top when the feed is shorter."""
     out: list[str] = []
     for line in ctx.feed_log[-n * 2 :]:
-        out.extend([line[1:]] if line.startswith(WHOLE) else wrap_visible(line, w - 1))
+        out.extend([line[1:]] if line.startswith(WHOLE) else wrap_kept(line, w - 1))
     return ([""] * n + out)[-n:]
 
 
@@ -11873,19 +12135,15 @@ def chat_draw_menu(ctx: ChatMenuContext, items: list[tuple[str, str, str]], h: i
         if len(more) + text_cols(prompt) + len(hint) + 3 > w:
             hint = ""  # a narrow window: the question first, the keys are known by now
         space = max(10, w - 3 - len(more) - len(hint))
-        if text_cols(prompt) > space:
-            prompt = cut_cols(prompt, space // 2 - 1) + "…" + cut_cols(prompt, space - space // 2, from_end=True)
+        prompt = shorten_cols(prompt, space)
         header = paint(f"  {more}", "2") + paint(prompt, "1") + paint(hint, "2")
     else:
         header = paint(cut_cols(tr("  ↑↓ choose · Enter select · keep typing to filter"), w - 1), "2")
     # Each row written over the old one, then the rest of the line erased: erasing first left
     # it blank for a moment on every key.
     out += f"\033[{top};1H" + header + "\033[K"
-    # A label longer than the window gives way in its middle: a path's end is the
-    # folder's name, the part that matters.
-    fit = lambda t, n: (
-        t if text_cols(t) <= n else cut_cols(t, n // 2) + "…" + cut_cols(t, n - n // 2 - 1, from_end=True)
-    )
+    # A label longer than the window gives way: a path in its middle (its end is the folder's name), words at their end.
+    fit = shorten_cols
     label_w = min(max(text_cols(label) for label, _, _ in rows_), max(8, w - 4))
     for i, (label, _, hint) in enumerate(rows_):
         mark = "›" if i == sel else " "
@@ -11893,7 +12151,7 @@ def chat_draw_menu(ctx: ChatMenuContext, items: list[tuple[str, str, str]], h: i
         text = tr(" {mark} {cell}{p2}", mark=mark, cell=cell, p2=" " * (label_w - text_cols(cell))) + (
             f"   {hint}" if hint else ""
         )
-        text = cut_cols(text, w - 1)  # columns: CJK paths cut at half the width they took
+        text = shorten_cols(text, w - 1)  # columns (CJK counts two); «…» says a hint goes on past the window
         out += f"\033[{top + 1 + i};1H" + (paint(text, "1;38;5;75") if i == sel else text) + "\033[K"
     sys.stdout.write(out + "\0338")
     ctx.ui.popup = len(rows_) + 1
@@ -12067,7 +12325,9 @@ def reading_frame(
                         "2",
                     )
                 )
-        body += [piece for line in pretty(config, m, w - 1, 0).split("\n") for piece in wrap_visible(line, w - 1)]
+        body += [
+            piece for line in pretty(config, m, w - 1, 0).split("\n") for piece in wrap_visible(line, w - 1, words=True)
+        ]
     area = max(1, h - 4)
     title = f" /mine · {reading['at'] + 1} of {len(reading['ids'])} "
     if len(body) > area - 1 and m is not None:
@@ -12663,7 +12923,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         options = []
         for key, title, _, _, _ in ctx.help_tasks:
             if key == "pause":
-                title = tr("Resume the room") if paused else tr("Pause the room")
+                title = "Resume the room" if paused else "Pause the room"  # English: help_words says it in the room's language
             options.append((help_words(title, lang), key))
         ctx.wizard.update(
             step="help_pick", from_cmd="/help", prompt=help_words("What would you like to do?", lang), options=options
@@ -13252,7 +13512,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             return  # the menu stays open: Esc closes it
         if key == "pause":
             paused = load_config().get("paused")
-            action, command = (tr("Resume the room"), "/resume") if paused else (tr("Pause the room"), "/pause")
+            action, command = ("Resume the room", "/resume") if paused else ("Pause the room", "/pause")
         title, action = help_words(title, lang), help_words(action, lang)
         steps = [help_words(x, lang) for x in steps]
         back = words_in("team.back", lang)
@@ -14695,7 +14955,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         # Name the pane once: an earlier version wrote states into the pane title, and tmux kept
         # that stale line above the panel after the chat stopped updating it.
         sys.stdout.write(f"\033]2;collab-room · {me}\033\\")
-        border_title(BORDER_CHAT.format(room=rp.root.name.lstrip(".") or rp.root.name))
+        border_title(tr("{room} · Room chat", room=rp.root.name.lstrip(".") or rp.root.name))
         h = rows()
         sys.stdout.write("\n" * 3 + f"\033[1;{h - 3}r")
         ui.laid = (h, shutil.get_terminal_size((100, 24)).columns)
@@ -15454,9 +15714,10 @@ def cmd_dm(args: argparse.Namespace) -> None:
         )
         head = input_head(config, owner, state["active"] or None)
         name = label_of(config, state["active"]) if state["active"] else ""
-        title = BORDER_DM.format(name=name) if name else "Direct messages"
+        # The top border (not «Private» — the log is shared; «Direct messages» says how they are addressed, «DM» where it is tight).
+        title = tr("Direct messages · {name}", name=name) if name else tr("Direct messages")
         if text_cols(title) + 4 > w:
-            title = BORDER_DM_SHORT.format(name=name) if name else "DM"
+            title = tr("DM · {name}", name=name) if name else tr("DM")
         if titled[0] != title:  # by the text: a /name or a narrower panel changes it too
             titled[0] = title
             border_title(title)
@@ -15482,7 +15743,7 @@ def cmd_dm(args: argparse.Namespace) -> None:
                 body += [
                     piece
                     for line in pretty(config, m, w - 1, 0).split("\n")
-                    for piece in wrap_visible(line, w - 1)
+                    for piece in wrap_visible(line, w - 1, words=True)
                 ]
             laid.update(made=made, body=body, starts=starts)
         body, starts = laid["body"], laid["starts"]

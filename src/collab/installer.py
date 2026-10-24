@@ -654,11 +654,12 @@ def install_python311() -> tuple[str, str] | None:
     try:
         choice = m_term.pick(
             [
-                "No Python 3.11 or newer was found. collab needs one, so that Codex agents can answer",
-                "in the room without asking each time.",
+                m_i18n.tr(
+                    "No Python 3.11 or newer was found. collab needs one, so that Codex agents can answer in the room without asking each time."
+                )
             ],
-            [("No", None), *ways],
-            ["↑/↓ choose · Enter · Esc — No"],
+            [(m_i18n.tr("No"), None), *ways],
+            [m_i18n.tr("↑/↓ choose · Enter · Esc — No")],
         )
     except (EOFError, KeyboardInterrupt):
         return None
@@ -997,6 +998,58 @@ def run_update(source: Path) -> tuple[str, str]:
     return "updated", f"collab updated from {m_boot.VERSION} to {newest}."
 
 
+PLUGIN = "collab-room@collab-room"
+PLUGIN_WAIT = 120  # seconds for each `claude plugin` call; beside the room, so the start never waits for it
+
+
+def claude_plugin_version(claude: str) -> str | None:
+    """The version of collab-room's plugin Claude Code has installed; None when it has none or does not say."""
+    listed = subprocess.run(
+        [claude, "plugin", "list", "--json"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=PLUGIN_WAIT
+    )
+    try:
+        plugins = json.loads(listed.stdout)
+    except ValueError:
+        return None
+    mine = [x for x in plugins if isinstance(x, dict) and x.get("id") == PLUGIN] if isinstance(plugins, list) else []
+    return (str(mine[0].get("version") or "") or None) if mine else None
+
+
+def update_claude_plugin() -> tuple[str, str]:
+    """After the update: Claude Code reads collab-room's plugin source again and moves the plugin to its version.
+    (outcome, line): «updated», «current», «skipped» (no Claude Code, no plugin) or «failed» — one line each,
+    and nothing it meets stops the update. A plugin Claude Code does not have is not installed here: that is
+    `collab install`'s, which says it."""
+    claude = shutil.which("claude")
+    if not claude:
+        return "skipped", m_i18n.tr("Claude Code not found — its plugin is not updated.")
+    try:
+        was = claude_plugin_version(claude)
+        if was is None:
+            return "skipped", m_i18n.tr("Claude Code has no collab-room plugin — `collab install` adds it.")
+        for command in (["marketplace", "update", "collab-room"], ["update", PLUGIN]):
+            done = subprocess.run(
+                [claude, "plugin", *command],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=PLUGIN_WAIT,
+            )
+            if done.returncode:
+                said = (done.stderr.strip() or done.stdout.strip()).splitlines() or ["exit " + str(done.returncode)]
+                return "failed", m_i18n.tr(
+                    "The Claude plugin is not updated: claude plugin {p0} said: {p1}", p0=command[0], p1=said[-1][:200]
+                )
+        moved = claude_plugin_version(claude)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return "failed", m_i18n.tr("The Claude plugin is not updated: {p0}", p0=str(e)[:200])
+    if moved == was:
+        return "current", m_i18n.tr("The Claude plugin {p0} is the newest.", p0=was)
+    return "updated", m_i18n.tr(
+        "The Claude plugin updated from {p0} to {p1}: Claude agents take its new hooks after /restart.", p0=was, p1=moved or "?"
+    )
+
+
 def update_in_background(root: str) -> None:
     """`collab start`: look for a newer collab beside the room — the start never waits for the network.
     Not from a --dev install, not when switched off."""
@@ -1056,19 +1109,26 @@ def auto_update(starter: int) -> None:
         except OSError:
             return  # another room's start is updating already
         outcome, line = run_update(source)
+        # The plugin follows the clone it is read from: after an update, and at a start with nothing newer
+        # (a plugin left behind catches up). Said with the update; alone only when the plugin moved.
+        plugin, plugin_line = update_claude_plugin() if outcome in ("updated", "current") else ("", "")
+        print(line)
+        if plugin_line:
+            print(plugin_line)
         try:
             told = json.loads(inst.update_state.read_text(encoding="utf-8")).get("told", "")
         except (OSError, ValueError, AttributeError):
             told = ""
         tell = outcome == "updated" or (outcome == "blocked" and line != told)
-        state = {"at": m_store.now(), "outcome": outcome, "line": line, "told": line if tell else told}
+        state = {"at": m_store.now(), "outcome": outcome, "line": line, "told": line if tell else told, "plugin": plugin}
         m_store.write_private(inst.update_state, json.dumps(state, ensure_ascii=False))
-    if not tell:
+    if not tell and plugin != "updated":
         return
     config = m_store.config_now()
     if outcome == "updated":
         line += UPDATED_IN_ROOM
-    m_log.append_message(m_text.ROOM, m_store.people_ids(config), line)
+    said = " ".join(x for x in (line if tell else "", plugin_line if outcome == "updated" or plugin == "updated" else "") if x)
+    m_log.append_message(m_text.ROOM, m_store.people_ids(config), said)
     link = m_boot.read_private(inst.installed_file)
     session = config.get("session", "collab-room")
     if outcome == "updated" and link and wait_for_room(session, starter):
@@ -1100,6 +1160,8 @@ def cmd_update(args: argparse.Namespace) -> None:
         m_store.fail(why)
     outcome, line = run_update(source)
     print(line)
+    if outcome in ("updated", "current"):
+        print(update_claude_plugin()[1])
     if outcome == "updated":
         print(
             m_i18n.tr(

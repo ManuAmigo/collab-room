@@ -208,9 +208,10 @@ class Base(unittest.TestCase):
                 return result
             time.sleep(0.1)
 
-    def write_config(self, participants, session="test-room"):
+    def write_config(self, participants, session="test-room", **room):
         self.cfg.parent.mkdir(parents=True, exist_ok=True)
-        self.cfg.write_text(json.dumps({"version": 2, "session": session, "participants": participants}), encoding="utf-8")
+        config = {"version": 2, "session": session, "participants": participants, **room}
+        self.cfg.write_text(json.dumps(config), encoding="utf-8")
 
     def run_collab(self, *args, stdin=None):
         return subprocess.run(
@@ -1889,6 +1890,19 @@ class RoomTest(Base):
         self.assertEqual(mod.words_in("n.agents", "en", n=1), "1 agent")
         self.assertEqual(mod.words_in("team.what", "xx"), "What will we do?", "a language not known: English")
 
+    def test_the_pseudo_language_makes_each_catalog_line_longer_and_framed(self):
+        mod = _Loader(f"collab_pseudo_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        with mock.patch.dict(os.environ, {"COLLAB_PSEUDO": "1"}):
+            said = mod.tr("Change {name}: which?", "ru", name="Ann")
+            two = mod.words_in("team.which", "ru")
+            layout = mod.tr("  {i}. {x}", "ru", i=1, x="step")
+        plain = mod.tr("Change {name}: which?", "ru", name="Ann")
+        self.assertTrue(said.startswith("⟦" + plain) and said.endswith("⟧"), said)
+        self.assertGreater(len(said), len(plain) * 4 // 3, "a third longer: room for a longer language")
+        self.assertTrue(two.startswith("⟦Какого агента?") and two.endswith("⟧"), two)
+        self.assertEqual(layout, "  1. step", "a template of places only is a layout, not words")
+        self.assertEqual(plain, "Агент: Ann. Что изменить?", "without the switch nothing changes")
+
     def test_every_line_the_room_says_through_tr_has_its_russian_one(self):
         # Each m_i18n.tr("English {template}") in the program: its key in the catalog, both languages, the same
         # parameters — a line added without its Russian one fails here.
@@ -1976,6 +1990,43 @@ class RoomTest(Base):
         self.assertEqual(mod.command(decomposed), "/language", "NFC")
         self.assertEqual(mod.shown_command("/add", "ru"), "/добавить")
         self.assertEqual(mod.shown_command("/add", "en"), "/add")
+
+    def test_a_ready_teams_own_topics_are_said_in_the_rooms_language_and_the_persons_as_written(self):
+        mod = _Loader(f"collab_topics_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        seats = mod.SCENARIOS["development"]["seats"]
+        people = [
+            {"id": "owner", "label": "Андрей"},
+            {"id": "lead", "label": "Lead", "kind": "claude", "pane": False, "seat": "lead"},
+            {"id": "review", "label": "Reviewer", "kind": "codex", "pane": False, "idle": "x", "seat": "review"},
+            {"id": "front", "label": "Frontend", "kind": "claude", "pane": False, "idle": "x", "seat": "frontend",
+             "topic": "frontend"},  # set by the person, though the same words: theirs
+            {"id": "back", "label": "Backend", "kind": "claude", "pane": False, "idle": "x", "seat": "backend"},
+        ]  # fmt: skip
+        team = {"scenario": "development", "lead": "lead", "seats": [*seats[:3], {**seats[3], "topic": "своя тема"}]}
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+
+        def room(pid, **lang):
+            config = {"version": 2, "session": "t", "participants": people, "team": team, **lang}
+            self.cfg.write_text(json.dumps(config), encoding="utf-8")
+            r = self.run_collab("brief", "--as", pid)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            rows = {p["id"]: mod.seat_line(p.get("kind", ""), p, config) for p in people[1:]}
+            return r.stdout, rows
+
+        brief, rows = room("lead", language="ru")
+        self.assertIn("- Тема: координация.", brief, "the lead's assignment says its topic in Russian")
+        self.assertIn("Backend — исполнитель, бэкенд", brief)
+        self.assertIn("Lead · ведущий · координация ·", rows["lead"], "the name stays — it is the id in commands")
+        self.assertIn(" · своя тема · ", rows["review"], "a topic the person typed for the seat: as written")
+        self.assertIn(" · frontend · ", rows["front"], "an agent's own topic: as written")
+        brief, rows = room("lead")
+        self.assertIn("coordination", brief, "an English room: the scenario's words")
+        self.assertIn("Lead · lead · coordination ·", rows["lead"])
+        # Each ready team's topic has its words in each language.
+        for name, scenario in mod.SCENARIOS.items():
+            for seat in scenario["seats"]:
+                entry = mod.CATALOG.get(mod.topic_key(seat["topic"]))
+                self.assertTrue(entry and entry["en"] == seat["topic"] and entry["ru"], f"{name}: {seat['topic']}")
 
     def test_a_russian_room_briefs_its_agents_in_russian_and_an_old_room_stays_english(self):
         people = [
@@ -13438,7 +13489,8 @@ class DeliveryTest(Base):
         self.assertNotIn("stops sending it messages", self.screen(pane))
         # And the full guide of /help says the same.
         mod = _Loader(f"collab_help_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
-        self.assertIn("messages to it by name still arrive", mod.HELP("Андрей", full=True))
+        # Read as words: in a window narrower than the guide an explanation goes on on the next row.
+        self.assertIn("messages to it by name still arrive", " ".join(mod.HELP("Андрей", full=True).split()))
 
     def test_unlimit_from_the_chat_offers_only_the_limited_and_clears_it(self):
         # Taking a limit off is in the agent's menu — /unlimit lists only those out of their limit.
@@ -14282,6 +14334,143 @@ class DeliveryTest(Base):
         keys("-l", "/продолжить")
         keys("Enter")
         self.assertTrue(self.wait_for(pane, "Доставка возобновлена"), self.screen(pane))
+
+    NARROW = 60
+
+    def narrow_screen(self, pane, *phrases):
+        """The screen of a window NARROW wide: no row past it, each phrase there whole — a row broken in a word
+        («/от|ветить») or cut in the middle loses it; a row cut at the window's edge says so with «…»."""
+        rows = self.screen(pane).splitlines()
+        self.assertTrue(all(len(x) <= self.NARROW for x in rows), rows)
+        flat = " ".join(" ".join(x.split()) for x in rows)
+        for phrase in phrases:
+            self.assertIn(" ".join(phrase.split()), flat, "\n".join(rows))
+        return rows
+
+    def test_a_russian_rooms_screens_in_a_narrow_window_keep_their_words_whole(self):
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {
+                    "id": "lea",
+                    "label": "Lea",
+                    "kind": "claude",
+                    "command": [str(self.root / "agent.sh")],
+                    "delivery": "tmux",
+                    "idle": r"^READY$",
+                    "role": "lead",
+                },
+                {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x"},
+            ],
+            session=self.session,
+            language="ru",
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", str(self.NARROW), "-y", "40"], check=True)
+        self.assertTrue(self.wait_chat(pane, "Андрей → Все"), self.screen(pane))
+        keys = lambda *k: self.press(pane, *k, most=0.6)
+        # The guide: a long explanation goes on under its own column, by words.
+        keys("-l", "/помощь")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Что вы хотите сделать?"), self.screen(pane))
+        self.assertNotIn("Не получилось", self.screen(pane))
+        keys("Up")
+        keys("Enter")  # Keys and commands, the last task
+        self.assertTrue(self.wait_for(pane, "уходят в архив"), self.screen(pane))
+        self.narrow_screen(pane, "Очистить историю для всех; старые сообщения уходят в архив")
+        keys("Escape")
+        keys("Escape")
+        # The command menu: a hint longer than the window ends with «…», not in the middle of a word.
+        keys("-l", "/")
+        self.assertTrue(self.wait_for(pane, "/добавить"), self.screen(pane))
+        rows = [x for x in self.narrow_screen(pane) if x.startswith(("   /", " › /"))]
+        self.assertTrue(rows, self.screen(pane))
+        mod = _Loader(f"collab_narrow_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        said = [str(v["ru"]) for v in mod.CATALOG.values() if isinstance(v, dict) and "ru" in v]
+        hints = [x[3:].split(None, 1)[1].strip() for x in rows if len(x[3:].split(None, 1)) == 2]
+        cut = [h for h in hints if h.endswith("…")]
+        self.assertTrue(cut, "some hints are longer than the window")
+        for hint in hints:
+            whole = hint in said or (hint.endswith("…") and any(x.startswith(hint[:-1].rstrip()) for x in said))
+            self.assertTrue(whole, f"a hint whole, or cut with «…» at its end: {hint!r}")
+        keys("Escape")
+        # The team and an agent's card.
+        keys("-l", "/команда")
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Изменить команду?"), self.screen(pane))
+        keys("Enter")
+        self.assertTrue(self.wait_for(pane, "Агент: Lea. Что изменить?"), self.screen(pane))
+        self.narrow_screen(pane, "Агент: Lea. Что изменить?")
+        keys("Escape")
+        keys("Escape")
+        keys("Escape")
+        # A proposal's card.
+        r = self.run_collab("propose", "--from", "lea", "--set", "ann.role=reviewer")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.run_collab("deliver", "--once").returncode, 0)
+        self.assertTrue(self.wait_for(pane, "Lea предлагает"), self.screen(pane))
+        self.narrow_screen(pane, "Lea предлагает")
+
+    def test_before_a_room_the_menus_speak_the_chosen_language_and_wrap_in_a_narrow_window(self):
+        # The first menu, the folders, the yes/no — what comes before a room's own chat — were English after
+        # «Русский» was chosen, and a sentence under the menu lost its middle in a window 60 wide.
+        (Path(os.environ["COLLAB_INVITES"]).parent / "language").write_text("ru\n", encoding="utf-8")
+        projects = self.root / "projects"
+        (projects / "fresh").mkdir(parents=True)
+        env = " ".join(
+            f"{k}={shlex.quote(v)}"
+            for k, v in (
+                ("COLLAB_ROOMS", str(self.root / "_rooms.json")),
+                ("HOME", os.environ["HOME"]),
+                ("COLLAB_INVITES", os.environ["COLLAB_INVITES"]),
+                ("COLLAB_STATE_HOME", os.environ["COLLAB_STATE_HOME"]),
+                ("COLLAB_CLAUDE_HOME", str(self.root / "_claude_home")),
+                ("COLLAB_CODEX_HOME", str(self.root / "_codex_home")),
+                ("COLLAB_TEMP_PREFIXES", "/nonexistent-temp-prefix/"),
+                ("COLLAB_NO_ATTACH", "1"),
+                ("COLLAB_NO_AUTODELIVER", "1"),
+            )
+        )
+        driver = f"{self.session}-drv"
+        self.addCleanup(subprocess.run, ["tmux", "kill-session", "-t", f"={driver}"], capture_output=True)
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", driver, "-x", str(self.NARROW), "-y", "30", "-c", str(projects),
+             f"env -u COLLAB_ROOT {env} {sys.executable} {COLLAB}; sleep 30"],
+            check=True,
+        )  # fmt: skip
+        pane = f"={driver}:"
+        self.assertTrue(self.wait_for(pane, "Выбрать другую папку проекта…"), self.screen(pane))
+        self.narrow_screen(
+            pane,
+            "Что вы хотите сделать?",
+            "Новая комната спросит только ваше имя. Агентов добавите потом через /добавить.",
+        )
+        self.press(pane, "Up", most=0.6)
+        self.press(pane, "Enter", most=0.6)
+        self.assertTrue(self.wait_for(pane, "✓ Выбрать эту папку"), self.screen(pane))
+        self.narrow_screen(pane, "↑ Папка выше", "fresh/", "Ввести путь вручную…")
+
+    def test_a_new_russian_rooms_ready_teams_in_a_narrow_window_keep_the_start_of_their_hint(self):
+        (self.root / "language").write_text("ru\n", encoding="utf-8")
+        self.cfg.unlink(missing_ok=True)
+        r = self.run_collab("start", "--session", self.session)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", str(self.NARROW), "-y", "40"], check=True)
+        self.assertTrue(self.wait_for(pane, "Предлагаемое имя из вашей учётной записи"), self.screen(pane))
+        subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+        self.assertTrue(self.wait_for(pane, "Что будем делать?"), self.screen(pane))
+        rows = self.narrow_screen(pane, "Разработка — Разделить работу")
+        self.assertTrue(any(x.rstrip().endswith("…") for x in rows), "a hint past the window ends with «…»")
+        self.press(pane, "Down", most=0.6)
+        self.press(pane, "Enter", most=0.6)  # Development
+        self.assertTrue(self.wait_for(pane, "Запустить команду — 4 агента"), self.screen(pane))
+        self.narrow_screen(pane, "Это начальный состав: после запуска его можно изменить через /команда.")
 
     def test_a_team_is_saved_in_the_chat_and_a_new_room_offers_it(self):
         self.write_config(

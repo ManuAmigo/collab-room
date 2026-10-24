@@ -35,7 +35,7 @@ def chat_feed_rows(ctx: ChatMenuContext, n: int, w: int) -> list[str]:
     a command to copy left whole; blank rows on top when the feed is shorter."""
     out: list[str] = []
     for line in ctx.feed_log[-n * 2 :]:
-        out.extend([line[1:]] if line.startswith(m_chat_base.WHOLE) else m_text.wrap_visible(line, w - 1))
+        out.extend([line[1:]] if line.startswith(m_chat_base.WHOLE) else m_text.wrap_kept(line, w - 1))
     return ([""] * n + out)[-n:]
 
 
@@ -79,19 +79,15 @@ def chat_draw_menu(ctx: ChatMenuContext, items: list[tuple[str, str, str]], h: i
         if len(more) + m_text.text_cols(prompt) + len(hint) + 3 > w:
             hint = ""  # a narrow window: the question first, the keys are known by now
         space = max(10, w - 3 - len(more) - len(hint))
-        if m_text.text_cols(prompt) > space:
-            prompt = m_text.cut_cols(prompt, space // 2 - 1) + "…" + m_text.cut_cols(prompt, space - space // 2, from_end=True)
+        prompt = m_text.shorten_cols(prompt, space)
         header = m_text.paint(f"  {more}", "2") + m_text.paint(prompt, "1") + m_text.paint(hint, "2")
     else:
         header = m_text.paint(m_text.cut_cols(m_i18n.tr("  ↑↓ choose · Enter select · keep typing to filter"), w - 1), "2")
     # Each row written over the old one, then the rest of the line erased: erasing first left
     # it blank for a moment on every key.
     out += f"\033[{top};1H" + header + "\033[K"
-    # A label longer than the window gives way in its middle: a path's end is the
-    # folder's name, the part that matters.
-    fit = lambda t, n: (
-        t if m_text.text_cols(t) <= n else m_text.cut_cols(t, n // 2) + "…" + m_text.cut_cols(t, n - n // 2 - 1, from_end=True)
-    )
+    # A label longer than the window gives way: a path in its middle (its end is the folder's name), words at their end.
+    fit = m_text.shorten_cols
     label_w = min(max(m_text.text_cols(label) for label, _, _ in rows_), max(8, w - 4))
     for i, (label, _, hint) in enumerate(rows_):
         mark = "›" if i == sel else " "
@@ -99,7 +95,7 @@ def chat_draw_menu(ctx: ChatMenuContext, items: list[tuple[str, str, str]], h: i
         text = m_i18n.tr(" {mark} {cell}{p2}", mark=mark, cell=cell, p2=" " * (label_w - m_text.text_cols(cell))) + (
             f"   {hint}" if hint else ""
         )
-        text = m_text.cut_cols(text, w - 1)  # columns: CJK paths cut at half the width they took
+        text = m_text.shorten_cols(text, w - 1)  # columns (CJK counts two); «…» says a hint goes on past the window
         out += f"\033[{top + 1 + i};1H" + (m_text.paint(text, "1;38;5;75") if i == sel else text) + "\033[K"
     sys.stdout.write(out + "\0338")
     ctx.ui.popup = len(rows_) + 1

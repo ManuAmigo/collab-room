@@ -153,7 +153,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         # Name the pane once: an earlier version wrote states into the pane title, and tmux kept
         # that stale line above the panel after the chat stopped updating it.
         sys.stdout.write(f"\033]2;collab-room · {me}\033\\")
-        m_agents.border_title(m_chat_base.BORDER_CHAT.format(room=rp.root.name.lstrip(".") or rp.root.name))
+        m_agents.border_title(m_i18n.tr("{room} · Room chat", room=rp.root.name.lstrip(".") or rp.root.name))
         h = rows()
         sys.stdout.write("\n" * 3 + f"\033[1;{h - 3}r")
         ui.laid = (h, shutil.get_terminal_size((100, 24)).columns)

@@ -72,6 +72,8 @@ def cmd_home(args: argparse.Namespace) -> None:
     project; no paths to type, no environment to clear."""
     rp = m_store.room().paths
     choose_language()
+    # What comes before a room — this menu, the folders, the name — in the language the person chose.
+    m_i18n.speak(m_store.room_language(m_store.read_config_raw()) if rp.config_path.is_file() else m_store.user_language())
     if rp.config_path.is_file():
         cmd_start(args)
         return
@@ -85,17 +87,23 @@ def cmd_home(args: argparse.Namespace) -> None:
     rows: list[tuple[str, Any]] = []
     if here not in (os.path.realpath(str(Path.home())), "/") and here not in map(os.path.realpath, rooms):
         fresh = [f for f in fresh if os.path.realpath(f) != here]
-        rows += [("THIS FOLDER", None), (f"New room — {m_text.tilde(here)}", ("new", here))]
+        rows += [(m_i18n.tr("THIS FOLDER"), None), (m_i18n.tr("New room — {p0}", p0=m_text.tilde(here)), ("new", here))]
     if rooms:
-        rows += [("YOUR ROOMS", None)] + [(f"Open room — {m_text.tilde(r)}", ("open", r)) for r in rooms]
+        rows += [(m_i18n.tr("YOUR ROOMS"), None)]
+        rows += [(m_i18n.tr("Open room — {p0}", p0=m_text.tilde(r)), ("open", r)) for r in rooms]
     if fresh:
-        rows += [("CREATE A ROOM", None)] + [(f"New room — {m_text.tilde(f)}", ("new", f)) for f in fresh]
-    rows += [("Choose another project folder…", ("other", ""))]
+        rows += [(m_i18n.tr("CREATE A ROOM"), None)]
+        rows += [(m_i18n.tr("New room — {p0}", p0=m_text.tilde(f)), ("new", f)) for f in fresh]
+    rows += [(m_i18n.tr("Choose another project folder…"), ("other", ""))]
     while True:
         choice = m_term.pick(
-            ["What would you like to do?", "Choose an existing room, or create one for a project.", ""],
+            [m_i18n.tr("What would you like to do?"), m_i18n.tr("Choose an existing room, or create one for a project."), ""],
             rows,
-            ["", "↑/↓ Move · Enter Select · Esc Cancel", "A new room asks only for your name. Add agents later with /add."],
+            [
+                "",
+                m_i18n.tr("↑/↓ Move · Enter Select · Esc Cancel"),
+                m_i18n.tr("A new room asks only for your name. Add agents later with /add."),
+            ],
             erase=lambda v: v is None or v[0] == "other",
         )  # the chosen room stays on screen
         if choice is None:

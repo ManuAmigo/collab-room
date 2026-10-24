@@ -570,7 +570,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
         options = []
         for key, title, _, _, _ in ctx.help_tasks:
             if key == "pause":
-                title = m_i18n.tr("Resume the room") if paused else m_i18n.tr("Pause the room")
+                title = "Resume the room" if paused else "Pause the room"  # English: help_words says it in the room's language
             options.append((m_i18n.help_words(title, lang), key))
         ctx.wizard.update(
             step="help_pick", from_cmd="/help", prompt=m_i18n.help_words("What would you like to do?", lang), options=options
@@ -1159,7 +1159,7 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             return  # the menu stays open: Esc closes it
         if key == "pause":
             paused = m_store.load_config().get("paused")
-            action, command = (m_i18n.tr("Resume the room"), "/resume") if paused else (m_i18n.tr("Pause the room"), "/pause")
+            action, command = ("Resume the room", "/resume") if paused else ("Pause the room", "/pause")
         title, action = m_i18n.help_words(title, lang), m_i18n.help_words(action, lang)
         steps = [m_i18n.help_words(x, lang) for x in steps]
         back = m_i18n.words_in("team.back", lang)
