@@ -284,7 +284,13 @@ def set_agent_rule(room_dir: str, pid: str, cli: str) -> None:
                 "prefix_rule(pattern="
                 + json.dumps([*rule_python(), cli, command, "--room", room_dir, flag, pid], ensure_ascii=False)
                 + ', decision="allow")\n'
-                for command, flag in (("say", "--from"), ("ack", "--for"), ("inbox", "--for"))
+                for command, flag in (
+                    ("say", "--from"),
+                    ("ack", "--for"),
+                    ("inbox", "--for"),
+                    ("propose", "--from"),
+                    ("goal", "--from"),
+                )
             )
         )
     inst.agent_rules.parent.mkdir(parents=True, exist_ok=True)

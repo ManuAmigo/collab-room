@@ -423,11 +423,13 @@ def deliver_once(config: dict[str, Any], panes: dict[str, str]) -> list[tuple[st
         if typed:
             done.append((p["id"], typed))
     m_ledger.tick(config)  # the tokens' ledger: each agent's spending since its last look
-    with contextlib.suppress(m_store.OperationFailed):
-        handle_proposals(config, m_log.read_log_tick())
     tell_outside_changes(config)
     tell_setting_changes(config)
     send_briefs(config)
+    # After what the room says of the settings: a proposal's card opens in the chat once all said before it is
+    # shown — so the lines and assignments of this tick are in the log when its state turns «pending».
+    with contextlib.suppress(m_store.OperationFailed):
+        handle_proposals(config, m_log.read_log_tick())
     with contextlib.suppress(m_store.OperationFailed):
         lead_round(config, m_log.read_log_tick())
     return done
@@ -503,7 +505,12 @@ def handle_proposals(config: dict[str, Any], recent: list[dict[str, Any]]) -> No
         req = m_log.request_of(m, config, messages)
         changes = prop.get("changes") or []
         lead = next((q for q in config["participants"] if q["id"] == m.get("from")), {})
-        own_session = bool(prop.get("session")) and prop.get("session") == lead.get("claude_session")
+        # Only a Claude lead has a session of its own the room bound: a Codex lead's every proposal waits for the Enter.
+        own_session = (
+            m_screen.agent_kind(lead) == "claude"
+            and bool(prop.get("session"))
+            and prop.get("session") == lead.get("claude_session")
+        )
         narrow = (
             req is not None
             and own_session
@@ -565,9 +572,22 @@ def brief_path() -> Path:
     return m_store.room().paths.state_dir / "briefs.json"
 
 
+def lead_command(command: str, rest: str, config: dict[str, Any]) -> str:
+    """One of the lead's commands, ready to run as the lead runs it: a Codex lead through its read-only copy."""
+    lead = m_store.lead_of(config)
+    p = next((q for q in config["participants"] if q["id"] == lead), {})
+    return room_cmd(command, rest, str(p.get("cli") or ""), lead)
+
+
+def brief_of(pid: str, config: dict[str, Any], version: int = 0) -> str:
+    """store.brief with the lead's own command to propose a change, as it runs it."""
+    propose = lead_command("propose", f"--from {pid}", config) if pid == m_store.lead_of(config) else ""
+    return m_store.brief(pid, config, version, propose)
+
+
 def brief_version(pid: str, config: dict[str, Any]) -> tuple[str, int]:
     """The agent's assignment and its version: the one last sent while it is the same, the next once it changed."""
-    text = m_store.brief(pid, config)
+    text = brief_of(pid, config)
     old = as_dict(m_store.read_json(brief_path()).get(pid))
     same = old.get("hash") == hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
     version = int(old.get("v") or 0) if isinstance(old.get("v"), int) else 0
@@ -576,7 +596,7 @@ def brief_version(pid: str, config: dict[str, Any]) -> tuple[str, int]:
 
 def current_brief(pid: str, config: dict[str, Any]) -> str:
     text, version = brief_version(pid, config)
-    return m_store.brief(pid, config, version) if text else ""
+    return brief_of(pid, config, version) if text else ""
 
 
 def assignment_state(pid: str, config: dict[str, Any], messages: list[dict[str, Any]]) -> str:
@@ -585,7 +605,7 @@ def assignment_state(pid: str, config: dict[str, Any], messages: list[dict[str, 
     p = next((q for q in config["participants"] if q["id"] == pid), {})
     if p.get("joined") == "pending":
         return m_i18n.words_in("state.starting", m_store.room_language(config))
-    if not m_store.brief(pid, config):
+    if not brief_of(pid, config):
         return ""
     sent = [m for m in messages if m.get("from") == m_text.ROOM and m.get("brief") is True and m.get("to") == [pid]]
     if not sent:
@@ -703,9 +723,9 @@ def lead_round(config: dict[str, Any], messages: list[dict[str, Any]]) -> None:
             m_i18n.tr("The team's round (every {n} min):", lang, n=minutes),
             *lines,
             m_i18n.tr(
-                "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: collab goal reached --from {lead}.",
+                "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: {cmd}",
                 lang,
-                lead=lead,
+                cmd=lead_command("goal", f"--from {lead} reached", config),
             ),
         ]
     )
@@ -737,7 +757,7 @@ def send_briefs(config: dict[str, Any]) -> None:
         )
         if old.get("hash") == digest and not again:
             continue
-        m_log.append_message(m_text.ROOM, [pid], m_store.brief(pid, config, version), brief=True)
+        m_log.append_message(m_text.ROOM, [pid], brief_of(pid, config, version), brief=True)
         state[pid] = {"hash": digest, "v": version, "pane": str(p.get("pane_pid", "")), "at": time.time()}
         changed = True
     if changed:
@@ -1085,7 +1105,9 @@ def trim_due(p: dict[str, Any], config: dict[str, Any], messages: list[dict[str,
     if rule == m_store.HANDOFF_CLEAR:
         # Handed in: its answer (--re) to a task from whom it reports to, since its last /clear.
         to = m_store.reports_to(m_screen.agent_kind(p), p, config)
-        asked = {m["id"] for m in messages if m.get("from") == to and p["id"] in m.get("to", [])}
+        # «The person» is no id: a task of theirs comes from any of the room's people.
+        givers = m_store.people_ids(config) if to == "person" else [to]
+        asked = {m["id"] for m in messages if m.get("from") in givers and p["id"] in m.get("to", [])}
         given = str(done.get("given") or "")
         handed = any(m.get("from") == p["id"] and m.get("re") in asked and str(m.get("at") or "") > given for m in messages)
         if not handed or in_merge_queue(p["id"]) or owes_answer(p["id"], config, messages, given):

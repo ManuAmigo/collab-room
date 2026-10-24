@@ -916,7 +916,15 @@ def repeated_identity(argv: list[str]) -> str:
     return ""
 
 
-IDENTITY_FLAG = {"say": ("--from", "sender"), "ack": ("--for", "participant"), "inbox": ("--for", "participant")}
+# What a room-started Codex may run through its read-only copy, and the flag that names who runs it: the lead's two
+# commands with the answers' three — each writes only the room's journal or its state, and only as that one id.
+IDENTITY_FLAG = {
+    "say": ("--from", "sender"),
+    "ack": ("--for", "participant"),
+    "inbox": ("--for", "participant"),
+    "propose": ("--from", "sender"),
+    "goal": ("--from", "sender"),
+}
 
 
 def rule_shape_differs(argv: list[str], args: argparse.Namespace) -> str:
@@ -984,7 +992,7 @@ def main() -> None:
     # COLLAB_SAFE_DIR switched the check off). And the check of links runs for every answer, copy
     # or not: for a plain room it costs nothing.
     if re.fullmatch(r"collab-[0-9a-f]{16}", Path(m_boot.SELF).name) and sys.argv[1:2] and sys.argv[1] not in IDENTITY_FLAG:
-        m_store.fail(m_i18n.tr("this copy of collab only answers in a room: say, ack, inbox"))
+        m_store.fail(m_i18n.tr("this copy of collab only answers in a room: say, ack, inbox, propose, goal"))
     if sys.argv[1:2] and sys.argv[1] in IDENTITY_FLAG:
         guard_room_state()
     if args.func is m_chat.cmd_chat:

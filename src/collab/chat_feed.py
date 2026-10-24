@@ -298,12 +298,14 @@ def chat_pump(ctx: ChatFeedContext) -> None:
                 try:
                     shown = ctx.ui.proposals_shown
                     waiting = [k for k, v in m_store.proposal_state().items() if v == "pending" and k not in shown]
-                    if waiting:
+                    everything = m_log.read_messages() if waiting else []
+                    at = next((i for i, x in enumerate(everything) if x.get("id") == waiting[0]), -1) if waiting else -1
+                    # What came after the proposal and is not on the screen yet goes first, on the next tick: a card
+                    # opened over it held it back, and it poured out after the person's answer, over the answer's
+                    # own line.
+                    if waiting and not any(x.get("id") not in ctx.printed for x in everything[at + 1 :]):
                         shown.add(waiting[0])  # the rest open one by one, each when no question is open
-                        everything = m_log.read_messages()
-                        m = next(
-                            (x for x in everything if x.get("id") == waiting[0] and isinstance(x.get("proposal"), dict)), None
-                        )
+                        m = everything[at] if at >= 0 and isinstance(everything[at].get("proposal"), dict) else None
                         if m is not None:
                             cfg = m_store.load_config()
                             req = m_log.request_of(m, cfg, everything) or {}  # only the person's own request is shown as one

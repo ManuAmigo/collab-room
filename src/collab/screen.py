@@ -873,7 +873,8 @@ def bind_claude_session(pid: str) -> None:
         return
     data = m_store.read_config_raw()
     entry = next((p for p in data["participants"] if p["id"] == pid), None)
-    if entry is None or entry.get("claude_session") == sid:
+    # A Claude speaking under a Codex's id is not that Codex: bound, it would pass for the Codex lead's own session.
+    if entry is None or entry.get("claude_session") == sid or agent_kind(entry) == "codex":
         return
     entry["claude_session"] = sid
     m_store.write_config(data)

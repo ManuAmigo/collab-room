@@ -712,7 +712,7 @@ def compacted_path() -> Path:
     return room().paths.state_dir / "compacted.json"
 
 
-def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
+def brief(pid: str, config: dict[str, Any], version: int = 0, propose: str = "") -> str:
     """An agent's assignment, made from the room's settings alone — never from what was said before: who it is
     here, its topic, whom it reports to, the lead, the result file, what is not done without the person.
     "" when the room sets nothing for it: a room without settings works as before."""
@@ -759,6 +759,8 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
                     + (f", {topic_}" if topic_ else "")
                 )
             lines.append(t("brief.team", team="; ".join(parts)))
+        # The team changes only by the person's Enter on a proposal: the lead's way to ask for it, as it runs it.
+        lines.append(t("brief.propose", cmd=propose or f"collab propose --from {pid}"))
         if goal := goal_of(config):
             lines.append(t("brief.goal", goal=goal))
     if out := output_of(config):
@@ -1392,9 +1394,16 @@ def change_words(data: dict[str, Any], rec: dict[str, Any], lang: str = "") -> s
     def w(key: str) -> str:
         return m_i18n.words_in(key, lang)
 
-    def shown(key: str, v: object) -> str:
+    def shown(key: str, v: object, who: str) -> str:
         if v is None:
             return w("change.default")
+        if key == "topic" and isinstance(v, str):
+            # The words of the agent's seat in its ready team: in the room's language, as on its row.
+            people_: list[dict[str, Any]] = data.get("participants", [])
+            nobody: dict[str, Any] = {}
+            p = next((q for q in people_ if q.get("id") == who), nobody)
+            if (seat_of(p, data).get("seat"), v) in BUILTIN_TOPICS:
+                return w(m_i18n.topic_key(v))
         if key == "without_person" and isinstance(v, list):
             return ", ".join(
                 w(f"without.{x}") if f"without.{x}" in m_i18n.CATALOG else str(x) for x in cast("list[object]", v)
@@ -1417,7 +1426,9 @@ def change_words(data: dict[str, Any], rec: dict[str, Any], lang: str = "") -> s
         named = key in ("lead", "reports_to")  # an id: shown by its name
         before, after = (
             m_text.clean_field(
-                (w("whom.person") if v == "person" else label_of(data, str(v))) if named and v is not None else shown(key, v),
+                (w("whom.person") if v == "person" else label_of(data, str(v)))
+                if named and v is not None
+                else shown(key, v, str(c.get("who"))),
                 GOAL_LIMIT,
             )
             for v in (c.get("before"), c.get("after"))

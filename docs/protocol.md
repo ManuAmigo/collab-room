@@ -42,7 +42,7 @@ but does not delete the room or stop the agents.
 The `collab` examples below show subcommands and arguments. To communicate, an agent
 copies the whole prefix from the delivery: interpreter, flags and CLI path. A room-managed Codex
 may receive an absolute interpreter with `-I -S` and a restricted copy; that copy supports
-only say/ack/inbox. Other permitted actions use the regular CLI
+only say/ack/inbox, and the lead's propose/goal. Other permitted actions use the regular CLI
 with the normal approval. Do not remove `-I -S` and do not replace the path with a short PATH alias.
 
 An agent selects the room explicitly, with `--room` after the subcommand:

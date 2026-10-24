@@ -1991,6 +1991,32 @@ class RoomTest(Base):
         self.assertEqual(mod.shown_command("/add", "ru"), "/добавить")
         self.assertEqual(mod.shown_command("/add", "en"), "/add")
 
+    def test_a_proposal_waits_for_the_person_only_after_the_ticks_assignments_are_in_the_log(self):
+        # The chat opens a proposal's card when its state turns «pending»; an assignment the same tick wrote after
+        # it was held by the card and came out over the person's answer.
+        people = [
+            {"id": "owner", "label": "Андрей"},
+            {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "idle": "x", "role": "lead"},
+            {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x", "role": "reviewer"},
+        ]
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg.write_text(json.dumps({"version": 2, "session": "t", "participants": people}), encoding="utf-8")
+        self.assertEqual(self.run_collab("propose", "--from", "lea", "--set", "ann.topic=facts").returncode, 0)
+        mod = _Loader(f"collab_order_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        seen: list[list[str]] = []
+        set_state = mod.set_proposal_state
+
+        def noted(mid, state):
+            seen.append([m["to"][0] for m in self.messages() if m.get("brief")])
+            return set_state(mid, state)
+
+        self.enterContext(seam(mod, "store.set_proposal_state", noted))
+        self.enterContext(seam(mod, "tmuxio.tmux", lambda *a, **k: SimpleNamespace(stdout="", returncode=0, stderr="")))
+        mod.deliver_once(mod.load_config(), {})
+        self.assertEqual(len(seen), 1, "the proposal was judged")
+        self.assertIn("ann", seen[0], "Ann's assignment was in the log before the proposal waited")
+
     def test_a_ready_teams_own_topics_are_said_in_the_rooms_language_and_the_persons_as_written(self):
         mod = _Loader(f"collab_topics_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
         seats = mod.SCENARIOS["development"]["seats"]
@@ -2022,6 +2048,16 @@ class RoomTest(Base):
         brief, rows = room("lead")
         self.assertIn("coordination", brief, "an English room: the scenario's words")
         self.assertIn("Lead · lead · coordination ·", rows["lead"])
+        # A change of a topic says the scenario's words in the room's language too; the person's as written.
+        config = {"participants": people, "team": team, "language": "ru"}
+        record = {"changes": [
+            {"who": "lead", "key": "topic", "before": "своя", "after": "coordination"},
+            {"who": "back", "key": "topic", "before": "backend", "after": "frontend"},  # not this seat's words
+        ]}  # fmt: skip
+        said = mod.change_words(config, record)
+        self.assertIn("Lead — тема своя → координация", said)
+        self.assertIn("Backend — тема бэкенд → frontend", said)
+        self.assertIn("Lead — topic своя → coordination", mod.change_words({**config, "language": "en"}, record))
         # Each ready team's topic has its words in each language.
         for name, scenario in mod.SCENARIOS.items():
             for seat in scenario["seats"]:
@@ -2145,6 +2181,40 @@ class RoomTest(Base):
                 mod.main()
         self.assertEqual(len(commands), 1, "refused before anything was proposed or started")
         self.assertEqual(len([m for m in self.messages() if m.get("proposal")]), 1)
+
+    def test_a_codex_leads_proposals_all_wait_for_the_persons_enter(self):
+        # A Codex has no session the room binds: what it proposes — narrowing, asked for, signed — waits for the
+        # Enter. And a Claude speaking under the Codex's id is not bound to it, so it cannot pass for the lead.
+        CLAUDE = "11111111-2222-3333-4444-555555555555"
+        seats = [
+            {"id": "owner", "label": "Андрей"},
+            {"id": "kodi", "label": "Kodi", "kind": "codex", "pane": False, "idle": "x", "role": "lead"},
+            {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x", "use_model": "opus"},
+        ]
+        self.write_config(seats)
+        mod = _Loader(f"collab_codex_waits_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+
+        def run(*a):
+            with seam(mod, "screen.caller_claude_session", lambda: CLAUDE):
+                with mock.patch.object(sys, "argv", ["collab", *a]):
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        with contextlib.suppress(SystemExit):
+                            mod.main()
+
+        kodi = lambda: next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "kodi")
+        run("say", "--from", "kodi", "--to", "owner", "hi")
+        self.assertNotIn("claude_session", kodi(), "a Claude is not bound to a Codex's id")
+        cfg = json.loads(self.cfg.read_text())
+        for q in cfg["participants"]:
+            q.update({"claude_session": CLAUDE} if q["id"] == "kodi" else {})  # as if bound before
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        req = mod.append_message("owner", ["kodi"], "please make Ann cheaper", sign=True)["id"]
+        run("propose", "--from", "kodi", "--re", req, "--set", "ann.model=sonnet")
+        mod.deliver_once(mod.load_config(), {})
+        ann = next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "ann")
+        self.assertEqual(ann["use_model"], "opus", "not at once")
+        self.assertEqual(list(json.loads((self.state / "proposals.json").read_text()).values()), ["pending"])
 
     def test_the_lead_proposes_and_only_a_narrowing_asked_for_in_a_signed_message_applies_at_once(self):
         LEA = "11111111-2222-3333-4444-555555555555"
@@ -4213,6 +4283,66 @@ class RoomTest(Base):
             hint = shlex.split(mod.room_cmd(command, rest, cli))
             self.assertTrue(any(hint[: len(pat)] == pat for pat in patterns), (hint, patterns))
 
+    def test_a_codex_leads_commands_in_its_brief_and_round_are_what_its_rule_allows(self):
+        # A Codex lead runs only what its rule names: its brief said nothing of proposing, and its round said a
+        # bare «collab goal reached» that the rule does not allow — so it asked the person before each.
+        from types import SimpleNamespace
+
+        mod = _Loader(f"collab_codex_lead_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.enterContext(seam(mod, "tmuxio.tmux", lambda *a, **k: SimpleNamespace(returncode=0, stdout="%77\n", stderr="")))
+        project = self.root / "project"
+        project.mkdir()
+        (self.invites.parent / "codex-room-replies").write_text("yes\n", encoding="utf-8")
+        pid = mod.launch_new_agent(mod.load_config(), "codex", str(project), "Коди")
+        cfg = json.loads(self.cfg.read_text())
+        for q in cfg["participants"]:
+            q.update({"role": "lead", "idle": "x"} if q["id"] == pid else {})
+        cfg["participants"].append({"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x"})
+        cfg["team"] = {"lead": pid, "round": 5}
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        patterns = [
+            json.loads(m)
+            for m in re.findall(r"prefix_rule\(pattern=(\[.*?\]), decision", mod.paths().agent_rules.read_text(encoding="utf-8"))
+        ]
+        allowed = lambda line: any(shlex.split(line)[: len(pat)] == pat for pat in patterns)
+        mod.send_briefs(mod.load_config())
+        brief = next(m["text"] for m in self.messages() if m.get("brief") and m["to"] == [pid])
+        line = next((x for x in brief.splitlines() if " propose " in x), "")
+        self.assertTrue(line and allowed(line.split("Enter: ", 1)[1]), brief)
+        state = self.state / "rounds.json"
+        state.write_text(json.dumps({"last": 1}), encoding="utf-8")
+        with seam(mod, "deliver.round_reasons", lambda *a: {"idle": "Ann has no task."}):
+            mod.lead_round(mod.load_config(), [])
+        round_ = [m["text"] for m in self.messages() if m["from"] == "room" and m["to"] == [pid] and not m.get("brief")][-1]
+        self.assertTrue(allowed(round_.rsplit("Goal reached: ", 1)[1]), round_)
+
+    def test_a_codex_rules_copy_runs_the_leads_propose_and_goal_and_nothing_else(self):
+        mod = _Loader(f"collab_copy_lead_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        copy = mod.safe_copy()
+        self.write_config(
+            [
+                {"id": "owner", "label": "Андрей"},
+                {"id": "kodi", "label": "Kodi", "kind": "codex", "pane": False, "idle": "x", "role": "lead"},
+                {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x"},
+            ]
+        )
+        run = lambda *a: subprocess.run(
+            [sys.executable, "-I", "-S", str(copy), *a], cwd=self.root, text=True, capture_output=True, timeout=60
+        )
+        room = ("--room", str(self.root))
+        r = run("propose", *room, "--from", "kodi", "--set", "ann.topic=facts")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([m["proposal"] for m in self.messages() if m.get("proposal")], [{"changes": [
+            {"who": "ann", "key": "topic", "after": "facts"}]}])  # fmt: skip
+        r = run("goal", *room, "--from", "kodi", "reached")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("declared the goal reached", self.messages()[-1]["text"])
+        self.assertNotEqual(run("show", *room, "x").returncode, 0, "the copy still answers nothing else")
+        twice = run("propose", *room, "--from", "kodi", "--from=ann", "--set", "ann.topic=x")
+        self.assertNotEqual(twice.returncode, 0, "one identity, as its rule names it")
+        self.assertNotEqual(run("propose", *room, "--from", "ann", "--set", "ann.topic=x").returncode, 0, "only the lead")
+
     def test_a_room_codex_runs_without_the_shared_daemon_when_its_codex_knows_how(self):
         # Through the shared background server a room's Codex did not take the rule
         # written for it before its start, and the person approved every say by hand. /add, relaunch and
@@ -4591,12 +4721,14 @@ class RoomTest(Base):
         self.assertEqual(cli.read_bytes(), COLLAB.read_bytes())
         self.assertEqual(oct(cli.stat().st_mode & 0o777), "0o444", "read-only")
         text = rules.read_text(encoding="utf-8")
-        self.assertEqual(text.count("prefix_rule("), 3 * len(mod.room_spellings()), text)
+        self.assertEqual(text.count("prefix_rule("), 5 * len(mod.room_spellings()), text)  # say ack inbox propose goal
         self.assertNotIn(str(COLLAB), text, "never the checkout a sandboxed Codex might write")
         # What the room tells this agent is what the rule allows — and nothing around it.
         say = shlex.split(mod.room_cmd("say", f"--from {pid} --to all hi", str(cli)))
         ack = shlex.split(mod.room_cmd("ack", f"--for {pid} --no-reply --id 1", str(cli)))
         inbox = shlex.split(mod.room_cmd("inbox", f"--for {pid}", str(cli)))
+        propose = shlex.split(mod.room_cmd("propose", f"--from {pid} --set {pid}.topic=facts", str(cli)))
+        goal = shlex.split(mod.room_cmd("goal", f"--from {pid} reached", str(cli)))
         self.assertEqual(
             say[:3],
             [os.path.realpath(sys.executable), "-I", "-S"],
@@ -4614,11 +4746,12 @@ class RoomTest(Base):
                 ).stdout
                 return json.loads(out or "{}").get("decision") == "allow"
 
-            for argv in (say, ack, inbox):
+            for argv in (say, ack, inbox, propose, goal):
                 self.assertTrue(allowed(argv), argv)
             for argv in (
                 other_room,
                 as_owner,
+                propose[:8] + ["owner"] + propose[9:],
                 [*say[:3], str(COLLAB), *say[4:]],
                 say[:4] + ["stop"] + say[5:],
                 bare_python,
@@ -7425,6 +7558,20 @@ class DeliveryTest(Base):
         settle()
         self.assertNotIn("clear", self.run_collab("deliver", "--once").stdout, "once per handing in")
         self.assertIn("Wes: handed in its work — given /clear.", [m["text"] for m in self.messages()])
+
+    def test_an_agent_that_reports_to_the_person_is_cleared_after_its_answer_to_the_persons_task(self):
+        # With no lead an agent reports to the person — whose messages come from their own id, never «person»: its
+        # answer to their task was not handing in, and «clear after handing in» never came.
+        mod = _Loader(f"collab_handoff_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        handoff = {"do": "clear", "after": "handoff"}
+        wes = {"id": "wes", "label": "Wes", "kind": "claude", "pane": False, "idle": "x", "context_trim": handoff}
+        config = {"version": 2, "participants": [{"id": "owner", "label": "Андрей"}, wes]}
+        self.assertEqual(mod.reports_to("claude", wes, config), "person")
+        task = {"id": "t1", "from": "owner", "to": ["wes"], "at": "2099-01-01T10:00:00+00:00", "text": "prices, please"}
+        self.assertIsNone(mod.trim_due(wes, config, [task]), "nothing handed in yet")
+        answer = {"id": "a1", "from": "wes", "to": ["owner"], "re": "t1", "at": "2099-01-01T10:05:00+00:00", "text": "$12"}
+        self.assertEqual((mod.trim_due(wes, config, [task, answer]) or ("",))[0], "clear")
 
     def test_past_its_context_threshold_an_idle_agent_is_given_compact_or_clear_and_otherwise_nothing(self):
         # Every wake re-reads the whole context. Past the room's threshold, a free agent is given /compact
@@ -14172,6 +14319,58 @@ class DeliveryTest(Base):
         self.assertTrue(self.wait_for(pane, "The room has one lead"), self.screen(pane))
         self.assertEqual(cfg()["team"]["lead"], "ann", "no team left without its lead")
 
+    def test_a_proposals_card_opens_after_what_came_before_it_is_on_the_screen(self):
+        # A message that came while the chat was judging the proposal was held by the card it opened, and poured
+        # out after the person's answer, over the answer's own line. The chat is held at that moment here: the
+        # proposal is pending, the tick's messages are read, the card is not open yet.
+        hold, held = self.root / "hold", self.root / "held"
+        chat = self.root / "chat.py"
+        chat.write_text(
+            "import importlib.machinery, os, sys, time\n"
+            f"c = importlib.machinery.SourceFileLoader('collab_chat', {str(COLLAB)!r}).load_module()\n"
+            "proposal_state = c.proposal_state\n"
+            "def state(*a, **k):\n"
+            "    s = proposal_state(*a, **k)\n"
+            "    if os.path.exists(%r) and 'pending' in s.values():\n"
+            "        open(%r, 'w').close()\n"
+            "        while os.path.exists(%r):\n"
+            "            time.sleep(0.05)\n"
+            "    return s\n"
+            "c.proposal_state = state\n"
+            "sys.argv = ['collab', 'chat', '--as', 'owner', '--interval', '0.2']\n"
+            "c.main()\n" % (str(hold), str(held), str(hold)),
+            encoding="utf-8",
+        )
+        self.write_config(
+            [
+                {"id": "owner", "label": "Андрей", "command": ["python3", str(chat)]},
+                {
+                    "id": "lea",
+                    "label": "Lea",
+                    "kind": "claude",
+                    "command": [str(self.root / "agent.sh")],
+                    "delivery": "tmux",
+                    "idle": r"^READY$",
+                    "role": "lead",
+                },  # fmt: skip
+                {"id": "ann", "label": "Ann", "kind": "claude", "pane": False, "idle": "x"},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(pane))
+        hold.touch()
+        self.assertEqual(self.run_collab("propose", "--from", "lea", "--set", "ann.topic=facts").returncode, 0)
+        r = self.run_collab("deliver", "--once")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(self.until(held.exists), self.screen(pane))
+        r = self.run_collab("say", "--from", "ann", "--to", "owner", "--quiet", "a note that came meanwhile")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        hold.unlink()
+        self.assertTrue(self.wait_for(pane, "Lea proposes — apply?"), self.screen(pane))
+        self.assertIn("a note that came meanwhile", self.screen(pane), "what came before the card is shown above it")
+
     def test_a_proposal_opens_its_card_in_the_chat_and_one_enter_applies_it(self):
         self.write_config(
             [
@@ -15522,6 +15721,34 @@ class UsageTest(Base):
             {k: got[0][k] for k in ("model", "effort", "input", "output", "cache_read", "cache_write")},
             {"model": "gpt-6.1-sol", "effort": "low", "input": 200, "output": 50, "cache_read": 800, "cache_write": 0},
         )
+
+    def test_a_codexs_new_conversation_after_a_restart_is_counted_and_the_old_ones_end_too(self):
+        # After /restart the old conversation's log stays on disk: the count stayed on it for two days and the new
+        # one, in its own file, was never read.
+        day = self.codex / "sessions" / "2026" / "10" / "22"
+        sids = {"1111": "aaaaaaaa-2222-3333-4444-555555555555", "2222": "bbbbbbbb-2222-3333-4444-555555555555"}
+        logs = {code: day / f"rollout-2026-10-22T1{i}-00-00-{sid}.jsonl" for i, (code, sid) in enumerate(sids.items())}
+        meta = json.dumps({"type": "session_meta", "payload": {"cwd": str(self.root)}}) + "\n"
+
+        def record(resp, when, out):
+            usage = {"input_tokens": 100, "cached_input_tokens": 60, "output_tokens": out}
+            pay = {"thread_id": "t", "response_id": resp, "turn_id": "u", "usage": usage}
+            return json.dumps({"timestamp": when, "type": "token_usage_record", "payload": pay}) + "\n"
+
+        agent = {"id": "kodi", "kind": "codex", "folder": str(self.root), "join_code": "1111"}
+        self.write(logs["1111"], meta)
+        with seam(self.mod, "screen.agent_session", lambda p: sids.get(p.get("join_code"), "")):
+            self.assertEqual(self.mod.increment(agent), [])
+            self.write(logs["1111"], record("r1", "2099-01-01T10:00:00Z", 1))
+            self.assertEqual([r["output"] for r in self.mod.increment(agent)], [1])
+            self.write(logs["1111"], record("r2", "2099-01-01T10:01:00Z", 2))  # its last answer, not looked at yet
+            agent["join_code"] = "2222"  # /restart: a new check, a new conversation
+            self.write(logs["2222"], meta, record("r3", "2099-01-01T10:05:00Z", 4), record("r4", "2099-01-01T11:00:00Z", 8))
+            got = self.mod.increment(agent)
+            self.assertEqual(sum(r["output"] for r in got), 2 + 4 + 8, "the old one's end and the new one from its start")
+            self.write(logs["2222"], record("r5", "2099-01-01T12:00:00Z", 16))
+            self.write(logs["1111"], record("r6", "2099-01-01T12:00:00Z", 32))  # not this agent's any more
+            self.assertEqual([r["output"] for r in self.mod.increment(agent)], [16])
 
     def test_a_codex_turn_begun_before_the_first_look_keeps_its_model(self):
         # The turn's context was written before the first look, which reads nothing —

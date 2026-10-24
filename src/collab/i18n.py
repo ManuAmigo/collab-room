@@ -1138,6 +1138,14 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "DM",
         "ru": "ЛС",
     },
+    "t.efc933fe77": {
+        "en": "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: {cmd}",
+        "ru": "Действуйте — подтолкните, дайте задачу, проверьте, спросите пользователя — или ответьте одной строкой «идёт». Цель достигнута: {cmd}",
+    },
+    "t.d64c5c8568": {
+        "en": "this copy of collab only answers in a room: say, ack, inbox, propose, goal",
+        "ru": "эта копия collab только отвечает в комнате: say, ack, inbox, propose, goal",
+    },
     "t.f2493a3e04": {
         "en": "The update at collab start is off. `collab update` still updates when you run it; --on turns it back on.",
         "ru": "Автоматическое обновление при collab start выключено. Команда `collab update` по-прежнему запускает обновление вручную. Включить автоматическое обновление: collab update --on.",
@@ -1314,10 +1322,6 @@ CATALOG: dict[str, dict[str, Any]] = {
     "t.c86137b8b7": {
         "en": "the room's settings must be a JSON object — in {p0}; fix it there",
         "ru": "настройки комнаты должны быть объектом JSON. Исправьте файл: {p0}",
-    },
-    "t.3d69b0b7f6": {
-        "en": "this copy of collab only answers in a room: say, ack, inbox",
-        "ru": "эта копия collab поддерживает только команды комнаты: say, ack, inbox",
     },
     "t.7ca6862873": {
         "en": "this is the installed copy of collab — update from your clone: git pull, then python3 {where} install",
@@ -1497,10 +1501,6 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "- {name} сдал {task} в {at}; вашего ответа пока нет.",
     },
     "t.dd5b3cef88": {"en": "The team's round (every {n} min):", "ru": "Обход команды (каждые {n} мин):"},
-    "t.eefc100803": {
-        "en": "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: collab goal reached --from {lead}.",
-        "ru": "Действуйте — подтолкните, дайте задачу, проверьте, спросите пользователя — или ответьте одной строкой «идёт». Цель достигнута: collab goal reached --from {lead}.",
-    },
     "t.5ffccc851b": {
         "en": "only the room's lead declares the goal reached",
         "ru": "объявить цель достигнутой может только ведущий комнаты",
@@ -1585,6 +1585,10 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "- Вы — ведущий комнаты: собирайте итог для пользователя и обращайтесь к нему с вопросами, которые может решить только он.",
     },
     "brief.goal": {"en": "- Goal: {goal} You answer for reaching it.", "ru": "- Цель: {goal} Вы отвечаете за её достижение."},
+    "brief.propose": {
+        "en": "- To change the team — a model, a topic, memory, one more agent — propose it, and the person applies it with Enter: {cmd} --set ID.KEY=VALUE (or --add KIND:NAME:ROLE:TOPIC).",
+        "ru": "- Чтобы изменить команду — модель, тему, память, добавить агента, — предложите это, и пользователь применит предложение клавишей Enter: {cmd} --set ID.KEY=VALUE (или --add KIND:NAME:ROLE:TOPIC).",
+    },
     "brief.team": {
         "en": "- Your team: {team}. Give each its part, have the result checked, gather it — do not do their parts yourself.",
         "ru": "- Ваша команда: {team}. Распределите работу, организуйте проверку и соберите итог. Не выполняйте чужие части работы сами.",

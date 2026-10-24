@@ -85,22 +85,27 @@ def claude_files(p: dict[str, Any]) -> list[Path]:
     return [base / f"{sid}.jsonl", *extra]
 
 
-def codex_file(p: dict[str, Any], known: str) -> list[Path]:
-    """The agent's Codex session log: the one found before while it is there; else found again —
-    a scan of the sessions folder, so not on every look."""
+def codex_file(p: dict[str, Any], known: str, code: str = "") -> tuple[list[Path], str]:
+    """The agent's Codex session logs and the connection check they were found by: the one found before while the
+    agent is in the same run (`code` is its join code then); after a /restart — a new check, a new conversation in a
+    new file, the old one left on disk — found again, and the old one read to its end beside it. A scan of the
+    sessions folder, so not on every look."""
     logs = codex_home()
     # The cursor is a file in the room's state, anyone's to edit: its path counts only inside Codex's own
     # sessions folder — nothing outside ~/.claude and ~/.codex is opened.
-    if known and os.path.isfile(known) and Path(os.path.realpath(known)).is_relative_to(os.path.realpath(logs)):
-        return [Path(known)]
+    had = bool(known) and os.path.isfile(known) and Path(os.path.realpath(known)).is_relative_to(os.path.realpath(logs))
+    run = str(p.get("join_code") or "")
+    if had and code == run:
+        return [Path(known)], run
     sid = m_screen.agent_session(p)
-    if not sid:
-        return []
     try:
-        found = sorted(logs.rglob(f"rollout-*{sid}.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+        found = sorted(logs.rglob(f"rollout-*{sid}.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True) if sid else []
     except OSError:
-        return []
-    return found[:1]
+        found = []
+    if not found:
+        return ([Path(known)] if had else []), ""  # the new one not there yet: looked for again next time
+    old = [Path(known)] if had and os.path.realpath(known) != os.path.realpath(found[0]) else []
+    return [found[0], *old], run
 
 
 def unread(p: dict[str, Any]) -> str:
@@ -118,7 +123,7 @@ def unread(p: dict[str, Any]) -> str:
         return ""
     if kind == "codex":
         known = next(iter(obj(obj(m_store.read_json(cursor_path())).get(p["id"])).get("files") or {}), "")
-        if codex_file(p, str(known)):
+        if codex_file(p, str(known))[0]:
             return ""
         return f"no log of its session in {m_text.tilde(str(codex_home()))} (found by its connection check)"
     return "not a Claude or a Codex: its spending is not read"
@@ -269,12 +274,13 @@ def read_codex(line: str, ctx: dict[str, list[str | None]]) -> Answer | None:
 @dataclass
 class Cursor:
     """Where one agent's counting stands: since when, how far into each log, the answers already counted
-    (id -> time), and a Codex log's recent turns (turn id -> model, effort)."""
+    (id -> time), a Codex log's recent turns (turn id -> model, effort) and the run its log is of."""
 
     since: str
     files: dict[str, dict[str, int]] = field(default_factory=lambda: {})
     seen: dict[str, str] = field(default_factory=lambda: {})
     ctx: dict[str, list[str | None]] = field(default_factory=lambda: {})
+    code: str = ""  # a Codex's: the join code of the run its log was found for
 
     @classmethod
     def load(cls, raw: object) -> Cursor | None:
@@ -289,7 +295,7 @@ class Cursor:
             for k, v in obj(r.get("ctx")).items()
             if isinstance(v, list) and len(cast("list[object]", v)) == 2
         }
-        return cls(r["since"], files, seen, ctx)
+        return cls(r["since"], files, seen, ctx, r["code"] if isinstance(r.get("code"), str) else "")
 
 
 def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
@@ -308,7 +314,10 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
     fresh = stored is None
     cur = stored or Cursor(m_store.now())
     base = claude_home() if kind == "claude" else codex_home()
-    files = claude_files(p) if kind == "claude" else codex_file(p, next(iter(cur.files), ""))
+    if kind == "claude":
+        files = claude_files(p)
+    else:
+        files, cur.code = codex_file(p, next(iter(cur.files), ""), cur.code)
     groups: dict[tuple[str | None, str | None], dict[str, Any]] = {}
     read_to: dict[str, dict[str, int]] = {}
     compacted: list[float] = []

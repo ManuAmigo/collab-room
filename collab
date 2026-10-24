@@ -110,7 +110,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.10"
+VERSION = "0.1.12"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
@@ -1990,6 +1990,14 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "DM",
         "ru": "ЛС",
     },
+    "t.efc933fe77": {
+        "en": "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: {cmd}",
+        "ru": "Действуйте — подтолкните, дайте задачу, проверьте, спросите пользователя — или ответьте одной строкой «идёт». Цель достигнута: {cmd}",
+    },
+    "t.d64c5c8568": {
+        "en": "this copy of collab only answers in a room: say, ack, inbox, propose, goal",
+        "ru": "эта копия collab только отвечает в комнате: say, ack, inbox, propose, goal",
+    },
     "t.f2493a3e04": {
         "en": "The update at collab start is off. `collab update` still updates when you run it; --on turns it back on.",
         "ru": "Автоматическое обновление при collab start выключено. Команда `collab update` по-прежнему запускает обновление вручную. Включить автоматическое обновление: collab update --on.",
@@ -2166,10 +2174,6 @@ CATALOG: dict[str, dict[str, Any]] = {
     "t.c86137b8b7": {
         "en": "the room's settings must be a JSON object — in {p0}; fix it there",
         "ru": "настройки комнаты должны быть объектом JSON. Исправьте файл: {p0}",
-    },
-    "t.3d69b0b7f6": {
-        "en": "this copy of collab only answers in a room: say, ack, inbox",
-        "ru": "эта копия collab поддерживает только команды комнаты: say, ack, inbox",
     },
     "t.7ca6862873": {
         "en": "this is the installed copy of collab — update from your clone: git pull, then python3 {where} install",
@@ -2349,10 +2353,6 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "- {name} сдал {task} в {at}; вашего ответа пока нет.",
     },
     "t.dd5b3cef88": {"en": "The team's round (every {n} min):", "ru": "Обход команды (каждые {n} мин):"},
-    "t.eefc100803": {
-        "en": "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: collab goal reached --from {lead}.",
-        "ru": "Действуйте — подтолкните, дайте задачу, проверьте, спросите пользователя — или ответьте одной строкой «идёт». Цель достигнута: collab goal reached --from {lead}.",
-    },
     "t.5ffccc851b": {
         "en": "only the room's lead declares the goal reached",
         "ru": "объявить цель достигнутой может только ведущий комнаты",
@@ -2437,6 +2437,10 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "- Вы — ведущий комнаты: собирайте итог для пользователя и обращайтесь к нему с вопросами, которые может решить только он.",
     },
     "brief.goal": {"en": "- Goal: {goal} You answer for reaching it.", "ru": "- Цель: {goal} Вы отвечаете за её достижение."},
+    "brief.propose": {
+        "en": "- To change the team — a model, a topic, memory, one more agent — propose it, and the person applies it with Enter: {cmd} --set ID.KEY=VALUE (or --add KIND:NAME:ROLE:TOPIC).",
+        "ru": "- Чтобы изменить команду — модель, тему, память, добавить агента, — предложите это, и пользователь применит предложение клавишей Enter: {cmd} --set ID.KEY=VALUE (или --add KIND:NAME:ROLE:TOPIC).",
+    },
     "brief.team": {
         "en": "- Your team: {team}. Give each its part, have the result checked, gather it — do not do their parts yourself.",
         "ru": "- Ваша команда: {team}. Распределите работу, организуйте проверку и соберите итог. Не выполняйте чужие части работы сами.",
@@ -3451,7 +3455,7 @@ def compacted_path() -> Path:
     return room().paths.state_dir / "compacted.json"
 
 
-def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
+def brief(pid: str, config: dict[str, Any], version: int = 0, propose: str = "") -> str:
     """An agent's assignment, made from the room's settings alone — never from what was said before: who it is
     here, its topic, whom it reports to, the lead, the result file, what is not done without the person.
     "" when the room sets nothing for it: a room without settings works as before."""
@@ -3498,6 +3502,8 @@ def brief(pid: str, config: dict[str, Any], version: int = 0) -> str:
                     + (f", {topic_}" if topic_ else "")
                 )
             lines.append(t("brief.team", team="; ".join(parts)))
+        # The team changes only by the person's Enter on a proposal: the lead's way to ask for it, as it runs it.
+        lines.append(t("brief.propose", cmd=propose or f"collab propose --from {pid}"))
         if goal := goal_of(config):
             lines.append(t("brief.goal", goal=goal))
     if out := output_of(config):
@@ -4131,9 +4137,16 @@ def change_words(data: dict[str, Any], rec: dict[str, Any], lang: str = "") -> s
     def w(key: str) -> str:
         return words_in(key, lang)
 
-    def shown(key: str, v: object) -> str:
+    def shown(key: str, v: object, who: str) -> str:
         if v is None:
             return w("change.default")
+        if key == "topic" and isinstance(v, str):
+            # The words of the agent's seat in its ready team: in the room's language, as on its row.
+            people_: list[dict[str, Any]] = data.get("participants", [])
+            nobody: dict[str, Any] = {}
+            p = next((q for q in people_ if q.get("id") == who), nobody)
+            if (seat_of(p, data).get("seat"), v) in BUILTIN_TOPICS:
+                return w(topic_key(v))
         if key == "without_person" and isinstance(v, list):
             return ", ".join(
                 w(f"without.{x}") if f"without.{x}" in CATALOG else str(x) for x in cast("list[object]", v)
@@ -4156,7 +4169,9 @@ def change_words(data: dict[str, Any], rec: dict[str, Any], lang: str = "") -> s
         named = key in ("lead", "reports_to")  # an id: shown by its name
         before, after = (
             clean_field(
-                (w("whom.person") if v == "person" else label_of(data, str(v))) if named and v is not None else shown(key, v),
+                (w("whom.person") if v == "person" else label_of(data, str(v)))
+                if named and v is not None
+                else shown(key, v, str(c.get("who"))),
                 GOAL_LIMIT,
             )
             for v in (c.get("before"), c.get("after"))
@@ -6340,7 +6355,8 @@ def bind_claude_session(pid: str) -> None:
         return
     data = read_config_raw()
     entry = next((p for p in data["participants"] if p["id"] == pid), None)
-    if entry is None or entry.get("claude_session") == sid:
+    # A Claude speaking under a Codex's id is not that Codex: bound, it would pass for the Codex lead's own session.
+    if entry is None or entry.get("claude_session") == sid or agent_kind(entry) == "codex":
         return
     entry["claude_session"] = sid
     write_config(data)
@@ -6439,22 +6455,27 @@ def claude_files(p: dict[str, Any]) -> list[Path]:
     return [base / f"{sid}.jsonl", *extra]
 
 
-def codex_file(p: dict[str, Any], known: str) -> list[Path]:
-    """The agent's Codex session log: the one found before while it is there; else found again —
-    a scan of the sessions folder, so not on every look."""
+def codex_file(p: dict[str, Any], known: str, code: str = "") -> tuple[list[Path], str]:
+    """The agent's Codex session logs and the connection check they were found by: the one found before while the
+    agent is in the same run (`code` is its join code then); after a /restart — a new check, a new conversation in a
+    new file, the old one left on disk — found again, and the old one read to its end beside it. A scan of the
+    sessions folder, so not on every look."""
     logs = codex_home()
     # The cursor is a file in the room's state, anyone's to edit: its path counts only inside Codex's own
     # sessions folder — nothing outside ~/.claude and ~/.codex is opened.
-    if known and os.path.isfile(known) and Path(os.path.realpath(known)).is_relative_to(os.path.realpath(logs)):
-        return [Path(known)]
+    had = bool(known) and os.path.isfile(known) and Path(os.path.realpath(known)).is_relative_to(os.path.realpath(logs))
+    run = str(p.get("join_code") or "")
+    if had and code == run:
+        return [Path(known)], run
     sid = agent_session(p)
-    if not sid:
-        return []
     try:
-        found = sorted(logs.rglob(f"rollout-*{sid}.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+        found = sorted(logs.rglob(f"rollout-*{sid}.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True) if sid else []
     except OSError:
-        return []
-    return found[:1]
+        found = []
+    if not found:
+        return ([Path(known)] if had else []), ""  # the new one not there yet: looked for again next time
+    old = [Path(known)] if had and os.path.realpath(known) != os.path.realpath(found[0]) else []
+    return [found[0], *old], run
 
 
 def unread(p: dict[str, Any]) -> str:
@@ -6472,7 +6493,7 @@ def unread(p: dict[str, Any]) -> str:
         return ""
     if kind == "codex":
         known = next(iter(obj(obj(read_json(cursor_path())).get(p["id"])).get("files") or {}), "")
-        if codex_file(p, str(known)):
+        if codex_file(p, str(known))[0]:
             return ""
         return f"no log of its session in {tilde(str(codex_home()))} (found by its connection check)"
     return "not a Claude or a Codex: its spending is not read"
@@ -6623,12 +6644,13 @@ def read_codex(line: str, ctx: dict[str, list[str | None]]) -> Answer | None:
 @dataclass
 class Cursor:
     """Where one agent's counting stands: since when, how far into each log, the answers already counted
-    (id -> time), and a Codex log's recent turns (turn id -> model, effort)."""
+    (id -> time), a Codex log's recent turns (turn id -> model, effort) and the run its log is of."""
 
     since: str
     files: dict[str, dict[str, int]] = field(default_factory=lambda: {})
     seen: dict[str, str] = field(default_factory=lambda: {})
     ctx: dict[str, list[str | None]] = field(default_factory=lambda: {})
+    code: str = ""  # a Codex's: the join code of the run its log was found for
 
     @classmethod
     def load(cls, raw: object) -> Cursor | None:
@@ -6643,7 +6665,7 @@ class Cursor:
             for k, v in obj(r.get("ctx")).items()
             if isinstance(v, list) and len(cast("list[object]", v)) == 2
         }
-        return cls(r["since"], files, seen, ctx)
+        return cls(r["since"], files, seen, ctx, r["code"] if isinstance(r.get("code"), str) else "")
 
 
 def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
@@ -6662,7 +6684,10 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
     fresh = stored is None
     cur = stored or Cursor(now())
     base = claude_home() if kind == "claude" else codex_home()
-    files = claude_files(p) if kind == "claude" else codex_file(p, next(iter(cur.files), ""))
+    if kind == "claude":
+        files = claude_files(p)
+    else:
+        files, cur.code = codex_file(p, next(iter(cur.files), ""), cur.code)
     groups: dict[tuple[str | None, str | None], dict[str, Any]] = {}
     read_to: dict[str, dict[str, int]] = {}
     compacted: list[float] = []
@@ -7009,7 +7034,13 @@ def set_agent_rule(room_dir: str, pid: str, cli: str) -> None:
                 "prefix_rule(pattern="
                 + json.dumps([*rule_python(), cli, command, "--room", room_dir, flag, pid], ensure_ascii=False)
                 + ', decision="allow")\n'
-                for command, flag in (("say", "--from"), ("ack", "--for"), ("inbox", "--for"))
+                for command, flag in (
+                    ("say", "--from"),
+                    ("ack", "--for"),
+                    ("inbox", "--for"),
+                    ("propose", "--from"),
+                    ("goal", "--from"),
+                )
             )
         )
     inst.agent_rules.parent.mkdir(parents=True, exist_ok=True)
@@ -8818,11 +8849,13 @@ def deliver_once(config: dict[str, Any], panes: dict[str, str]) -> list[tuple[st
         if typed:
             done.append((p["id"], typed))
     tick(config)  # the tokens' ledger: each agent's spending since its last look
-    with contextlib.suppress(OperationFailed):
-        handle_proposals(config, read_log_tick())
     tell_outside_changes(config)
     tell_setting_changes(config)
     send_briefs(config)
+    # After what the room says of the settings: a proposal's card opens in the chat once all said before it is
+    # shown — so the lines and assignments of this tick are in the log when its state turns «pending».
+    with contextlib.suppress(OperationFailed):
+        handle_proposals(config, read_log_tick())
     with contextlib.suppress(OperationFailed):
         lead_round(config, read_log_tick())
     return done
@@ -8898,7 +8931,12 @@ def handle_proposals(config: dict[str, Any], recent: list[dict[str, Any]]) -> No
         req = request_of(m, config, messages)
         changes = prop.get("changes") or []
         lead = next((q for q in config["participants"] if q["id"] == m.get("from")), {})
-        own_session = bool(prop.get("session")) and prop.get("session") == lead.get("claude_session")
+        # Only a Claude lead has a session of its own the room bound: a Codex lead's every proposal waits for the Enter.
+        own_session = (
+            agent_kind(lead) == "claude"
+            and bool(prop.get("session"))
+            and prop.get("session") == lead.get("claude_session")
+        )
         narrow = (
             req is not None
             and own_session
@@ -8960,9 +8998,22 @@ def brief_path() -> Path:
     return room().paths.state_dir / "briefs.json"
 
 
+def lead_command(command: str, rest: str, config: dict[str, Any]) -> str:
+    """One of the lead's commands, ready to run as the lead runs it: a Codex lead through its read-only copy."""
+    lead = lead_of(config)
+    p = next((q for q in config["participants"] if q["id"] == lead), {})
+    return room_cmd(command, rest, str(p.get("cli") or ""), lead)
+
+
+def brief_of(pid: str, config: dict[str, Any], version: int = 0) -> str:
+    """store.brief with the lead's own command to propose a change, as it runs it."""
+    propose = lead_command("propose", f"--from {pid}", config) if pid == lead_of(config) else ""
+    return brief(pid, config, version, propose)
+
+
 def brief_version(pid: str, config: dict[str, Any]) -> tuple[str, int]:
     """The agent's assignment and its version: the one last sent while it is the same, the next once it changed."""
-    text = brief(pid, config)
+    text = brief_of(pid, config)
     old = as_dict(read_json(brief_path()).get(pid))
     same = old.get("hash") == hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
     version = int(old.get("v") or 0) if isinstance(old.get("v"), int) else 0
@@ -8971,7 +9022,7 @@ def brief_version(pid: str, config: dict[str, Any]) -> tuple[str, int]:
 
 def current_brief(pid: str, config: dict[str, Any]) -> str:
     text, version = brief_version(pid, config)
-    return brief(pid, config, version) if text else ""
+    return brief_of(pid, config, version) if text else ""
 
 
 def assignment_state(pid: str, config: dict[str, Any], messages: list[dict[str, Any]]) -> str:
@@ -8980,7 +9031,7 @@ def assignment_state(pid: str, config: dict[str, Any], messages: list[dict[str, 
     p = next((q for q in config["participants"] if q["id"] == pid), {})
     if p.get("joined") == "pending":
         return words_in("state.starting", room_language(config))
-    if not brief(pid, config):
+    if not brief_of(pid, config):
         return ""
     sent = [m for m in messages if m.get("from") == ROOM and m.get("brief") is True and m.get("to") == [pid]]
     if not sent:
@@ -9098,9 +9149,9 @@ def lead_round(config: dict[str, Any], messages: list[dict[str, Any]]) -> None:
             tr("The team's round (every {n} min):", lang, n=minutes),
             *lines,
             tr(
-                "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: collab goal reached --from {lead}.",
+                "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: {cmd}",
                 lang,
-                lead=lead,
+                cmd=lead_command("goal", f"--from {lead} reached", config),
             ),
         ]
     )
@@ -9132,7 +9183,7 @@ def send_briefs(config: dict[str, Any]) -> None:
         )
         if old.get("hash") == digest and not again:
             continue
-        append_message(ROOM, [pid], brief(pid, config, version), brief=True)
+        append_message(ROOM, [pid], brief_of(pid, config, version), brief=True)
         state[pid] = {"hash": digest, "v": version, "pane": str(p.get("pane_pid", "")), "at": time.time()}
         changed = True
     if changed:
@@ -9480,7 +9531,9 @@ def trim_due(p: dict[str, Any], config: dict[str, Any], messages: list[dict[str,
     if rule == HANDOFF_CLEAR:
         # Handed in: its answer (--re) to a task from whom it reports to, since its last /clear.
         to = reports_to(agent_kind(p), p, config)
-        asked = {m["id"] for m in messages if m.get("from") == to and p["id"] in m.get("to", [])}
+        # «The person» is no id: a task of theirs comes from any of the room's people.
+        givers = people_ids(config) if to == "person" else [to]
+        asked = {m["id"] for m in messages if m.get("from") in givers and p["id"] in m.get("to", [])}
         given = str(done.get("given") or "")
         handed = any(m.get("from") == p["id"] and m.get("re") in asked and str(m.get("at") or "") > given for m in messages)
         if not handed or in_merge_queue(p["id"]) or owes_answer(p["id"], config, messages, given):
@@ -14428,12 +14481,14 @@ def chat_pump(ctx: ChatFeedContext) -> None:
                 try:
                     shown = ctx.ui.proposals_shown
                     waiting = [k for k, v in proposal_state().items() if v == "pending" and k not in shown]
-                    if waiting:
+                    everything = read_messages() if waiting else []
+                    at = next((i for i, x in enumerate(everything) if x.get("id") == waiting[0]), -1) if waiting else -1
+                    # What came after the proposal and is not on the screen yet goes first, on the next tick: a card
+                    # opened over it held it back, and it poured out after the person's answer, over the answer's
+                    # own line.
+                    if waiting and not any(x.get("id") not in ctx.printed for x in everything[at + 1 :]):
                         shown.add(waiting[0])  # the rest open one by one, each when no question is open
-                        everything = read_messages()
-                        m = next(
-                            (x for x in everything if x.get("id") == waiting[0] and isinstance(x.get("proposal"), dict)), None
-                        )
+                        m = everything[at] if at >= 0 and isinstance(everything[at].get("proposal"), dict) else None
                         if m is not None:
                             cfg = load_config()
                             req = request_of(m, cfg, everything) or {}  # only the person's own request is shown as one
@@ -16812,7 +16867,15 @@ def repeated_identity(argv: list[str]) -> str:
     return ""
 
 
-IDENTITY_FLAG = {"say": ("--from", "sender"), "ack": ("--for", "participant"), "inbox": ("--for", "participant")}
+# What a room-started Codex may run through its read-only copy, and the flag that names who runs it: the lead's two
+# commands with the answers' three — each writes only the room's journal or its state, and only as that one id.
+IDENTITY_FLAG = {
+    "say": ("--from", "sender"),
+    "ack": ("--for", "participant"),
+    "inbox": ("--for", "participant"),
+    "propose": ("--from", "sender"),
+    "goal": ("--from", "sender"),
+}
 
 
 def rule_shape_differs(argv: list[str], args: argparse.Namespace) -> str:
@@ -16880,7 +16943,7 @@ def main() -> None:
     # COLLAB_SAFE_DIR switched the check off). And the check of links runs for every answer, copy
     # or not: for a plain room it costs nothing.
     if re.fullmatch(r"collab-[0-9a-f]{16}", Path(SELF).name) and sys.argv[1:2] and sys.argv[1] not in IDENTITY_FLAG:
-        fail(tr("this copy of collab only answers in a room: say, ack, inbox"))
+        fail(tr("this copy of collab only answers in a room: say, ack, inbox, propose, goal"))
     if sys.argv[1:2] and sys.argv[1] in IDENTITY_FLAG:
         guard_room_state()
     if args.func is cmd_chat:
