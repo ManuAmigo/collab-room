@@ -8,9 +8,10 @@ from typing import Any
 # button: its words as the program shows them, every option, the one selected. Only programs and versions whose
 # dialogs were read live and whose keys were tried; anything else — no buttons, the person answers on the computer.
 #
-# Claude Code 2.1 (2.1.310 tried): the dialog sits under the last full-width rule «────»; its last line is
-# «Esc to cancel · Tab to amend»; options «❯ 1. Yes» / «  2. …», a long one wrapped by Claude itself onto lines
-# indented under it. A digit selects AND confirms at once.
+# Claude Code 2.1 (2.1.310 tried): the dialog sits under the last rule «────» exactly as wide as the window, its title
+# on the next line; its last line is «Esc to cancel · Tab to amend»; options «❯ 1. Yes» / «  2. …», a long one wrapped
+# by Claude itself onto lines indented under it. Every line of it but the program's «╌╌╌» is indented: the agent's
+# command and words are, so a line at the first column inside it is not the program's. A digit selects AND confirms.
 # Codex 0.163: the dialog begins at «Would you like to …?» and ends with «Press enter to confirm or esc to cancel»;
 # options «› 1. Yes, proceed (y)». A digit selects and confirms at once.
 CLAUDE_VERSION = re.compile(r"2\.1\.\d+")
@@ -19,6 +20,7 @@ CLAUDE_END = re.compile(r"^\s*Esc to cancel · Tab to amend\s*$")
 CODEX_END = re.compile(r"^\s*Press enter to confirm or esc to cancel\s*$")
 CODEX_TITLE = re.compile(r"^  Would you like to [^\n?]+\?$")
 RULE = re.compile(r"^─{20,}$")
+CLAUDE_TITLE = re.compile(r"^ \S.*$")
 DOTS = re.compile(r"^╌{20,}$")
 OPTION = {
     "claude": re.compile(r"^ (❯| ) (\d)\. (\S.*)$"),
@@ -45,8 +47,9 @@ def program_version(kind: str, program: str, pane_pid: str) -> str:
     return ""
 
 
-def read_prompt(kind: str, version: str, screen: str) -> dict[str, Any] | None:
-    """The question an agent's program asks now, from its window's plain text: {"lines": its words as shown,
+def read_prompt(kind: str, version: str, screen: str, width: int) -> dict[str, Any] | None:
+    """The question an agent's program asks now, from its window's plain text (wrapped lines joined) and its width:
+    {"lines": its words as shown,
     "options": [{"n", "lines"}], "selected": n, "print": what tells this question from any other}. None — no
     question this version's dialog has, or not all of it on the screen: no option is guessed."""
     if not (kind == "claude" and CLAUDE_VERSION.fullmatch(version)) and not (
@@ -60,6 +63,17 @@ def read_prompt(kind: str, version: str, screen: str) -> dict[str, Any] | None:
         return None
     if kind == "claude":
         top = max((i for i, line in enumerate(lines) if RULE.match(line)), default=-1)
+        # The program's rule spans the window, its title right under it. A rule-like line the agent's words made —
+        # a long line the terminal wrapped — is no top: the dialog's own lines above it would be hidden from the card.
+        if top < 0 or len(lines[top]) != width or top + 1 >= len(lines) or not CLAUDE_TITLE.match(lines[top + 1]):
+            return None
+        inner = lambda line: not line or line.startswith(" ") or bool(DOTS.match(line))  # a line a dialog has
+        if not all(inner(line) for line in lines[top + 1 : -1]):
+            return None
+        # Nor the rule of a dialog inside another: one more such rule above, only a dialog's lines between them.
+        above = [i for i in range(max(0, top - MAX_LINES), top) if lines[i] == "─" * width]
+        if above and all(inner(line) for line in lines[above[-1] + 1 : top]):
+            return None
     else:
         # Its title is the program's own line: two spaces in, after an empty one. The command and its reason are the
         # agent's words inside the dialog — a «Would you like to …?» among them would move where the dialog seems to

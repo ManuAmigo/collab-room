@@ -4,6 +4,12 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.21
+
+- A Codex agent can send you files with `collab say --file`, under the same checks as everyone else. · Агент Codex может присылать вам файлы через `collab say --file` — с теми же проверками, что у всех.
+- A file from Telegram is saved under a name the room makes; its own name is only shown, never given as a path. · Файл из Telegram сохраняется под именем, которое даёт комната; его собственное имя только показывается и никогда не идёт путём.
+- A permission question is read more strictly: a long line the terminal wrapped can no longer hide part of the command on its card. · Вопрос о разрешении читается строже: длинная строка, перенесённая терминалом, больше не может спрятать часть команды на карточке.
+
 ## 0.1.20
 
 - Telegram: an album comes to the agent as one message, files in order, captions joined. · Telegram: альбом приходит агенту одним сообщением — файлы по порядку, подписи вместе.

@@ -1012,10 +1012,6 @@ def main() -> None:
     # or not: for a plain room it costs nothing.
     if re.fullmatch(r"collab-[0-9a-f]{16}", Path(m_boot.SELF).name) and sys.argv[1:2] and sys.argv[1] not in IDENTITY_FLAG:
         m_store.fail(m_i18n.tr("this copy of collab only answers in a room: say, ack, inbox, propose, goal"))
-    if re.fullmatch(r"collab-[0-9a-f]{16}", Path(m_boot.SELF).name) and getattr(args, "files", None):
-        # Its rule lets a Codex answer in the room without asking; a file out of the project is more than an answer,
-        # and opens to it only by its own agreed change of that rule.
-        m_store.fail(m_i18n.tr("--file is not open to this copy of collab yet: tell the person where the file is"))
     if sys.argv[1:2] and sys.argv[1] in IDENTITY_FLAG:
         guard_room_state()
     if args.func is m_chat.cmd_chat:

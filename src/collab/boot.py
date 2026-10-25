@@ -110,7 +110,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.20"
+VERSION = "0.1.21"
 
 
 # Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.

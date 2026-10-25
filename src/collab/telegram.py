@@ -12,7 +12,6 @@ import stat
 import sys
 import threading
 import time
-import unicodedata
 import urllib.parse
 import uuid
 from pathlib import Path
@@ -26,6 +25,7 @@ import collab.log as m_log
 import collab.ledger as m_ledger
 import collab.screen as m_screen
 import collab.prompts as m_prompts
+import collab.deliver as m_deliver
 import collab.agents as m_agents
 import collab.lifecycle as m_lifecycle
 
@@ -249,21 +249,14 @@ FILE_ID = re.compile(r"[0-9a-f]{16}")
 SHA = re.compile(r"[0-9a-f]{64}")
 
 
-def file_name(raw: object, taken: set[str]) -> str:
-    """A file's name as it lands in the inbox: its last part only, no controls, no leading dots, a fallback for
-    nothing left; another of the same name in one message gets «-2»."""
-    name = "".join(c for c in str(raw).replace("\\", "/").rsplit("/", 1)[-1] if c.isprintable() and c not in '<>:"|?*')
-    name = name.strip().lstrip(".") or "file"
-    while len(name.encode("utf-8")) > 160:  # a name is up to 255 bytes on disk, with room for «-2» and a temporary one
-        name = name[:-1]
-    stem, dot, ext = name.rpartition(".") if "." in name else (name, "", "")
-    shown, n = name, 1
-    same = lambda x: unicodedata.normalize("NFD", x).casefold()  # one file to APFS: case and composition alike
-    while same(shown) in taken:
-        n += 1
-        shown = f"{stem}-{n}{dot}{ext}"
-    taken.add(same(shown))
-    return shown
+def file_name(raw: object, n: int) -> tuple[str, str]:
+    """A file's name on disk and as shown. On disk — one the room makes, file-<n> with its extension if a plain one:
+    the name it came with is anyone's («a$(…).pdf», a forwarded file keeps its sender's), and an agent puts the path in
+    its shell. Shown — that name: its last part, no controls, no leading dots, text only."""
+    shown = "".join(c for c in str(raw).replace("\\", "/").rsplit("/", 1)[-1] if c.isprintable())
+    shown = shown.strip().lstrip(".")[:120] or "file"
+    ext = shown.rpartition(".")[2].lower() if "." in shown else ""
+    return f"file-{n}" + (f".{ext}" if re.fullmatch(r"[a-z0-9]{1,10}", ext) else ""), shown
 
 
 def inbox_dir(mid: str) -> Path:
@@ -306,18 +299,18 @@ def receive(state: dict[str, Any], msg: dict[str, Any]) -> list[dict[str, Any]] 
     if not isinstance(files, list) or len(files) > 10 or not AGENT_ID.fullmatch(mid):
         return None
     folder = inbox_dir(mid)
-    taken: set[str] = set()
     got: list[dict[str, Any]] = []
-    for f in files:
+    for n, f in enumerate(files, 1):
         fid, size, sha = (f.get(k) for k in ("id", "size", "sha")) if isinstance(f, dict) else (None, None, None)
         if not (isinstance(fid, str) and FILE_ID.fullmatch(fid) and type(size) is int and 0 <= size <= FILE_MAX
                 and isinstance(sha, str) and SHA.fullmatch(sha)):  # fmt: skip
             return None
-        dest = folder / file_name(f.get("name") or "file", taken)
+        disk, shown = file_name(f.get("name") or "file", n)
+        dest = folder / disk
         mime = m_text.clean_field(str(f.get("mime") or ""), 80)
         if not (dest.is_file() and not dest.is_symlink() and dest.stat().st_size == size and sha_of(dest) == sha):
             fetch(state, fid, dest, size, sha)
-        got.append({"path": str(dest), "name": dest.name, "mime": mime, "size": size})
+        got.append({"path": str(dest), "name": shown, "mime": mime, "size": size})
     return got
 
 
@@ -339,17 +332,27 @@ def own_copy(f: dict[str, Any]) -> Path | None:
 def drop_copy(f: dict[str, Any]) -> None:
     """The copy of an agent's file once sent: its own folder in the room's outbox, nothing else."""
     path = own_copy(f)
-    if path is not None:
-        shutil.rmtree(path.parent, ignore_errors=True)
+    if path is None:
+        return
+    with contextlib.suppress(OSError):
+        fd = m_deliver.outbox_fd()
+        try:
+            shutil.rmtree(path.parent.name, dir_fd=fd, ignore_errors=True)
+        finally:
+            os.close(fd)
 
 
 def sweep_copies(days: float = 7) -> None:
     """Copies never sent (Telegram not linked, or said before it was): gone after a week."""
-    outbox = m_store.room().paths.state_dir / "outbox"
     with contextlib.suppress(OSError):
-        for d in outbox.iterdir():
-            if COPY_DIR.fullmatch(d.name) and not d.is_symlink() and time.time() - d.stat().st_mtime > days * 86400:
-                shutil.rmtree(d, ignore_errors=True)
+        fd = m_deliver.outbox_fd()
+        try:
+            for name in os.listdir(fd):
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if COPY_DIR.fullmatch(name) and stat.S_ISDIR(st.st_mode) and time.time() - st.st_mtime > days * 86400:
+                    shutil.rmtree(name, dir_fd=fd, ignore_errors=True)
+        finally:
+            os.close(fd)
 
 
 def upload(state: dict[str, Any], f: dict[str, Any]) -> str:
@@ -359,7 +362,15 @@ def upload(state: dict[str, Any], f: dict[str, Any]) -> str:
     if path is None:
         return ""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        box = m_deliver.outbox_fd()
+        try:
+            folder = os.open(path.parent.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=box)
+        finally:
+            os.close(box)
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=folder)
+        finally:
+            os.close(folder)
     except OSError:
         return ""
     st = os.fstat(fd)
@@ -610,15 +621,19 @@ def asking(p: dict[str, Any]) -> dict[str, Any] | None:
     version = m_prompts.program_version(m_screen.agent_kind(p), program, pane_pid)
     # With the lines above the screen: a long command scrolls the program's own title out of view, and a title-like
     # line the agent wrote into the command would then be the only one seen — the dialog would seem to begin there.
-    return m_prompts.read_prompt(m_screen.agent_kind(p), version, window_text(pane))
+    width = m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_width}", check=False).stdout.strip()
+    if not width.isdigit():
+        return None
+    return m_prompts.read_prompt(m_screen.agent_kind(p), version, window_text(pane), int(width))
 
 
 HISTORY = 200  # lines above the screen read with a question
 
 
 def window_text(pane: str) -> str:
-    """An agent's window as plain text, with the HISTORY lines above its screen; "" — not read."""
-    shown = m_tmuxio.tmux("capture-pane", "-p", "-S", f"-{HISTORY}", "-t", pane, check=False)
+    """An agent's window as plain text, with the HISTORY lines above its screen, a line the terminal wrapped joined
+    again (-J): its continuation is no line of its own; "" — not read."""
+    shown = m_tmuxio.tmux("capture-pane", "-p", "-J", "-S", f"-{HISTORY}", "-t", pane, check=False)
     return shown.stdout if shown.returncode == 0 else ""
 
 

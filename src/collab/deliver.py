@@ -205,6 +205,12 @@ def path_of_fd(fd: int) -> str | None:
     return None
 
 
+def outbox_fd() -> int:
+    """The room's outbox, every level opened refusing links: one linked away (to another room's) is an OSError."""
+    fd, _ = m_store.state_dir(m_store.room().paths.state_dir / "outbox" / "-", strict=False, create=False)
+    return fd
+
+
 def snapshot(path: str) -> dict[str, Any]:
     """An agent's file for the person, as it is now: a regular file of the project (its collab-inbox too), reached by
     no link out of it and through no hidden folder, its name not one of secrets; up to 50 MB. Copied into the room's
@@ -249,10 +255,13 @@ def snapshot(path: str) -> dict[str, Any]:
                 )
             )
         name = m_text.clean_field(parts[-1], 120) or "file"
-        folder = rp.state_dir / "outbox" / uuid.uuid4().hex[:16]
-        m_store.private_dir(folder, strict=False)
-        copy = folder / name
-        out_fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        copy = rp.state_dir / "outbox" / uuid.uuid4().hex[:16] / name
+        # Every level opened refusing links: an outbox swapped for a link (to ~/.claude/skills) took the copy there.
+        dir_fd, leaf = m_store.state_dir(copy)
+        try:
+            out_fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
         size = 0
         with os.fdopen(out_fd, "wb") as out:
             while chunk := src.read(1 << 16):
@@ -315,8 +324,13 @@ def post_message(args: argparse.Namespace, text: str) -> None:
             for path in paths:
                 files.append(snapshot(path))
         except BaseException:
-            for f in files:
-                shutil.rmtree(Path(f["path"]).parent, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                fd = outbox_fd()
+                try:
+                    for f in files:
+                        shutil.rmtree(Path(f["path"]).parent.name, dir_fd=fd, ignore_errors=True)
+                finally:
+                    os.close(fd)
             raise
     if files:
         size = lambda n: f"{n / 1024 / 1024:.1f} MB" if n >= 1024 * 1024 else f"{max(1, n // 1024)} KB"
