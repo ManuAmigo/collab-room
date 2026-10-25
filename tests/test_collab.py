@@ -16284,6 +16284,7 @@ class FakeBotServer:
         self.uploads: dict[str, tuple[str, bytes]] = {}  # what the room sent up: id -> (name, bytes)
         self.answered: dict[str, str] = {}
         self.refuse = False
+        self.unknown_words: set[str] = set()
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -16325,6 +16326,8 @@ class FakeBotServer:
                     acts = [a for a in fake.actions if a["id"] not in fake.answered]  # handed out until answered
                     return self.reply(200, {"events": events, "messages": waiting, "after": len(events), "actions": acts})
                 if tail == "actions":
+                    if body["word"] in fake.unknown_words:  # a bot from before that word
+                        return self.reply(400, {"error": "bad word"})
                     fake.answered[body["id"]] = body["word"]
                     return self.reply(200, {})
                 if tail.startswith("files/"):  # a file's bytes, as the bot hands them to the room
@@ -16535,7 +16538,23 @@ class TelegramTest(Base):
         agents = {a["id"]: a["restartable"] for a in self.mod.room_state(self.mod.load_config())["agents"]}
         self.assertEqual(agents, {"lea": True, "ann": False})
 
-    def test_an_action_that_broke_halfway_is_told_failed_and_never_done_again(self):
+    def test_a_restart_from_telegram_is_noted_with_the_agent_the_person_and_where_from(self):
+        cfg = json.loads(self.cfg.read_text())
+        cfg["participants"][1].update(started_by_room=True)  # Lea: the room's, a Claude
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        self.mod.enable(self.bot.url)
+        with seam(self.mod, "agents.restart_in_window", lambda *a: None):
+            self.assertEqual(self.mod.act_locked("restart", "lea", "s-1"), "done")
+        lines = [m["text"] for m in self.messages() if m["from"] == "room" and "Telegram" in m["text"]]
+        self.assertEqual(lines, ["Agent restarted: Lea. User: Андрей · via Telegram. The saved conversation has resumed."])
+
+        def halfway(*a):
+            raise SystemExit(1)
+
+        with seam(self.mod, "agents.restart_in_window", halfway):
+            self.assertEqual(self.mod.act_locked("restart", "lea", "s-1"), "unknown", "stopped on the way: not «failed»")
+
+    def test_an_action_that_broke_halfway_is_told_unknown_and_never_done_again(self):
         self.mod.enable(self.bot.url)
         self.bot.actions.append({"id": "b1", "kind": "pause", "to": ""})
         tries = []
@@ -16548,7 +16567,12 @@ class TelegramTest(Base):
             state = self.mod.take_in(self.mod.load(), 0)
             del self.bot.answered["b1"]  # the answer lost: handed out again
             self.mod.take_in(state, 0)
-        self.assertEqual((tries, self.bot.answered), ([True], {"b1": "failed"}))
+        self.assertEqual((tries, self.bot.answered), ([True], {"b1": "unknown"}), "begun, its end not known: never «failed»")
+        self.bot.actions.append({"id": "b2", "kind": "pause", "to": ""})
+        self.bot.unknown_words = {"unknown"}  # a bot from before «unknown»: told its older word
+        with seam(self.mod, "lifecycle.set_paused", broken):
+            self.mod.take_in(self.mod.load(), 0)
+        self.assertEqual(self.bot.answered["b2"], "failed")
 
     def asking_room(self) -> None:
         cfg = json.loads(self.cfg.read_text())

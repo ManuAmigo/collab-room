@@ -4,6 +4,11 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.22
+
+- Telegram `/control`: an action that failed and changed nothing is told apart from one whose end is unknown («could not confirm — do not repeat»); the final card names who pressed. · Telegram `/control`: действие, которое не удалось и ничего не изменило, отличается от действия с неизвестным исходом («не удалось подтвердить — не повторяйте»); на итоговой карточке — кто нажал.
+- The room's log line for an agent restarted from Telegram says who and that the saved conversation went on. · Строка журнала о перезапуске агента из Telegram говорит, кто перезапустил и что сохранённый разговор продолжен.
+
 ## 0.1.21
 
 - A Codex agent can send you files with `collab say --file`, under the same checks as everyone else. · Агент Codex может присылать вам файлы через `collab say --file` — с теми же проверками, что у всех.

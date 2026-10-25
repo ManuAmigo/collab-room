@@ -848,9 +848,9 @@ def act_locked(kind: str, to: str, sid: str) -> str:
     try:
         m_agents.restart_in_window(config.get("session", "collab-room"), p, m_screen.agent_kind(p), sid)
     except (m_store.OperationFailed, SystemExit):
-        return "failed"
-    m_log.room_line(people, "{who} restarted {name} from Telegram; its conversation continues.", who=who,
-                    name=m_text.visible(m_store.label_of(config, to)))  # fmt: skip
+        return "unknown"  # stopped somewhere on the way: the old window may be gone, the new one may be up
+    name = m_text.visible(m_store.label_of(config, to))
+    m_log.room_line(people, "Agent restarted: {name}. User: {who} · via Telegram. The saved conversation has resumed.", who=who, name=name)  # fmt: skip
     return "done"
 
 
@@ -875,19 +875,26 @@ def take_in(state: dict[str, Any], wait: float) -> dict[str, Any]:
         if not AGENT_ID.fullmatch(aid):
             continue
         # Handed out again (an answer lost): its answer again, never the action twice — marked before it is done, so
-        # one that broke halfway is not done again either.
+        # one that broke halfway is not done again either, and is «unknown»: begun, its end not known. «failed» is
+        # only what the room refused before doing anything.
         word = acted.get(aid, "")
         if not word:
-            acted = {**dict(list(acted.items())[-49:]), aid: "failed"}
+            acted = {**dict(list(acted.items())[-49:]), aid: "unknown"}
             state = update(acted=acted)
             try:
                 kind = a.get("kind")
                 word = screen_shot(state, a) if kind == "snapshot" else prepare_video(a) if kind == "prepare" else act(a)
-            except Exception:  # noqa: BLE001 — told as failed; the person looks on the computer
-                word = "failed"
+            except Exception:  # noqa: BLE001 — told as unknown; the person looks on the computer
+                word = "unknown"
             acted = {**acted, aid: word}
             state = update(acted=acted)
-        call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/actions", {"id": aid, "word": word}, state["token"])
+        try:
+            call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/actions", {"id": aid, "word": word}, state["token"])
+        except Refused as exc:
+            if exc.status != 400 or word != "unknown":
+                raise
+            # A bot from before «unknown»: its older word, which it shows as not confirmed.
+            call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/actions", {"id": aid, "word": "failed"}, state["token"])
     done: list[tuple[str, str]] = []
     for m in got.get("messages") or []:
         if not isinstance(m, dict):

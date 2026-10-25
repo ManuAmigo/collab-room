@@ -1149,9 +1149,9 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "{who} resumed delivery from Telegram.",
         "ru": "{who}: доставка возобновлена из Telegram.",
     },
-    "t.37aa4e8f6e": {
-        "en": "{who} restarted {name} from Telegram; its conversation continues.",
-        "ru": "{who}: перезапуск {name} из Telegram; разговор продолжается.",
+    "t.5ba6b1d2d8": {
+        "en": "Agent restarted: {name}. User: {who} · via Telegram. The saved conversation has resumed.",
+        "ru": "Агент перезапущен: {name}. Пользователь: {who} · из Telegram. Сохранённый разговор возобновлён.",
     },
     "t.743cf8bab2": {
         "en": "{who} chose «{option}» for {name} from Telegram.",
