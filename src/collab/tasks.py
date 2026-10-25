@@ -21,6 +21,20 @@ LANES = ("A", "B", "C")
 # «.», «-», «_». No spaces, no control codes: the id goes into a report's table as it is.
 TASK_ID = re.compile(r"[^\W_][\w.\-]{0,39}")
 COMMIT = re.compile(r"[0-9a-f]{7,40}")
+# A plan's file, inside the room's folder: a relative path of plain parts — no «..», no leading «/», no control codes.
+# Only the path goes into the agent's brief after a /clear; the agent reads the file itself.
+PLAN = re.compile(r"(?!/)(?!.*(?:^|/)\.\.(?:/|$))[\w.\-/]{1,200}")
+
+
+def check_plan(plan: str) -> str:
+    if not PLAN.fullmatch(plan):
+        m_store.fail(
+            m_i18n.tr(
+                "a plan is a file inside the room's folder, a relative path of letters, digits, «.», «-», «_» and «/», no «..»: {plan}",
+                plan=repr(plan),
+            )
+        )
+    return plan
 
 
 def check_task_id(task: str) -> str:
@@ -46,6 +60,8 @@ def is_task_record(rec: Any) -> bool:
     if not (by == "" or (isinstance(by, str) and TASK_ID.fullmatch(by))):
         return False
     if not isinstance(since, str):
+        return False
+    if "plan" in rec and not (isinstance(rec["plan"], str) and PLAN.fullmatch(rec["plan"])):
         return False
     try:
         dt.datetime.fromisoformat(since)  # the time m_store.now() wrote, nothing else
@@ -102,9 +118,12 @@ def log_task_event(rec: dict[str, Any]) -> None:
 
 
 @m_store.room_locked
-def task_take(pid: str, task: str, kind: str, lane: str = "", by: str = "") -> dict[str, Any]:
-    """`pid` is on `task` from now. The one it was on, if another, is left — not done."""
+def task_take(pid: str, task: str, kind: str, lane: str = "", by: str = "", plan: str = "") -> dict[str, Any]:
+    """`pid` is on `task` from now. The one it was on, if another, is left — not done. `plan`: the file it keeps
+    its plan in, given back to it after its context is cleared."""
     check_task_id(task)
+    if plan:
+        check_plan(plan)
     if kind not in KINDS:
         m_store.fail(m_i18n.tr("kind is one of: {p0}", p0=", ".join(KINDS)))
     if lane and lane not in LANES:
@@ -115,7 +134,7 @@ def task_take(pid: str, task: str, kind: str, lane: str = "", by: str = "") -> d
     was = data.get(pid)
     if was and was["task"] != task:
         log_task_event({"at": at, "event": "left", "pid": pid, "task": was["task"]})
-    rec = {"task": task, "kind": kind, "lane": lane, "by": by, "since": at}
+    rec = {"task": task, "kind": kind, "lane": lane, "by": by, "since": at, **({"plan": plan} if plan else {})}
     log_task_event({"at": at, "event": "take", "pid": pid, "task": task, "kind": kind, "lane": lane, "by": by})
     data[pid] = rec
     m_store.write_json(rp.state_dir / "tasks.json", data)

@@ -90,7 +90,8 @@ class UpdateTest(unittest.TestCase):
         work = self.root / "releases"
         if not work.exists():
             self.git("init", "-q", "-b", "main", str(work))
-            self.git("init", "-q", "--bare", str(self.public))
+            # The clone checks out the branch the bare repository names: git before 3.0 names master.
+            self.git("init", "-q", "--bare", "-b", "main", str(self.public))
             self.git("remote", "add", "origin", str(self.public), cwd=work)
         text = COLLAB.read_text(encoding="utf-8").replace(f'VERSION = "{OLD}"', f'VERSION = "{says or version}"')
         if broken:

@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
-"""collab-room: local message room and tmux launcher for teams of people and AI agents.
+#!/bin/sh
+""":"
+exec python3 -I -S -c 'import sys;f=sys.argv[1];s=open(f,"rb").read();exec(s[s.index(b"# fast-start"+b":begin"):s.index(b"# fast-start"+b":end")]);_fast_start(f,s)' "$0" "$@"
+collab-room: local message room and tmux launcher for teams of people and AI agents.
 
 The room is a local append-only log (.collab/messages.jsonl). Every participant is a
 stable `id` from .collab.json; the number of participants is not fixed.
@@ -14,17 +16,165 @@ Delivery is explicit and per participant:
 """
 
 from __future__ import annotations
+
+# fast-start:begin
 import contextlib
 import hashlib
+import importlib.util
 import json
+import marshal
 import os
 import re
 import stat
 import sys
 import tempfile
+import time
+import types
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+# Python compiles a script whole on every run — two thirds of a short command's time — and keeps the
+# compiled code only for modules it imports. Started as a command (the `collab` on PATH, Claude's hooks), the
+# file's first lines are sh: they run this block alone, which takes the compiled program from the person's
+# own cache, or compiles it and keeps it there. `python3 collab` reads those lines as the docstring and
+# compiles as before. Only the standard library, nothing of the program: it runs before the program exists,
+# on whatever python3 is first on PATH (3.9 too). -I: neither the current folder nor PYTHON* settings reach
+# the imports — a json.py where the command is run would otherwise be the json the program imports
+# (PYTHONUTF8, PYTHONWARNINGS… are not read either, as in the hand-over to a newer Python).
+# The key is the file's content, the interpreter's version and bytecode magic: a changed file is a
+# new key, never stale code. The cache is the person's own folder, closed to everyone else and never in a
+# temporary folder (a HOME there is one Codex may write); a file there is taken only when it is theirs, no one
+# else may write it and its code matches the hash in its head — compiled code runs as it is, unchecked, and
+# marshal crashes the interpreter on some damaged data, every run, rather than raise.
+# Anything wrong with the cache (missing, broken, foreign) — compiled as without it, never an error.
+
+# Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
+TEMP_FOLDERS = ("/private/", "/tmp/", "/var/folders/")
+
+
+def in_temp_folder(real: str) -> bool:
+    """A real path in a temporary folder — where Codex writes by default. A fixed list: no setting
+    loosens a security check. Case-folded on macOS: its disks ignore case and realpath keeps the case it
+    was given — /PRIVATE/TMP/x is /private/tmp/x. No temporary folder to be found: counted as one."""
+    fold = (lambda x: x.casefold()) if sys.platform == "darwin" else (lambda x: x)
+    try:
+        temp = os.path.realpath(tempfile.gettempdir())
+    except OSError:
+        return True
+    return fold(real + "/").startswith(tuple(fold(t) for t in (*TEMP_FOLDERS, temp + "/")))
+
+
+FAST_KEEP = 16  # compiled versions kept: one per content, a developer's edits make many
+FAST_TMP_AGE = 600  # seconds: a temporary file older than that is a write that was killed
+
+
+def fast_folder() -> str:
+    return os.path.join(os.path.expanduser("~"), ".collab-room", "code")
+
+
+def _fast_safe_folder(folder: str) -> bool:
+    """A real folder (not a link), this user's, with no rights for anyone else; its parent this user's
+    too and writable by no one else — else the folder could be swapped beneath us."""
+    try:
+        parent, own = os.lstat(os.path.dirname(folder)), os.lstat(folder)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(parent.st_mode)
+        and stat.S_ISDIR(own.st_mode)
+        and parent.st_uid == own.st_uid == os.getuid()
+        and not parent.st_mode & 0o022
+        and not own.st_mode & 0o077
+        and not in_temp_folder(os.path.realpath(folder))
+    )
+
+
+def _fast_head(key: str, code: bytes) -> bytes:
+    return b"collab code " + key.encode() + b" " + hashlib.sha256(code).hexdigest().encode() + b"\n"
+
+
+def _fast_cached(folder: str, key: str, path: str) -> Any:
+    """The compiled program kept under `key`, or None."""
+    if not _fast_safe_folder(folder):
+        return None
+    try:
+        fd = os.open(os.path.join(folder, key), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as f:
+        try:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022 or st.st_nlink != 1:
+                return None
+            head, _, data = f.read().partition(b"\n")
+        except OSError:  # a disk that fails the read: compiled as without the cache
+            return None
+        if head + b"\n" != _fast_head(key, data):
+            return None
+        try:
+            code = marshal.loads(data)
+        except Exception:  # whatever marshal raises on data that passed the hash
+            return None
+        if not isinstance(code, types.CodeType):
+            return None
+        with contextlib.suppress(OSError):
+            os.utime(f.fileno())  # in use: the last to be cleaned away
+    # The same content at another path (a clone and its installed copy): tracebacks name the file run.
+    return code if code.co_filename == path else _fast_named(code, path)
+
+
+def _fast_named(code: Any, path: str) -> Any:
+    consts = tuple(_fast_named(c, path) if isinstance(c, types.CodeType) else c for c in code.co_consts)
+    return code.replace(co_filename=path, co_consts=consts)
+
+
+def _fast_keep(folder: str, key: str, code: Any) -> None:
+    """Kept for the next run — written whole under a temporary name, then put in place; the oldest
+    beyond FAST_KEEP go."""
+    with contextlib.suppress(FileExistsError, OSError):
+        os.mkdir(os.path.dirname(folder), 0o700)
+    with contextlib.suppress(FileExistsError, OSError):
+        os.mkdir(folder, 0o700)
+    if not _fast_safe_folder(folder):
+        return
+    tmp = os.path.join(folder, f".{key}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            data = marshal.dumps(code)
+            f.write(_fast_head(key, data) + data)
+        os.replace(tmp, os.path.join(folder, key))
+        names = os.listdir(folder)
+        kept = [os.path.join(folder, n) for n in names if len(n) == 64 and not n.startswith(".")]
+        kept.sort(key=lambda n: os.lstat(n).st_mtime)
+        left = [os.path.join(folder, n) for n in names if n.startswith(".") and n.endswith(".tmp")]
+        for old in kept[:-FAST_KEEP] + [n for n in left if os.lstat(n).st_mtime < time.time() - FAST_TMP_AGE]:
+            os.unlink(old)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+
+
+def _fast_start(path: str, source: bytes) -> None:
+    """Run the program in `source` (the file at `path`) as `python3 path` would."""
+    key = hashlib.sha256(
+        importlib.util.MAGIC_NUMBER + sys.version.encode() + bytes([sys.flags.optimize]) + b"\0" + source
+    ).hexdigest()
+    folder = fast_folder()
+    code = _fast_cached(folder, key, path)
+    if code is None:
+        code = compile(source, path, "exec", dont_inherit=True)
+        _fast_keep(folder, key, code)
+    sys.argv[:] = sys.argv[1:]
+    main = sys.modules["__main__"].__dict__
+    for name in [n for n in main if not n.startswith("__")]:
+        del main[name]  # the start's own names: the program finds a module as fresh as a script's
+    main["__file__"] = path
+    exec(code, main)
+
+
+# fast-start:end
 
 
 @dataclass(frozen=True)
@@ -110,17 +260,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.22"
-
-
-# Temporary folders: Codex writes there by default (workspace-write); no room, agent or Python lives there.
-TEMP_FOLDERS = ("/private/", "/tmp/", "/var/folders/")
-
-
-def in_temp_folder(real: str) -> bool:
-    """A real path in a temporary folder — where Codex writes by default. A fixed list: no setting
-    loosens a security check."""
-    return (real + "/").startswith((*TEMP_FOLDERS, os.path.realpath(tempfile.gettempdir()) + "/"))
+VERSION = "0.1.23"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:

@@ -4,6 +4,13 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.23
+
+- collab starts about twice as fast when run as a command (and so do the Claude hooks): the compiled program is kept in `~/.collab-room/code`, checked by the hash of its code and by its owner and rights; anything else is compiled as before. · collab запускается примерно вдвое быстрее командой (и хуки Claude тоже): скомпилированная программа хранится в `~/.collab-room/code`, сверяется по хешу кода, владельцу и правам; иначе компилируется как раньше.
+- «Clear after handing in» waits while the agent still holds a task; after any /clear or /compact the agent is told where it was — its task, its last message, its plan file. · «Очищать после сдачи» ждёт, пока у агента взятая задача; после любого /clear или /compact агенту напоминается, где он был — задача, его последнее сообщение, файл плана.
+- The lead's round tells of an agent whose screen has not changed for 20 minutes while it works on a task, with its last lines; a busy agent (working, in background, landing) is called neither silent nor free. · Обход ведущего сообщает об агенте, чей экран не менялся 20 минут при взятой задаче, с последними строками; занятого агента (работает, фон, влитие) обход не называет ни молчащим, ни свободным.
+- The full test suite runs on four processes when the machine is free; a test run gives a short summary, its output stays in a file. · Полный набор тестов идёт в четыре процесса, когда машина свободна; итог прогона — коротко, вывод остаётся в файле.
+
 ## 0.1.22
 
 - Telegram `/control`: an action that failed and changed nothing is told apart from one whose end is unknown («could not confirm — do not repeat»); the final card names who pressed. · Telegram `/control`: действие, которое не удалось и ничего не изменило, отличается от действия с неизвестным исходом («не удалось подтвердить — не повторяйте»); на итоговой карточке — кто нажал.

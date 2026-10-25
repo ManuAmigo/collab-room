@@ -121,6 +121,13 @@ class BuildTest(unittest.TestCase):
         def python_counts(src: str) -> set:
             table = symtable.symtable(src, "m", "exec")
             names = {s.get_name() for s in table.get_symbols() if s.is_assigned() or s.is_imported()}
+            # 3.12 inlines the module's list, set and dict comprehensions into it (PEP 709) and counts
+            # their variables there; 3.11 keeps each a table of its own. The build counts them, as 3.12 does.
+            inlined = [c for c in table.get_children() if c.get_name() in ("listcomp", "setcomp", "dictcomp")]
+            while inlined and sys.version_info < (3, 12):
+                comp = inlined.pop()
+                names |= {s.get_name() for s in comp.get_symbols() if s.is_assigned() and s.get_name() != ".0"}
+                inlined.extend(c for c in comp.get_children() if c.get_name() in ("listcomp", "setcomp", "dictcomp"))
             stack = list(table.get_children())
             while stack:
                 child = stack.pop()

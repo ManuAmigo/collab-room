@@ -4,6 +4,7 @@ location of collab, Claude Code and Codex point into the test's temporary folder
 import atexit
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -51,9 +52,37 @@ if _outside_temp(_CACHE.parent):
     atexit.register(shutil.rmtree, TEST_ROOTS, True)
 
 
+# collab run as a command keeps its compiled program in HOME (~/.collab-room/code); every test has a HOME of
+# its own, so each would compile it again. Compiled once per process, by collab itself — the key is its
+# business — and put into each test's HOME as collab would have kept it.
+_COMPILED: list[Path] = []
+
+
+def _compiled() -> list[Path]:
+    if not _COMPILED and TEST_ROOTS:
+        home = Path(tempfile.mkdtemp(prefix="compiled-", dir=TEST_ROOTS))
+        program = Path(__file__).resolve().parents[1] / "collab"
+        subprocess.run([str(program), "--version"], env={**os.environ, "HOME": str(home)}, capture_output=True)
+        code = home / ".collab-room" / "code"
+        _COMPILED.extend(sorted(code.iterdir()) if code.is_dir() else [])
+    return _COMPILED
+
+
+def _seed_compiled(home: Path) -> None:
+    code = home / ".collab-room" / "code"
+    if code.exists():
+        return
+    code.mkdir(mode=0o700, parents=True)
+    os.chmod(code.parent, 0o700)
+    for kept in _compiled():
+        shutil.copyfile(kept, code / kept.name)
+        os.chmod(code / kept.name, 0o600)
+
+
 def isolated(root) -> dict:
     root = Path(root)
     (root / "_home").mkdir(exist_ok=True)
+    _seed_compiled(root / "_home")
     return {
         "HOME": str(root / "_home"),  # owner.key, ~/.local, ~/.claude, ~/.codex, git config
         "COLLAB_INVITES": str(root / "_invites"),  # ~/.collab-room: invites, consent, owner.key, welcomed

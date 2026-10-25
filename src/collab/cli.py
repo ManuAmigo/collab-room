@@ -244,7 +244,7 @@ def cmd_task(args: argparse.Namespace) -> None:
             m_store.fail(m_i18n.tr("--kind is one of: {p0}", p0=", ".join(m_tasks.KINDS)))
         if args.by:
             m_store.participant(config, args.by)
-        m_tasks.task_take(args.participant, args.task, args.kind, args.lane or "", args.by or "")
+        m_tasks.task_take(args.participant, args.task, args.kind, args.lane or "", args.by or "", args.plan or "")
         print(m_i18n.tr("{who} is on {task} ({kind}).", who=who, task=args.task, kind=args.kind))
         return
     was_current = m_tasks.task_done(args.participant, args.task, args.commit or "")
@@ -513,6 +513,9 @@ def cmd_brief(args: argparse.Namespace) -> None:
         m_store.participant(config, pid)
     text = m_deliver.current_brief(pid, config)
     print(text or f"{m_store.label_of(config, pid)}: the room sets nothing for it.")
+    if args.hook:
+        # Its context is gone: where it was, from the room's data — what came next lived only there.
+        print("\n" + m_deliver.where_it_was(pid, config, m_log.read_messages()))
 
 
 def cmd_hook_model(args: argparse.Namespace) -> None:
@@ -729,6 +732,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--kind", choices=m_tasks.KINDS, help="take: the kind of work")
     s.add_argument("--lane", choices=m_tasks.LANES, help="take: the lane, A/B/C")
     s.add_argument("--by", help="take: who gave the task (a participant's id)")
+    s.add_argument("--plan", help="take: the file inside the room's folder the plan is kept in (given back after /clear)")
     s.add_argument("--commit", help="done: the commit it ended in")
     s.set_defaults(func=cmd_task)
 

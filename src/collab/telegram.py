@@ -337,7 +337,7 @@ def drop_copy(f: dict[str, Any]) -> None:
     with contextlib.suppress(OSError):
         fd = m_deliver.outbox_fd()
         try:
-            shutil.rmtree(path.parent.name, dir_fd=fd, ignore_errors=True)
+            shutil.rmtree(path.parent.name, dir_fd=fd, ignore_errors=True)  # pyright: ignore[reportCallIssue] — dir_fd is 3.11's; collab runs on 3.11+
         finally:
             os.close(fd)
 
@@ -350,7 +350,7 @@ def sweep_copies(days: float = 7) -> None:
             for name in os.listdir(fd):
                 st = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if COPY_DIR.fullmatch(name) and stat.S_ISDIR(st.st_mode) and time.time() - st.st_mtime > days * 86400:
-                    shutil.rmtree(name, dir_fd=fd, ignore_errors=True)
+                    shutil.rmtree(name, dir_fd=fd, ignore_errors=True)  # pyright: ignore[reportCallIssue] — dir_fd is 3.11's; collab runs on 3.11+
         finally:
             os.close(fd)
 

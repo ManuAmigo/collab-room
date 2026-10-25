@@ -18,38 +18,45 @@ paths() { for p in collab scripts tests tools src; do if [ -e "$p" ]; then echo 
 
 # pyright on the program's own code: no new findings. The count is the current debt; lower it
 # here when a fix brings it down (the check says so). Tests are not gated: their mocks are untyped.
-PYRIGHT_DEBT=1
+PYRIGHT_DEBT=0
 
 # The one ruff: the version pyproject.toml requires (required-version), never whatever uvx has newest.
 ruff() { uvx "ruff@$(sed -n 's/^required-version = "==\(.*\)"$/\1/p' pyproject.toml)" "$@"; }
 
+# A check says nothing when green — one line for them all at the end; red, its whole output.
+quiet() {
+    local name=$1 out
+    shift
+    if ! out=$("$@" 2>&1); then printf '== %s\n%s\n' "$name" "$out"; return 1; fi
+}
+
 lint() {
-    local code
-    echo "== ruff check ($(ruff --version))"
-    ruff check $(paths)
-    echo "== ruff format --check"
+    local code out found
+    quiet "ruff check" ruff check $(paths) || return 1
     # Not collab: it is the package's build — its empty lines stand for imports the build empties —
     # checked below.
-    ruff format --check $(paths | grep -v '^collab$')
-    echo "== pyright (program code: at most $PYRIGHT_DEBT, the current debt)"
+    quiet "ruff format --check" ruff format --check $(paths | grep -v '^collab$') || return 1
     # Not collab once src is there: it is src's build (checked below), and its findings are src's, counted twice.
     code=$(paths | grep -v '^tests$' | { if [ -d src ]; then grep -v '^collab$'; else cat; fi; })
-    local found
     # pyright exits non-zero whenever it finds anything; the count decides here, not its exit code.
-    found=$( (pyright $code 2>&1 || true) | sed -n 's/^\([0-9][0-9]*\) errors\{0,1\},.*/\1/p')
-    if [ -z "$found" ]; then pyright $code; return 1; fi
-    if [ "$found" -gt "$PYRIGHT_DEBT" ]; then pyright $code; echo "pyright: $found findings, more than the debt $PYRIGHT_DEBT" >&2; return 1; fi
-    if [ "$found" -lt "$PYRIGHT_DEBT" ]; then echo "pyright: $found findings — lower PYRIGHT_DEBT in scripts/ci to $found"; fi
-    echo "pyright: $found"
-    # The file people and Codex run is the build: the committed one must equal a fresh build.
-    if [ -f tools/build_collab.py ]; then
-        echo "== build: committed collab == fresh build"
-        python3 tools/build_collab.py --check
+    out=$(pyright $code 2>&1 || true)
+    found=$(sed -n 's/^\([0-9][0-9]*\) errors\{0,1\},.*/\1/p' <<<"$out")
+    if [ -z "$found" ] || [ "$found" -gt "$PYRIGHT_DEBT" ]; then
+        printf '== pyright (program code: at most %s, the current debt)\n%s\n' "$PYRIGHT_DEBT" "$out"
+        if [ -n "$found" ]; then echo "pyright: $found findings, more than the debt $PYRIGHT_DEBT" >&2; fi
+        return 1
     fi
+    if [ "$found" -lt "$PYRIGHT_DEBT" ]; then echo "pyright: $found findings — lower PYRIGHT_DEBT in scripts/ci to $found"; fi
+    # The file people and Codex run is the build: the committed one must equal a fresh build.
+    local built=""
+    if [ -f tools/build_collab.py ]; then
+        quiet "build: committed collab == fresh build" python3 tools/build_collab.py --check || return 1
+        built=", build"
+    fi
+    echo "lint: $(ruff --version), format, pyright $found (debt $PYRIGHT_DEBT)$built — OK"
 }
 
 suite() {
-    echo "== full suite ($(python3 --version), in parallel)"
     # Its own tests point it at another folder with CI_PARALLEL_TESTS; the suite is always tests/.
     env -u CI_PARALLEL_TESTS python3 scripts/ci_parallel.py
 }
@@ -69,12 +76,21 @@ linux() {
     # Every version runs, red or green, and the summary says which failed — one red version must not
     # hide how the others did.
     local failed=""
+    # A worktree's .git names the repository's folder outside the checkout: without it the copy is no
+    # repository, and the tests that read it (export's git archive) are red for that alone. It goes in
+    # too, read-only, at /git — and the entry points the copy there.
+    local mounts=(-v "$PWD:/src:ro")
+    if [ -f .git ]; then
+        local common
+        common="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+        mounts+=(-v "$common:/git:ro" -e "CI_GIT_COMMON=$common")
+    fi
     for version in 3.11 3.12 3.13; do
         echo "== Linux, Python $version"
-        docker run --rm --network none -v "$PWD:/src:ro" "$image" "$version" suite || failed="$failed $version"
+        docker run --rm --network none "${mounts[@]}" "$image" "$version" suite || failed="$failed $version"
     done
     echo "== Linux, Python 3.9: syntax and install start"
-    docker run --rm --network none -v "$PWD:/src:ro" "$image" 3.9 py39 || failed="$failed 3.9"
+    docker run --rm --network none "${mounts[@]}" "$image" 3.9 py39 || failed="$failed 3.9"
     if [ -n "$failed" ]; then echo "Linux: red on Python$failed" >&2; return 1; fi
     echo "Linux: green on 3.11, 3.12, 3.13; 3.9 starts"
 }

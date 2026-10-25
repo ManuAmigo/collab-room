@@ -406,6 +406,11 @@ def codex_rule_refusal(cli: Path, folder: str) -> tuple[str, str]:
                 "keep the collab installation data outside temporary folders, the agent folder and its writable_roots",
             ),
             (
+                lambda: codex_can_write(Path(m_boot.fast_folder()), folder),
+                "Codex can change the compiled collab every collab command runs",
+                "keep the collab installation data outside temporary folders, the agent folder and its writable_roots",
+            ),
+            (
                 lambda: bool(m_boot.recorded_python()) and codex_can_touch_python(m_boot.recorded_python(), folder),
                 "Codex can change the recorded Python installation or files inside it",
                 "keep the recorded Python installation outside temporary folders, the agent folder and its writable_roots",

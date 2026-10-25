@@ -3,6 +3,8 @@ small suite of its own."""
 
 import json
 import os
+import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -35,6 +37,8 @@ class CiParallelTest(unittest.TestCase):
         return {
             **env,
             "CI_PARALLEL_TESTS": str(self.tests),
+            # A busy machine unless a test says otherwise: the machine's own load must not choose for them.
+            "CI_PARALLEL_LOAD": "99",
             "CPT_SEEN": str(self.seen),
             "CPT_DIR": str(self.tests),
             "TMPDIR": tmpdir,
@@ -153,13 +157,23 @@ class CiParallelTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(self.seen.read_text().strip(), "(None, None)")
 
-    def test_two_workers_by_default(self):
-        # Four beside other work took the whole machine.
-        self.recording_tests(6)
-        r = self.run_script()
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("in 2 workers", r.stdout)
-        self.assertEqual(len({line.split()[2] for line in self.seen.read_text().splitlines()}), 2)
+    def test_four_workers_on_a_free_machine_two_on_a_busy_one(self):
+        # Four beside other work took the whole machine; on a free one they halve the run.
+        if (os.cpu_count() or 1) < 4:
+            self.skipTest("fewer than four cores: never more workers than cores")
+        self.recording_tests(8)
+        for load, count in (("0.5", 4), ("99", 2)):
+            self.seen.write_text("")
+            r = subprocess.run(
+                [sys.executable, str(SCRIPT)],
+                env={**self.env(self.short_tmpdir()), "CI_PARALLEL_LOAD": load},
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn(f"in {count} workers", r.stdout, load)
+            self.assertEqual(len({line.split()[2] for line in self.seen.read_text().splitlines()}), count, load)
 
     def queue_lock(self, pid: int) -> Path:
         lock = self.tests / "queue.lock"
@@ -254,6 +268,68 @@ class CiParallelTest(unittest.TestCase):
         self.assertIn("red the first time only", r.stdout, "the parallel run's failure is printed")
         self.assertIn("alone: test_flaky.F.test_red_once — OK", r.stdout)
         self.assertIn("FAILED (red=1", r.stdout)
+
+    def test_a_red_test_is_one_line_its_full_text_left_in_its_workers_log(self):
+        # Whoever reads the run pays for each line: the tracebacks of red tests were most of a red run's text.
+        self.suite(
+            "test_r.py",
+            """\
+            import unittest
+            class R(unittest.TestCase):
+                def test_red(self):
+                    def deep(n):
+                        return deep(n - 1) if n else self.assertEqual(29, 3)
+                    deep(5)
+            """,
+        )
+        r = self.run_script("--workers", "1")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stdout)
+        line = next((x for x in r.stdout.splitlines() if x.startswith("FAIL: test_red (test_r.R.test_red)")), r.stdout)
+        found = re.search(r" — AssertionError: 29 != 3 · (\S+):(\d+)$", line)
+        self.assertIsNotNone(found, line)
+        assert found
+        text = Path(found.group(1)).read_text(encoding="utf-8").splitlines()
+        n = int(found.group(2))
+        self.assertEqual(text[n - 1], "FAIL: test_red (test_r.R.test_red)", "the line points at the test's full text")
+        self.assertIn("Traceback", "\n".join(text[n:]), "the full text is there")
+
+    def test_what_the_tests_print_stays_in_the_runs_folder(self):
+        # A test's stray lines — a collab it starts saying it cannot read a room — were most of a green run's text.
+        self.suite(
+            "test_p.py",
+            """\
+            import sys, unittest
+            class P(unittest.TestCase):
+                def test_prints(self):
+                    print("stray stderr of a test", file=sys.stderr)
+                    print("stray stdout of a test")
+            """,
+        )
+        green = self.run_script("--workers", "1")
+        self.assertEqual(green.returncode, 0, green.stdout + green.stderr)
+        self.assertNotIn("stray", green.stdout + green.stderr)
+        # The positive pair: the lines were printed — into the run's folder, kept when the run is red.
+        self.suite(
+            "test_q.py", "import unittest\nclass Q(unittest.TestCase):\n    def test_red(self):\n        self.fail('red')\n"
+        )
+        red = self.run_script("--workers", "1")
+        self.assertNotIn("stray", red.stdout + red.stderr)
+        folder = re.search(r"worker logs: (\S+)", red.stdout)
+        self.assertIsNotNone(folder, red.stdout)
+        assert folder
+        kept = "".join(f.read_text(encoding="utf-8") for f in Path(folder.group(1)).glob("w*/output.log"))
+        self.assertIn("stray stderr of a test", kept)
+        self.assertIn("stray stdout of a test", kept)
+
+    def test_the_run_says_what_it_ran_on(self):
+        # The summary is the run's own facts, not what its reader remembers: the commit, Python, tmux.
+        self.recording_tests(2)
+        r = self.run_script("--workers", "1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=SCRIPT.parent, capture_output=True, text=True)
+        self.assertIn(f"suite: {git.stdout.strip() or 'no commit'}", r.stdout)
+        self.assertIn(f"· Python {platform.python_version()} ·", r.stdout)
 
     def test_a_module_that_does_not_import_is_red(self):
         self.recording_tests(3)

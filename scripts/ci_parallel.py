@@ -8,12 +8,18 @@ tmux server and test folders, as a whole run has (tests/_isolation.py, tests/tes
 The tests are shared out by their measured durations (scripts/ci-durations.json; --save-durations
 writes what this run measured). A test that fails runs once more alone and both results are printed;
 red stays red — the exit code is the parallel run's.
+
+What it prints is short, for whoever reads it next — often an agent paying for each line: a red test is one
+line (its id, what it raised, where its full text is), green is what the run ran on and unittest's verdict.
+The tests' own output stays in the run's folder, kept when red.
 """
 
 import argparse
 import contextlib
 import json
 import os
+import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -30,9 +36,12 @@ DURATIONS = REPO / "scripts" / "ci-durations.json"
 # More gains little and loads the machine: a flaky red under load costs a whole round of the merge
 # queue (test_esc_goes_back_one_step_everywhere failed under load, passed alone).
 MAX_WORKERS = 4
-# Two by default: four, beside other work, can take the whole machine and leave it unresponsive.
-# --workers 3 or 4 when the machine is free.
-DEFAULT_WORKERS = 2
+# Four when the machine is free, two when it is busy: four, beside other work, can take the whole machine
+# and leave it unresponsive. Measured on 827 tests: 2 workers 1325 s, 4 workers 680 s, three runs each, no red.
+DEFAULT_WORKERS = 4
+BUSY_WORKERS = 2
+# Free: the last minute's load at most half the cores. Its own tests set CI_PARALLEL_LOAD.
+FREE_LOAD = (os.cpu_count() or 1) / 2
 # A merge queue's lock while its checks run: outside the queue, one worker, niced — the
 # queue's run is the one that lands. Its own checks carry COLLAB_QUEUE_RUN and are not slowed.
 # In the person's own folder, not /tmp: a link planted there under this name would have been written through.
@@ -137,13 +146,50 @@ def run_worker(k: int, out: Path) -> int:
     return 0 if result.wasSuccessful() else 1
 
 
-def failures_text(log: str) -> str:
-    """The FAIL/ERROR sections unittest printed, without the dots before and the summary after."""
-    start = log.find("=" * 70)
-    if start < 0:
-        return log
-    end = log.rfind("-" * 70)
-    return log[start:end].rstrip() + "\n"
+RED = re.compile(r"(FAIL|ERROR|UNEXPECTED SUCCESS): ")
+
+
+def red_lines(text: str, log: Path) -> list[str]:
+    """Each red test of a worker's log in one line: unittest's own head of it («FAIL: test_x (module.Class.test_x)»,
+    as the merge queue reads it), what it raised last, and the line of the log where its full text starts."""
+    lines = text.splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        if i == 0 or lines[i - 1] != "=" * 70 or not RED.match(line):
+            continue
+        end = next((j for j in range(i + 1, len(lines)) if lines[j] == "=" * 70 or lines[j].startswith("Ran ")), len(lines))
+        part = lines[i + 1 : end]
+        # After the last traceback: an import that failed carries the one it caught inside its message.
+        last = max((j for j, x in enumerate(part) if x.startswith("Traceback ")), default=len(part))
+        raised = next((x for x in part[last + 1 :] if x and not x[0].isspace()), "")
+        out.append(f"{line} — {raised[:200]} · {log}:{i + 1}" if raised else f"{line} · {log}:{i + 1}")
+    return out
+
+
+def tail(path: Path, n: int = 20) -> str:
+    """The end of a log, to tell why a helper died without its report — the rest stays in the file."""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return f"(no {path.name})"
+    return "\n".join(lines[-n:])
+
+
+def facts() -> str:
+    """What the run ran on, asked of the machine, not remembered: the commit (and whether the checkout differs
+    from it), Python, tmux, the system."""
+
+    def out(*argv: str) -> str:
+        try:
+            return subprocess.run(argv, cwd=REPO, capture_output=True, text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    commit = out("git", "rev-parse", "--short", "HEAD") or "no commit"
+    if out("git", "status", "--porcelain"):
+        commit += " + uncommitted changes"
+    tmux = out("tmux", "-V") if shutil.which("tmux") else ""
+    return f"{commit} · Python {platform.python_version()} · {tmux or 'no tmux'} · {platform.system()} {platform.release()}"
 
 
 def clean_env(tmpdir: Path) -> dict[str, str]:
@@ -171,11 +217,13 @@ def scratch() -> Path:
 
 
 def helper(base: Path, name: str, *args: str) -> subprocess.Popen:
-    """This script again, as a worker or the lister, in a folder of its own under base."""
+    """This script again, as a worker or the lister, in a folder of its own under base. What it and its tests
+    print goes to output.log there, not to the caller: dozens of tests' stray lines were most of a green run's text."""
     tmp = base / name
     tmp.mkdir()
     command = [sys.executable, __file__, *args, "--out", str(base)]
-    return subprocess.Popen(command, cwd=REPO, env=clean_env(tmp))
+    with open(tmp / "output.log", "w", encoding="utf-8") as output:
+        return subprocess.Popen(command, cwd=REPO, env=clean_env(tmp), stdout=output, stderr=subprocess.STDOUT)
 
 
 def kill_servers(base: Path) -> None:
@@ -229,8 +277,9 @@ def collect(base: Path, ids: list[str], codes: list[int]) -> tuple[int, int, lis
         log = base / f"worker-{k}.log"
         text = log.read_text(encoding="utf-8", errors="replace") if log.exists() else ""
         report_file = base / f"worker-{k}.json"
-        if not report_file.exists():  # the worker died before its report: its log says why
-            print(f"worker {k}: no report (exit {code})\n{text}")
+        if not report_file.exists():  # the worker died before its report: its logs say why
+            output = base / f"w{k}" / "output.log"
+            print(f"worker {k}: no report (exit {code}); the end of {log}:\n{tail(log)}\nthe end of {output}:\n{tail(output)}")
             failed.append(f"worker {k}")
             continue
         report = json.loads(report_file.read_text(encoding="utf-8"))
@@ -238,12 +287,15 @@ def collect(base: Path, ids: list[str], codes: list[int]) -> tuple[int, int, lis
         skipped += report["skipped"]
         failed += report["failed"]
         durations.update(report["durations"])
-        if report["failed"]:
-            print(failures_text(text))
-        print(f"worker {k}: {report['ran']} tests, {sum(report['durations'].values()):.0f}s, {len(report['failed'])} red")
+        said = red_lines(text, log)
+        # A red test whose text the log does not hold as unittest prints it is still named.
+        said += [f"red: {tid} · {log}" for tid in report["failed"] if not any(f"({tid.split(' ')[0]})" in line for line in said)]
+        for line in said:
+            print(line)
         ran_ids += list(report["durations"])
     if not ids:
-        print("the tests could not be listed: see the lister's output above")
+        output = base / "list" / "output.log"
+        print(f"the tests could not be listed; the end of {output}:\n{tail(output)}")
         failed.append("listing")
     lost = sorted(set(ids) - set(ran_ids))
     twice = sorted({t for t in ran_ids if ran_ids.count(t) > 1})
@@ -253,9 +305,19 @@ def collect(base: Path, ids: list[str], codes: list[int]) -> tuple[int, int, lis
     return ran, skipped, failed, durations
 
 
+def default_workers() -> int:
+    """Four on a free machine, two on a busy one; never more than the cores."""
+    load = float(os.environ.get("CI_PARALLEL_LOAD") or os.getloadavg()[0])
+    return min(DEFAULT_WORKERS if load <= FREE_LOAD else BUSY_WORKERS, os.cpu_count() or 1)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="The full suite in up to four processes at once.")
-    ap.add_argument("--workers", type=int, help=f"default {DEFAULT_WORKERS}; 1, niced, while the merge queue checks")
+    ap.add_argument(
+        "--workers",
+        type=int,
+        help=f"default {DEFAULT_WORKERS} on a free machine, {BUSY_WORKERS} on a busy one; 1, niced, while the merge queue checks",
+    )
     ap.add_argument("--save-durations", action="store_true", help=f"write what this run measured to {DURATIONS.name}")
     ap.add_argument(
         "--pattern", help="test files to run (default: all, as unittest discover — and then not beside the merge queue's checks)"
@@ -271,7 +333,7 @@ def main() -> int:
     if args.worker is not None:
         return run_worker(args.worker, Path(args.out))
 
-    workers = max(1, min(args.workers, MAX_WORKERS)) if args.workers is not None else min(DEFAULT_WORKERS, os.cpu_count() or 1)
+    workers = max(1, min(args.workers, MAX_WORKERS)) if args.workers is not None else default_workers()
     if args.pattern is None:
         # One full suite on the machine: the whole suite waits for the queue's checks to end, not runs
         # beside them — two at once took the whole machine.
@@ -310,6 +372,7 @@ def main() -> int:
         kill_servers(base)
     if TESTS != REPO / "tests":  # set by CI_PARALLEL_TESTS: never a full suite of another folder unsaid
         print(f"tests from {TESTS}, not tests/")
+    print(f"suite: {facts()}")
     print("-" * 70)
     print(f"Ran {ran} tests in {took:.3f}s in {workers} workers")
     if failed:

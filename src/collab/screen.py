@@ -2,6 +2,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -569,15 +570,47 @@ def set_model(pid: str, model: str) -> None:
         m_store.replace_state(rp.status_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
-def write_status(pid: str, state: str, detail: str, source: str, model: str = "", background: int | None = None) -> None:
+def write_status(
+    pid: str, state: str, detail: str, source: str, model: str = "", background: int | None = None, screen: str | None = None
+) -> None:
     with status_lock():
-        _write_status(pid, state, detail, source, model, background)
+        _write_status(pid, state, detail, source, model, background, screen)
+
+
+def screen_lines(p: dict[str, Any], plain: str) -> list[str]:
+    """The screen without the lines its busy state is read by — a spinner's verb and clock, «esc to interrupt»:
+    they move while a hung tool waits for ever."""
+    busy = re.compile(p["busy"]) if p.get("busy") else None
+    return [line for line in plain.split("\n") if not (busy and busy.search(line))]
+
+
+def screen_print(p: dict[str, Any], plain: str) -> str:
+    """What says the screen moved: its lines but the busy ones, digits as «#» — clocks and token counts tick on a
+    stuck screen too."""
+    return hashlib.sha256(re.sub(r"\d+", "#", "\n".join(screen_lines(p, plain))).encode("utf-8")).hexdigest()[:16]
+
+
+# A run of letters and digits this long with both in it reads as a key or a token: not copied into the lead's line.
+SECRET_LIKE = re.compile(r"(?=[\w\-]*\d)(?=[\w\-]*[A-Za-z])[\w\-]{24,}")
+
+
+def screen_tail(p: dict[str, Any], plain: str, n: int = 6) -> list[str]:
+    """Its last lines of work for the lead: above its input line (the person's draft is not the agent's), no busy
+    lines nor box rules, no control codes, each cut; what looks like a key or a token is left out — the line stays in
+    the room's log."""
+    lines = screen_lines(p, plain)
+    prompt = re.compile("|".join(f"(?:{p[k]})" for k in ("idle", "draft") if p.get(k)) or "(?!)")
+    at = max((i for i, line in enumerate(lines) if prompt.search(line)), default=len(lines))
+    shown = [SECRET_LIKE.sub("[…]", m_text.clean_field(line, 160)) for line in lines[:at]]
+    return [line for line in shown if line.strip("─━-—═ ")][-n:]
 
 
 BACKGROUND_DETAIL = re.compile(r"background \d+")
 
 
-def _write_status(pid: str, state: str, detail: str, source: str, model: str = "", background: int | None = None) -> None:
+def _write_status(
+    pid: str, state: str, detail: str, source: str, model: str = "", background: int | None = None, screen: str | None = None
+) -> None:
     rp = m_store.room().paths
     m_store.private_dir(rp.state_dir)
     detail, model = m_text.clean_field(detail, 300), m_text.clean_field(model, 40)
@@ -605,6 +638,15 @@ def _write_status(pid: str, state: str, detail: str, source: str, model: str = "
         bg_since = bg_since or m_store.now()
     if bg_since:
         data[pid]["bg_since"] = bg_since
+    # Since when its screen stands still (screen_print): a look that saw another one starts the clock anew; a write
+    # with no look (its own hooks) keeps what was seen.
+    if screen is not None:
+        data[pid]["screen"] = screen
+        data[pid]["screen_since"] = (
+            old.get("screen_since") if old.get("screen") == screen and old.get("screen_since") else m_store.now()
+        )
+    elif old.get("screen") and old.get("screen_since"):
+        data[pid]["screen"], data[pid]["screen_since"] = old["screen"], old["screen_since"]
     m_store.replace_state(rp.status_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
