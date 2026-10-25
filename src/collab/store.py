@@ -1754,6 +1754,11 @@ def label_taken(config: dict[str, Any], pid: str, label: str) -> str:
     )
 
 
+def telegram_path() -> Path:
+    """The room's link to the Telegram bot (its token in it: 0600, in the room's home)."""
+    return room().paths.state_dir / "telegram.json"
+
+
 def read_json(path: Path) -> dict[str, Any]:
     try:
         data: object = json.loads(path.read_text(encoding="utf-8"))

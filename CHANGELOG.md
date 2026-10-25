@@ -4,6 +4,32 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.20
+
+- Telegram: an album comes to the agent as one message, files in order, captions joined. · Telegram: альбом приходит агенту одним сообщением — файлы по порядку, подписи вместе.
+- Telegram: after a video, «Prepare for analysis» asks the agent it went to for up to 20 frames with timecodes and a manifest of what is skipped, no sound; the room itself runs nothing on the video. · Telegram: после видео кнопка «Подготовить для анализа» просит агента-адресата сделать до 20 кадров с таймкодами и список пропусков, без звука; сама комната на видео ничего не запускает.
+
+## 0.1.19
+
+- Telegram: «Agent's screen» in `/control` — the text of the chosen agent's window, without colours, comes to the topic as a .txt file. Only the agent's own window, never your chat. · Telegram: «Снимок экрана агента» в `/control` — текст окна выбранного агента, без цветов, приходит в тему файлом .txt. Только окно самого агента, никогда ваш чат.
+- `collab say --file` checks the file again once it is open, so a folder swapped for a link in between does not pass. · `collab say --file` проверяет файл ещё раз уже открытым — папка, подменённая ссылкой в промежутке, не проходит.
+
+## 0.1.18
+
+- `collab say --file`: an agent sends you a file of its project (up to 50 MB, up to ten at once) — in the room it is shown as «📎 name · size», in Telegram a picture comes as a photo, an MP4 as a video, anything else as a document. Only ordinary files inside the project: no links out, no hidden folders, nothing named like a secret. For now Claude agents and you can send files; a Codex agent cannot. · `collab say --file`: агент присылает вам файл своего проекта (до 50 МБ, до десяти за раз) — в комнате он виден как «📎 имя · размер», в Telegram картинка приходит фото, MP4 — видео, остальное — документом. Только обычные файлы внутри проекта: без ссылок наружу, скрытых папок и имён, похожих на секреты. Пока файлы могут слать агенты Claude и вы; агент Codex — нет.
+
+## 0.1.17
+
+- Telegram: send a photo, a screenshot, a document, a video or audio (up to 20 MB) to the room's topic; it goes to the agent the words would go to, saved in the project under `collab-inbox/`, and the agent opens it with its own tools. A file is data, never instructions. · Telegram: пришлите в тему комнаты фото, скриншот, документ, видео или аудио (до 20 МБ); файл уходит тому агенту, кому ушли бы слова, сохраняется в проекте в `collab-inbox/`, и агент открывает его своими инструментами. Файл — данные, не указания.
+
+## 0.1.16
+
+- Telegram: when an agent waits in its window for a permission, its topic gets the question and every option word for word, a button for each. A press is checked against the window again — the same agent, the same question — and sends one key; otherwise nothing is pressed. Only for program versions the room knows; any other question stays «needs you at the computer». · Telegram: когда агент ждёт в окне разрешения, в его тему приходит вопрос и все варианты дословно, по кнопке на каждый. Нажатие сверяется с окном заново — тот же агент, тот же вопрос — и посылает одну клавишу; иначе ничего не нажимается. Только для известных комнате версий программ; любой другой вопрос — по-прежнему «нужно действие на компьютере».
+
+## 0.1.15
+
+- Telegram: `/control` in a room's topic — pause or resume delivery in the room (with how many messages wait), restart an agent so its saved conversation goes on. Each action asks for a confirmation and runs once; a card older than ten minutes does nothing. · Telegram: `/control` в теме комнаты — приостановить или возобновить доставку (видно, сколько сообщений ждут), перезапустить агента — его сохранённый разговор продолжится. Каждое действие просит подтверждения и выполняется один раз; карточка старше десяти минут ничего не делает.
+
 ## 0.1.14
 
 - Telegram: write to any agent of the room, not only the lead — `/dm` lists them; Reply to an agent's answer goes to that agent. Plain text still goes to the lead. Every agent's words to you come to the room's topic, signed; what you write from the computer is shown there too. · Telegram: пишите любому агенту комнаты, не только ведущему — `/dm` показывает список; Reply на ответ агента уходит этому агенту. Обычный текст — по-прежнему ведущему. Всё, что агенты пишут вам, приходит в тему комнаты с подписью; написанное вами с компьютера тоже видно там.

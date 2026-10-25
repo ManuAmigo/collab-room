@@ -5,14 +5,18 @@ import datetime as dt
 import errno
 import hashlib
 import json
+import mimetypes
 import os
+import pwd
 import re
 import secrets
 import shlex
+import shutil
 import stat
 import sys
 import time
 import unicodedata
+import uuid
 from pathlib import Path
 from typing import Any, cast
 import collab.boot as m_boot
@@ -177,6 +181,89 @@ def pause_for_talk(config: dict[str, Any], n: int) -> None:
     )
 
 
+SEND_FILES_MAX = 10  # files in one message
+SEND_MAX = 50 * 1024 * 1024  # Telegram's cloud Bot API takes a document or a video up to 50 MB
+# Never sent, whatever the agent is told: what holds secrets by its name.
+SECRET_NAME = re.compile(
+    r"(^|[._-])(env|pem|key|p8|p12|pfx|jks|ppk|gpg|asc|keystore|kdbx|keychain-db|netrc|pgpass|npmrc|pypirc|ovpn|har|"
+    r"tfstate|tfvars)$|^id_[a-z0-9]+$|^authkey_|^service-account|^auth\.json$|^kubeconfig$|^wp-config\.php$|"
+    r"secret|credential|passw|token|private",
+    re.I,
+)
+
+
+def path_of_fd(fd: int) -> str | None:
+    """The real path of an open file, as the system knows it now: macOS F_GETPATH, Linux /proc. None — not known."""
+    import fcntl
+
+    if hasattr(fcntl, "F_GETPATH"):
+        with contextlib.suppress(OSError):
+            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+            return os.path.realpath(raw.split(b"\0", 1)[0].decode("utf-8", "surrogateescape"))
+    with contextlib.suppress(OSError):
+        return os.path.realpath(os.readlink(f"/proc/self/fd/{fd}"))
+    return None
+
+
+def snapshot(path: str) -> dict[str, Any]:
+    """An agent's file for the person, as it is now: a regular file of the project (its collab-inbox too), reached by
+    no link out of it and through no hidden folder, its name not one of secrets; up to 50 MB. Copied into the room's
+    home at once — the file changing after does not change what goes. {name, size, mime, path of the copy}."""
+    rp = m_store.room().paths
+    root = os.path.realpath(rp.root)
+    home = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)  # the account's own, not one $HOME names
+    if root in ("/", home) or home.startswith(root + os.sep):
+        m_store.fail(m_i18n.tr("this room is the home folder or above it: --file sends from a project folder only"))
+    given = os.path.abspath(path)
+    real = os.path.realpath(given)
+    if os.path.commonpath([root, real]) != root or real == root:
+        m_store.fail(m_i18n.tr("{path}: not a file of this project", path=m_text.tilde(given)))
+    parts = Path(os.path.relpath(real, root)).parts
+    if any(p.startswith(".") or SECRET_NAME.search(p) for p in parts):  # every part: «secrets/prod.json» too
+        m_store.fail(m_i18n.tr("{path}: hidden or secret-looking files are not sent", path=m_text.tilde(given)))
+    try:
+        fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        m_store.fail(m_i18n.tr("{path}: cannot be read: {why}", path=m_text.tilde(given), why=exc.strerror or exc))
+    opened = path_of_fd(fd)
+    if (
+        opened is None
+        or os.path.commonpath([root, opened]) != root
+        or any(p.startswith(".") or SECRET_NAME.search(p) for p in Path(os.path.relpath(opened, root)).parts)
+    ):
+        # What was opened, not the name checked before: a folder swapped for a link in between leads elsewhere.
+        os.close(fd)
+        m_store.fail(m_i18n.tr("{path}: not a file of this project", path=m_text.tilde(given)))
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):  # a folder, a pipe, a device: checked on what was opened, not on the name
+        os.close(fd)
+        m_store.fail(m_i18n.tr("{path}: not a regular file", path=m_text.tilde(given)))
+    if st.st_nlink > 1:  # one name of a file that lives elsewhere too (ln ~/.aws/credentials notes.txt)
+        os.close(fd)
+        m_store.fail(m_i18n.tr("{path}: has other names (a hard link): copy it into the project", path=m_text.tilde(given)))
+    with os.fdopen(fd, "rb") as src:
+        if st.st_size > SEND_MAX:
+            m_store.fail(
+                m_i18n.tr(
+                    "{path}: {mb} MB — up to 50 MB goes to Telegram", path=m_text.tilde(given), mb=st.st_size // 1024 // 1024
+                )
+            )
+        name = m_text.clean_field(parts[-1], 120) or "file"
+        folder = rp.state_dir / "outbox" / uuid.uuid4().hex[:16]
+        m_store.private_dir(folder, strict=False)
+        copy = folder / name
+        out_fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        size = 0
+        with os.fdopen(out_fd, "wb") as out:
+            while chunk := src.read(1 << 16):
+                size += len(chunk)
+                if size > SEND_MAX:
+                    m_store.fail(m_i18n.tr("{path}: grew past 50 MB while read", path=m_text.tilde(given)))
+                out.write(chunk)
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    return {"name": name, "size": size, "mime": mime, "path": str(copy)}
+
+
 @m_store.room_locked
 def post_message(args: argparse.Namespace, text: str) -> None:
     """cmd_say under the room's lock: checks, the pause, the record, the answered mark."""
@@ -189,8 +276,18 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     bad = [t for t in to if t not in known and t not in m_text.SPECIAL]
     if bad:
         m_store.fail(m_i18n.tr("unknown recipient(s): {p0}", p0=", ".join(bad)))
-    if not text.strip():
+    paths = list(getattr(args, "files", None) or [])
+    if not text.strip() and not paths:
         m_store.fail(m_i18n.tr("message cannot be empty"))
+    files: list[dict[str, Any]] = []
+    if paths:
+        people = m_store.people_ids(config)
+        if not set(to) <= set(people):
+            m_store.fail(m_i18n.tr("--file goes to the person only: --to {who}", who=people[0] if people else "owner"))
+        if config.get("paused"):
+            m_store.fail(m_i18n.tr("the room is paused: send the file after /resume"))
+        if len(paths) > SEND_FILES_MAX:
+            m_store.fail(m_i18n.tr("up to {n} files in one message", n=SEND_FILES_MAX))
     if args.re and not any(m["id"] == args.re for m in m_log.read_messages()):
         m_store.fail(m_i18n.tr("no message {re} to reply to", re=args.re))
     m_screen.check_name_is_mine(args.sender, config)
@@ -212,7 +309,20 @@ def post_message(args: argparse.Namespace, text: str) -> None:
         m_store.write_state(rp.held_path, json.dumps(held, ensure_ascii=False) + "\n", append=True)
         print(m_i18n.tr("Held: the room is paused; your message goes out when it resumes."))
         return
-    record = m_log.append_message(args.sender, to, text.strip(), args.re or "", quiet=quiet, silent=silent)
+    if paths:
+        # Copied last, after every other check; one that fails takes the copies already made with it.
+        try:
+            for path in paths:
+                files.append(snapshot(path))
+        except BaseException:
+            for f in files:
+                shutil.rmtree(Path(f["path"]).parent, ignore_errors=True)
+            raise
+    if files:
+        size = lambda n: f"{n / 1024 / 1024:.1f} MB" if n >= 1024 * 1024 else f"{max(1, n // 1024)} KB"
+        lines = "\n".join(f"📎 {f['name']} · {size(f['size'])}" for f in files)
+        text = f"{text.strip()}\n\n{lines}" if text.strip() else lines
+    record = m_log.append_message(args.sender, to, text.strip(), args.re or "", quiet=quiet, silent=silent, files=files)
     streak = 0 if args.sender in m_store.people_ids(config) else talk_streak(m_log.read_messages(), config)
     if args.re and any(m["id"] == args.re and m_log.is_for(m, args.sender) for m in m_log.read_messages()):
         # An answer is more than «read»: it closes the message in the answerer's inbox, as ack

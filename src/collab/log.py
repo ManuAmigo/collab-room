@@ -186,6 +186,7 @@ def append_message(
     said: dict[str, Any] | None = None,
     via: str = "",
     tg: str = "",
+    files: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     rp = m_store.room().paths
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": m_store.now(), "from": sender, "to": to, "text": text}
@@ -205,6 +206,8 @@ def append_message(
         record["via"] = via  # where the person wrote it (telegram): under the signature, so no one adds or drops it
     if tg:
         record["tg"] = tg  # the bot server's id of it: taken twice, written once
+    if files:
+        record["files"] = files  # an agent's files for the person (say --file): copies made when it was said
     if sign:
         record["sig"] = signature(owner_key(create=True), record)
         mark_signing(record["id"])

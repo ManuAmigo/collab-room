@@ -22,7 +22,6 @@ import collab.log as m_log
 import collab.screen as m_screen
 import collab.installer as m_installer
 import collab.deliver as m_deliver
-import collab.telegram as m_telegram
 import collab.agents as m_agents
 
 
@@ -200,7 +199,7 @@ def start_deliverer(session: str) -> None:
 def start_telegram(session: str) -> None:
     """The room's Telegram, when it is on: in its own hidden window, like the deliverer — started anew on each start
     (new code), gone with the room."""
-    if m_telegram.load().get("state") != "on":
+    if m_store.read_json(m_store.telegram_path()).get("state") != "on":
         return
     rp = m_store.room().paths
     cmd = f"python3 {shlex.quote(m_boot.SELF)} telegram run --room {shlex.quote(str(rp.root))}"

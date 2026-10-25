@@ -700,6 +700,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--quiet", action="store_true", help="a note that wakes no agent («Taking: …», «done»): it goes with their next message"
     )
+    s.add_argument(
+        "--file",
+        dest="files",
+        action="append",
+        help="a file of the project for the person (their Telegram too); repeat, up to 10 — sent as it is now",
+    )
     s.add_argument("text", help="message text, or - to read stdin")
     s.set_defaults(func=cmd_say)
 
@@ -1006,6 +1012,10 @@ def main() -> None:
     # or not: for a plain room it costs nothing.
     if re.fullmatch(r"collab-[0-9a-f]{16}", Path(m_boot.SELF).name) and sys.argv[1:2] and sys.argv[1] not in IDENTITY_FLAG:
         m_store.fail(m_i18n.tr("this copy of collab only answers in a room: say, ack, inbox, propose, goal"))
+    if re.fullmatch(r"collab-[0-9a-f]{16}", Path(m_boot.SELF).name) and getattr(args, "files", None):
+        # Its rule lets a Codex answer in the room without asking; a file out of the project is more than an answer,
+        # and opens to it only by its own agreed change of that rule.
+        m_store.fail(m_i18n.tr("--file is not open to this copy of collab yet: tell the person where the file is"))
     if sys.argv[1:2] and sys.argv[1] in IDENTITY_FLAG:
         guard_room_state()
     if args.func is m_chat.cmd_chat:
