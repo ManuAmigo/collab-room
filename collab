@@ -260,7 +260,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.23"
+VERSION = "0.1.24"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:
@@ -1302,6 +1302,10 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "an agent is back from its usage limit: deliver to it again",
         "ru": "возобновить доставку агенту после окончания лимита",
     },
+    "cmd.rest": {
+        "en": "an agent free on purpose: the lead's round leaves it be",
+        "ru": "агент свободен намеренно: обход ведущего его не трогает",
+    },
     "cmd.name": {"en": "rename yourself or an agent", "ru": "переименовать себя или агента"},
     "cmd.view": {"en": "see an agent's screen (read-only)", "ru": "посмотреть экран агента (только чтение)"},
     "cmd.answer": {"en": "respond in an agent terminal over the chat", "ru": "ответить в терминале агента поверх чата"},
@@ -1457,6 +1461,10 @@ CATALOG: dict[str, dict[str, Any]] = {
     "help.b474bc9da6": {
         "en": "An agent is back from its usage limit: the room delivers to it again",
         "ru": "Возобновить доставку агенту после окончания лимита",
+    },
+    "help.39b6ea3728": {
+        "en": "An agent free on purpose, until a time or until taken off: the lead's round leaves it be",
+        "ru": "Агент свободен намеренно — до времени или пока не снимут: обход ведущего его не трогает",
     },
     "help.abb8b22aa6": {
         "en": "Rename yourself or an agent: choose whom, type the new name",
@@ -3107,6 +3115,46 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "- {n} message(s) to you not yet acknowledged: {cmd}",
         "ru": "- Неподтверждённых сообщений вам: {n}. Прочесть: {cmd}",
     },
+    "t.faf6fdfe5a": {"en": "resting until {at}", "ru": "отдыхает до {at}"},
+    "t.8d8695ee10": {"en": "resting since {at}", "ru": "отдыхает с {at}"},
+    "t.ecf744ea1e": {
+        "en": "- {name} is free on purpose: {rest}. Take it off: {cmd}",
+        "ru": "- {name} свободен намеренно: {rest}. Снять: {cmd}",
+    },
+    "t.f141cd47a0": {
+        "en": "a rest in the person's name is set in their chat: /rest <name> [HH:MM] [reason]",
+        "ru": "отдых от имени человека ставится в его чате: /отдых <имя> [ЧЧ:ММ] [причина]",
+    },
+    "t.170c7a13e4": {
+        "en": "! A rest is set only in the person's own chat window.",
+        "ru": "! Отдых ставится только в собственном окне чата человека.",
+    },
+    "t.d7add12fc6": {
+        "en": "! /rest <name> [HH:MM] [reason] · /rest <name> off",
+        "ru": "! /отдых <имя> [ЧЧ:ММ] [причина] · /отдых <имя> снять",
+    },
+    "t.70730d2fb2": {
+        "en": "a rest is set by the room's lead or the person, not by {who}",
+        "ru": "отдых ставит ведущий комнаты или человек, а не {who}",
+    },
+    "t.fbe9ee9e3e": {
+        "en": "{pid} is not one of the room's agents to rest",
+        "ru": "{pid} — не агент этой комнаты, ему нельзя поставить отдых",
+    },
+    "t.2ea5b8716c": {"en": "collab rest <id> off — to take the mark off", "ru": "collab rest <id> off — снять метку"},
+    "t.4b59520807": {"en": "{by}: {name} is no longer resting.", "ru": "{by}: {name} больше не отдыхает."},
+    "t.9a0d1460fa": {"en": "{name} is no longer resting.", "ru": "{name} больше не отдыхает."},
+    "t.c0942f6872": {"en": "--until is a time of day, HH:MM: {until}", "ru": "--until — время суток, ЧЧ:ММ: {until}"},
+    "t.9d40466648": {"en": "{by}: {name} — {rest}.", "ru": "{by}: {name} — {rest}."},
+    "t.ed16cb7a22": {"en": "{name}: {rest}.", "ru": "{name}: {rest}."},
+    "t.ab50757bd2": {
+        "en": "- {name} has been free for {mins} min with no task, and the goal is not reached.",
+        "ru": "- {name} свободен уже {mins} мин без задачи, а цель не достигнута.",
+    },
+    "t.7fad6183f6": {
+        "en": "The lead's rounds are on, but the room has no goal: they will not notice a free agent. Set one: {cmd} → The room.",
+        "ru": "Обходы ведущего идут, но у комнаты нет цели: они не заметят свободного агента. Задать: {cmd} → Комната.",
+    },
     "t.dd5b3cef88": {"en": "The team's round (every {n} min):", "ru": "Обход команды (каждые {n} мин):"},
     "t.5ffccc851b": {
         "en": "only the room's lead declares the goal reached",
@@ -3266,6 +3314,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/mute", "/заглушить"),
     ("/unmute", "/разглушить"),
     ("/unlimit", "/снятьлимит"),
+    ("/rest", "/отдых"),
     ("/name", "/имя"),
     ("/view", "/экран"),
     ("/answer", "/ответить"),
@@ -6270,6 +6319,11 @@ def task_take(pid: str, task: str, kind: str, lane: str = "", by: str = "", plan
     log_task_event({"at": at, "event": "take", "pid": pid, "task": task, "kind": kind, "lane": lane, "by": by})
     data[pid] = rec
     write_json(rp.state_dir / "tasks.json", data)
+    if by:
+        # A task given ends its rest (`collab rest`): the one who gives work takes the mark off with it.
+        rest = read_json(rp.state_dir / "rest.json")
+        if pid in rest:
+            write_json(rp.state_dir / "rest.json", {k: v for k, v in rest.items() if k != pid})
     return rec
 
 
@@ -6322,9 +6376,10 @@ PRESETS: dict[str, dict[str, Any]] = {
         # spinner line that ends «(… • esc to interrupt)» — «• Compacting context (2s • esc to
         # interrupt)» was read as idle and delivery typed into it. A title
         # may hold brackets of its own («Thinking about the fix (approach 2) (5s …)»): in doubt, busy —
-        # a wait costs one tick, typing into a turn costs the turn.
+        # a wait costs one tick, typing into a turn costs the turn. After the bracket Codex may add its own
+        # «· 1 background terminal running · /ps to view · /stop to close» (codex 0.164): still busy.
         "idle": "^› Ask Codex",
-        "busy": "^\\S [A-Z][^\\n]*\\(\\d[^\\n]*• [Ee]sc to interrupt\\)\\s*$",
+        "busy": "^\\S [A-Z][^\\n]*\\(\\d[^\\n]*• [Ee]sc to interrupt\\)(?: · [^\\n]*)?\\s*$",
         # Also Codex's own start-up questions (hooks to trust): a new Codex
         # sat on «t trust all · enter review · esc close» while the room showed Connecting.
         # And the folder to trust: «› 1. Trust and continue» read as a draft.
@@ -10207,10 +10262,14 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
     without = "; ".join(words_in(f"without.{a}", lang) for a in allowed) or words_in("team.view.nothing", lang)
     output = output_of(config) or words_in("team.result.chat", lang)
     lines = [words_in("team.view.head", lang, title=title, output=output, without=without)]
+    resting = rests()
     for p in agents_of(config):
         state = assignment_state(p["id"], config, messages)
+        rest = resting.get(p["id"])
         lines.append(
-            f"  {visible(seat_line(agent_kind(p), p, config))}" + (f" — {state}" if state else "")
+            f"  {visible(seat_line(agent_kind(p), p, config))}"
+            + (f" — {state}" if state else "")
+            + (f" · {rest_words(rest, lang)}" if rest else "")
         )
     return lines if len(lines) > 1 else [*lines, "  " + words_in("team.view.empty", lang)]
 
@@ -10219,6 +10278,68 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
 # not changed». Kept here, not in the state files — the screen's words stay out of what others read.
 SCREEN_TAILS: dict[str, list[str]] = {}
 STUCK_MINUTES = 20  # a screen standing still this long while it works on a task: a tool may hang (a browser)
+
+
+def rest_path() -> Path:
+    return room().paths.state_dir / "rest.json"
+
+
+def rests() -> dict[str, dict[str, str]]:
+    """Agents free on purpose (`collab rest`): {pid: {"since", "until", "why", "by"}} — only well-formed records whose
+    «until» has not passed; the file is anyone's in the room."""
+    out: dict[str, dict[str, str]] = {}
+    for pid, rec in read_json(rest_path()).items():
+        if not (isinstance(rec, dict) and all(isinstance(rec.get(f), str) for f in ("since", "until", "why", "by"))):
+            continue
+        if rec["until"] and at_time(rec["until"]) <= time.time():
+            continue  # its time is over: the mark is gone by itself
+        if at_time(rec["since"]):
+            out[str(pid)] = {**{f: rec[f] for f in ("since", "until", "by")}, "why": clean_field(rec["why"], 80)}
+    return out
+
+
+@room_locked
+def set_rest(pid: str, by: str, until: str = "", why: str = "") -> None:
+    """Mark `pid` free on purpose (until: an ISO time or "" — until taken off); by "" — take the mark off."""
+    data = {k: v for k, v in rests().items() if k != pid}
+    if by:
+        data[pid] = {"since": now(), "until": until, "why": clean_field(why, 80), "by": by}
+    write_json(rest_path(), data)
+
+
+def rest_words(rec: dict[str, str], lang: str) -> str:
+    """«resting until 18:00 — a small limit», as /team and the round say it."""
+    words = (
+        tr("resting until {at}", lang, at=local_hm(rec["until"]))
+        if rec["until"]
+        else tr("resting since {at}", lang, at=local_hm(rec["since"]))
+    )
+    return words + (f" — {rec['why']}" if rec.get("why") else "")
+
+
+def rest_agent(config: dict[str, Any], pid: str, by: str, until: str = "", why: str = "", off: bool = False) -> str:
+    """Set (until: HH:MM or "") or take off `pid`'s rest in `by`'s name — that `by` is its caller is the caller's to
+    check (`collab rest` for the lead, the chat for the person); the room's line written, the words for the one who
+    set it returned. ValueError with the reason when it cannot be set."""
+    if pid not in [p["id"] for p in agents_of(config)] or pid == by:
+        raise ValueError(tr("{pid} is not one of the room's agents to rest", pid=repr(pid)))
+    people, name, who = people_ids(config), label_of(config, pid), label_of(config, by)
+    if off:
+        set_rest(pid, "")
+        room_line(people or ["all"], "{by}: {name} is no longer resting.", silent=True, by=who, name=name)
+        return tr("{name} is no longer resting.", name=name)
+    at = ""
+    if until:
+        if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", until):
+            raise ValueError(tr("--until is a time of day, HH:MM: {until}", until=repr(until)))
+        hour, minute = map(int, until.split(":"))
+        today = dt.datetime.now().astimezone()
+        when = today.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        at = (when if when > today else when + dt.timedelta(days=1)).isoformat(timespec="seconds")
+    set_rest(pid, by, at, why)
+    words = rest_words(rests()[pid], room_language(config))
+    room_line(people or ["all"], "{by}: {name} — {rest}.", silent=True, by=who, name=name, rest=words)
+    return tr("{name}: {rest}.", name=name, rest=words)
 
 
 def rounds_path() -> Path:
@@ -10232,11 +10353,25 @@ def round_reasons(config: dict[str, Any], messages: list[dict[str, Any]], minute
     a screen standing still while it works on a task.
     Each a line of names, task ids and times."""
     lang, lead, now_ = room_language(config), lead_of(config), time.time()
-    tasks, status = current_tasks(), read_status()
+    tasks, status, resting, events = current_tasks(), read_status(), rests(), task_events()
     lines: dict[str, str] = {}  # each reason by its key: who, what, which task
     for p in agents_of(config):
         pid, name = p["id"], label_of(config, p["id"])
         if pid == lead:
+            continue
+        rest = resting.get(pid)
+        if rest:
+            # Free on purpose (`collab rest`): neither «free» nor «silent». A mark with no end is told once a day, so
+            # it is not forgotten for good.
+            days = int((now_ - at_time(rest["since"])) // 86400)
+            if not rest["until"] and days >= 1:
+                lines[f"rest:{pid}:{days}"] = tr(
+                    "- {name} is free on purpose: {rest}. Take it off: {cmd}",
+                    lang,
+                    name=name,
+                    rest=rest_words(rest, lang),
+                    cmd=lead_command("rest", f"{pid} off --from {lead}", config),
+                )
             continue
         st = status.get(pid) or {}
         # Busy is neither silent nor free: its turn runs, its tests run in the background, or its branch is in the
@@ -10286,8 +10421,16 @@ def round_reasons(config: dict[str, Any], messages: list[dict[str, Any]], minute
                     mins=int(held // 60),
                 )
         elif goal_of(config) and st.get("state") == "idle":
-            lines[f"idle:{pid}"] = tr("- {name} is free with no task, and the goal is not reached.", lang, name=name)
-    for e in task_events():
+            # Free since its last done or its last word, whichever is later (its idle screen when neither): one free a
+            # minute and one free an hour are not the same. Past two rounds with no task given it is told once more.
+            ats = [str(e.get("at") or "") for e in events if e.get("event") == "done" and e.get("pid") == pid]
+            ats += [str(m.get("at") or "") for m in messages if m.get("from") == pid]
+            free_since = max([at_time(at) for at in ats] or [at_time(str(st.get("since") or ""))])
+            free = int((now_ - free_since) // 60) if free_since else 0
+            lines[f"idle:{pid}" if free * 60 <= 2 * minutes * 60 else f"idle-long:{pid}"] = tr(
+                "- {name} has been free for {mins} min with no task, and the goal is not reached.", lang, name=name, mins=free
+            )
+    for e in events:
         if e.get("event") != "done" or at_time(str(e.get("at") or "")) <= since or e.get("pid") == lead:
             continue
         pid = str(e.get("pid"))
@@ -10323,10 +10466,22 @@ def lead_round(config: dict[str, Any], messages: list[dict[str, Any]]) -> None:
         return
     if now_ - last < minutes * 60:
         return
+    goal = goal_of(config)
+    if not goal and not state.get("no_goal_told"):
+        # With no goal the round cannot tell a free agent: the person is told once — a line in their chat, no model
+        # woken — until a goal is set.
+        room_line(
+            people_ids(config) or ["all"],
+            "The lead's rounds are on, but the room has no goal: they will not notice a free agent. Set one: {cmd} → The room.",
+            silent=True,
+            cmd=shown_command("/team", room_language(config)),
+        )
+        state = {**state, "no_goal_told": True}
+    elif goal and "no_goal_told" in state:
+        state = {k: v for k, v in state.items() if k != "no_goal_told"}
     reasons = round_reasons(config, messages, minutes, last)
     # A reason told is not told again while it lasts: the lead knows it; gone and back, it is new. Only the new ones
     # wake the lead.
-    goal = goal_of(config)
     told = state.get("told")
     if not isinstance(told, list) or state.get("goal") != goal:
         told = []  # a new goal: anew
@@ -10633,10 +10788,17 @@ def clear_after_merge(pid: str, commit: str) -> None:
     write_set(clear_dir(), pid, read_set(clear_dir(), pid) | {commit})
 
 
-def wants_clear(p: dict[str, Any]) -> bool:
-    """Only a Claude: a Codex's conversation is found by its connection check in its log, and a new one
-    has none — /restart would lose it."""
-    return agent_kind(p) == "claude" and bool(read_set(clear_dir(), p["id"]))
+def wants_clear(p: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Only a Claude whose memory is «clear after it hands in» — «keep», «compact» or none set is its own to
+    keep. Never a Codex: its conversation is found by its connection check in its log, and a new one has none
+    — /restart would lose it."""
+    if not read_set(clear_dir(), p["id"]):
+        return False
+    if agent_kind(p) == "claude" and effective_trim("claude", p, config) == HANDOFF_CLEAR:
+        # Landed while a task is still its: the work goes on — the mark waits for `task done`, as a handing in does.
+        return p["id"] not in current_tasks()
+    write_set(clear_dir(), p["id"], set())  # not its to clear: a later «clear» set does not act on old landings
+    return False
 
 
 def clear_agent(p: dict[str, Any], pane: str) -> str:
@@ -10811,7 +10973,7 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
             # still sees and answers a direct message; room-wide talk passes it by.
             pending = [m for m in pending if p["id"] in m.get("to", [])]
         if state == "idle" and all(is_quiet(m, config) or not well_formed(m) for m in pending):
-            if wants_clear(p):
+            if wants_clear(p, config):
                 return clear_agent(p, pane)  # a landing done and nothing to say: the history goes
             due = None if background else trim_due(p, config, messages)
             if due:
@@ -14591,6 +14753,7 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = 
             # A muted agent still gets what is addressed to it by name — the text said all.
             ("/mute · /unmute", "Stop / resume room-wide messages to an agent; messages to it by name still arrive"),
             ("/unlimit", "An agent is back from its usage limit: the room delivers to it again"),
+            ("/rest", "An agent free on purpose, until a time or until taken off: the lead's round leaves it be"),
             ("/name", "Rename yourself or an agent: choose whom, type the new name"),
             ("/help", "Show this guide"),
             ("/view", "See an agent's screen, read-only; Esc — back to chat"),
@@ -16423,6 +16586,7 @@ from pathlib import Path
 
 
 
+
 def chat_add_wizard(ctx: ChatCommandContext, line: str) -> None:
     """Run one step and remember where it came from, so Esc goes back one step («back, everywhere»), not out of the whole question."""
     before = {k: v for k, v in ctx.wizard.items() if k != "back"}
@@ -16634,6 +16798,27 @@ def chat_handle(ctx: ChatCommandContext, line: str) -> None:
                 "38;5;252",
             )
         )
+        return
+    if line == "/rest" or line.startswith("/rest "):
+        # The person's rest for an agent: their chat is where their words are theirs — `collab rest --from <the
+        # person>` is refused, anyone could type it.
+        who, *more = line.split()[1:] or [""]
+        pid = ctx.names.get(who.lower().lstrip("@"), "")
+        off, until = more[:1] in (["off"], ["снять"]), more[0] if more and more[0][:1].isdigit() else ""
+        why = " ".join(more[1:] if off or until else more)
+        if not pid:
+            ctx.feed(paint(tr("! /rest <name> [HH:MM] [reason] · /rest <name> off"), "1;38;5;196"))
+            return
+        if ctx.args.as_ not in people_ids(ctx.config) or not ctx.signs():
+            # «printf '/rest …' | collab chat --as <the person>» is anyone's to type, as «--from» was.
+            ctx.feed(paint(tr("! A rest is set only in the person's own chat window."), "1;38;5;196"))
+            return
+        try:
+            text = rest_agent(load_config(), pid, ctx.args.as_, until, why, off)
+        except ValueError as exc:
+            ctx.feed(paint(tr("! {exc}", exc=exc), "1;38;5;196"))
+            return
+        ctx.feed(paint(text, "38;5;252"))
         return
     if line in ("/exit", "/quit"):
         raise EOFError
@@ -18061,7 +18246,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
     COMMANDS = [
         (c, words_in(f"cmd.{c[1:]}", "en"))
         for c in (
-            "/add", "/remove", "/mute", "/unmute", "/unlimit", "/name", "/view", "/answer", "/open", "/pause",
+            "/add", "/remove", "/mute", "/unmute", "/unlimit", "/rest", "/name", "/view", "/answer", "/open", "/pause",
             "/resume", "/clear", "/help", "/mine", "/dm", "/restart", "/team", "/telegram", "/language", "/stop", "/exit",
         )
     ]  # fmt: skip
@@ -19057,6 +19242,25 @@ def cmd_goal(args: argparse.Namespace) -> None:
     print(tr("Goal reached: the rounds stop."))
 
 
+def cmd_rest(args: argparse.Namespace) -> None:
+    """`collab rest <id> [--until HH:MM] [--why …] --from <lead or person>`, `collab rest <id> off --from …`: an agent
+    free on purpose — the lead's round names it neither free nor silent. The lead's or the person's to set, never
+    the agent's own: else a rest is a way out of the round. The person's rest is set in their chat (/rest) — only
+    their signed words are theirs: from a terminal, «--from <the person>» is anyone's to type."""
+    config = load_config()
+    if args.sender in people_ids(config):
+        fail(tr("a rest in the person's name is set in their chat: /rest <name> [HH:MM] [reason]"))
+    if args.sender != lead_of(config):
+        fail(tr("a rest is set by the room's lead or the person, not by {who}", who=args.sender))
+    check_name_is_mine(args.sender, config)
+    if args.off and args.off != "off":
+        fail(tr("collab rest <id> off — to take the mark off"))
+    try:
+        print(rest_agent(config, args.pid, args.sender, args.until or "", args.why or "", bool(args.off)))
+    except ValueError as exc:
+        fail(str(exc))
+
+
 def cmd_brief(args: argparse.Namespace) -> None:
     """An agent's assignment, as the room's settings make it now (store.brief). With --hook — for Claude Code's
     SessionStart: after /compact or /clear the session is given it again, for the participant whose session
@@ -19440,6 +19644,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("action", choices=["reached"])
     s.add_argument("--from", dest="sender", required=True)
     s.set_defaults(func=cmd_goal)
+
+    s = sub.add_parser("rest", help="the lead or the person marks an agent free on purpose: the round leaves it be")
+    s.add_argument("pid", help="the agent's id")
+    s.add_argument("off", nargs="?", help="off — take the mark off")
+    s.add_argument("--until", help="a time of day, HH:MM: the mark ends by itself then")
+    s.add_argument("--why", help="why, in a few words (shown in /team)")
+    s.add_argument("--from", dest="sender", required=True, help="who sets it: the room's lead or the person")
+    s.set_defaults(func=cmd_rest)
 
     s = sub.add_parser("brief", help="an agent's assignment from the room's settings (--hook: for Claude Code's SessionStart)")
     s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))

@@ -494,6 +494,25 @@ def cmd_goal(args: argparse.Namespace) -> None:
     print(m_i18n.tr("Goal reached: the rounds stop."))
 
 
+def cmd_rest(args: argparse.Namespace) -> None:
+    """`collab rest <id> [--until HH:MM] [--why …] --from <lead or person>`, `collab rest <id> off --from …`: an agent
+    free on purpose — the lead's round names it neither free nor silent. The lead's or the person's to set, never
+    the agent's own: else a rest is a way out of the round. The person's rest is set in their chat (/rest) — only
+    their signed words are theirs: from a terminal, «--from <the person>» is anyone's to type."""
+    config = m_store.load_config()
+    if args.sender in m_store.people_ids(config):
+        m_store.fail(m_i18n.tr("a rest in the person's name is set in their chat: /rest <name> [HH:MM] [reason]"))
+    if args.sender != m_store.lead_of(config):
+        m_store.fail(m_i18n.tr("a rest is set by the room's lead or the person, not by {who}", who=args.sender))
+    m_screen.check_name_is_mine(args.sender, config)
+    if args.off and args.off != "off":
+        m_store.fail(m_i18n.tr("collab rest <id> off — to take the mark off"))
+    try:
+        print(m_deliver.rest_agent(config, args.pid, args.sender, args.until or "", args.why or "", bool(args.off)))
+    except ValueError as exc:
+        m_store.fail(str(exc))
+
+
 def cmd_brief(args: argparse.Namespace) -> None:
     """An agent's assignment, as the room's settings make it now (store.brief). With --hook — for Claude Code's
     SessionStart: after /compact or /clear the session is given it again, for the participant whose session
@@ -877,6 +896,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("action", choices=["reached"])
     s.add_argument("--from", dest="sender", required=True)
     s.set_defaults(func=cmd_goal)
+
+    s = sub.add_parser("rest", help="the lead or the person marks an agent free on purpose: the round leaves it be")
+    s.add_argument("pid", help="the agent's id")
+    s.add_argument("off", nargs="?", help="off — take the mark off")
+    s.add_argument("--until", help="a time of day, HH:MM: the mark ends by itself then")
+    s.add_argument("--why", help="why, in a few words (shown in /team)")
+    s.add_argument("--from", dest="sender", required=True, help="who sets it: the room's lead or the person")
+    s.set_defaults(func=cmd_rest)
 
     s = sub.add_parser("brief", help="an agent's assignment from the room's settings (--hook: for Claude Code's SessionStart)")
     s.add_argument("--as", dest="as_", default=os.environ.get("COLLAB_AS", "claude"))

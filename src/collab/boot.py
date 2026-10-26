@@ -260,7 +260,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.23"
+VERSION = "0.1.24"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:

@@ -39,6 +39,10 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "an agent is back from its usage limit: deliver to it again",
         "ru": "возобновить доставку агенту после окончания лимита",
     },
+    "cmd.rest": {
+        "en": "an agent free on purpose: the lead's round leaves it be",
+        "ru": "агент свободен намеренно: обход ведущего его не трогает",
+    },
     "cmd.name": {"en": "rename yourself or an agent", "ru": "переименовать себя или агента"},
     "cmd.view": {"en": "see an agent's screen (read-only)", "ru": "посмотреть экран агента (только чтение)"},
     "cmd.answer": {"en": "respond in an agent terminal over the chat", "ru": "ответить в терминале агента поверх чата"},
@@ -194,6 +198,10 @@ CATALOG: dict[str, dict[str, Any]] = {
     "help.b474bc9da6": {
         "en": "An agent is back from its usage limit: the room delivers to it again",
         "ru": "Возобновить доставку агенту после окончания лимита",
+    },
+    "help.39b6ea3728": {
+        "en": "An agent free on purpose, until a time or until taken off: the lead's round leaves it be",
+        "ru": "Агент свободен намеренно — до времени или пока не снимут: обход ведущего его не трогает",
     },
     "help.abb8b22aa6": {
         "en": "Rename yourself or an agent: choose whom, type the new name",
@@ -1844,6 +1852,46 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "- {n} message(s) to you not yet acknowledged: {cmd}",
         "ru": "- Неподтверждённых сообщений вам: {n}. Прочесть: {cmd}",
     },
+    "t.faf6fdfe5a": {"en": "resting until {at}", "ru": "отдыхает до {at}"},
+    "t.8d8695ee10": {"en": "resting since {at}", "ru": "отдыхает с {at}"},
+    "t.ecf744ea1e": {
+        "en": "- {name} is free on purpose: {rest}. Take it off: {cmd}",
+        "ru": "- {name} свободен намеренно: {rest}. Снять: {cmd}",
+    },
+    "t.f141cd47a0": {
+        "en": "a rest in the person's name is set in their chat: /rest <name> [HH:MM] [reason]",
+        "ru": "отдых от имени человека ставится в его чате: /отдых <имя> [ЧЧ:ММ] [причина]",
+    },
+    "t.170c7a13e4": {
+        "en": "! A rest is set only in the person's own chat window.",
+        "ru": "! Отдых ставится только в собственном окне чата человека.",
+    },
+    "t.d7add12fc6": {
+        "en": "! /rest <name> [HH:MM] [reason] · /rest <name> off",
+        "ru": "! /отдых <имя> [ЧЧ:ММ] [причина] · /отдых <имя> снять",
+    },
+    "t.70730d2fb2": {
+        "en": "a rest is set by the room's lead or the person, not by {who}",
+        "ru": "отдых ставит ведущий комнаты или человек, а не {who}",
+    },
+    "t.fbe9ee9e3e": {
+        "en": "{pid} is not one of the room's agents to rest",
+        "ru": "{pid} — не агент этой комнаты, ему нельзя поставить отдых",
+    },
+    "t.2ea5b8716c": {"en": "collab rest <id> off — to take the mark off", "ru": "collab rest <id> off — снять метку"},
+    "t.4b59520807": {"en": "{by}: {name} is no longer resting.", "ru": "{by}: {name} больше не отдыхает."},
+    "t.9a0d1460fa": {"en": "{name} is no longer resting.", "ru": "{name} больше не отдыхает."},
+    "t.c0942f6872": {"en": "--until is a time of day, HH:MM: {until}", "ru": "--until — время суток, ЧЧ:ММ: {until}"},
+    "t.9d40466648": {"en": "{by}: {name} — {rest}.", "ru": "{by}: {name} — {rest}."},
+    "t.ed16cb7a22": {"en": "{name}: {rest}.", "ru": "{name}: {rest}."},
+    "t.ab50757bd2": {
+        "en": "- {name} has been free for {mins} min with no task, and the goal is not reached.",
+        "ru": "- {name} свободен уже {mins} мин без задачи, а цель не достигнута.",
+    },
+    "t.7fad6183f6": {
+        "en": "The lead's rounds are on, but the room has no goal: they will not notice a free agent. Set one: {cmd} → The room.",
+        "ru": "Обходы ведущего идут, но у комнаты нет цели: они не заметят свободного агента. Задать: {cmd} → Комната.",
+    },
     "t.dd5b3cef88": {"en": "The team's round (every {n} min):", "ru": "Обход команды (каждые {n} мин):"},
     "t.5ffccc851b": {
         "en": "only the room's lead declares the goal reached",
@@ -2003,6 +2051,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/mute", "/заглушить"),
     ("/unmute", "/разглушить"),
     ("/unlimit", "/снятьлимит"),
+    ("/rest", "/отдых"),
     ("/name", "/имя"),
     ("/view", "/экран"),
     ("/answer", "/ответить"),

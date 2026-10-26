@@ -138,6 +138,11 @@ def task_take(pid: str, task: str, kind: str, lane: str = "", by: str = "", plan
     log_task_event({"at": at, "event": "take", "pid": pid, "task": task, "kind": kind, "lane": lane, "by": by})
     data[pid] = rec
     m_store.write_json(rp.state_dir / "tasks.json", data)
+    if by:
+        # A task given ends its rest (`collab rest`): the one who gives work takes the mark off with it.
+        rest = m_store.read_json(rp.state_dir / "rest.json")
+        if pid in rest:
+            m_store.write_json(rp.state_dir / "rest.json", {k: v for k, v in rest.items() if k != pid})
     return rec
 
 

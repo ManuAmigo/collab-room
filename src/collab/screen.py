@@ -30,9 +30,10 @@ PRESETS: dict[str, dict[str, Any]] = {
         # spinner line that ends «(… • esc to interrupt)» — «• Compacting context (2s • esc to
         # interrupt)» was read as idle and delivery typed into it. A title
         # may hold brackets of its own («Thinking about the fix (approach 2) (5s …)»): in doubt, busy —
-        # a wait costs one tick, typing into a turn costs the turn.
+        # a wait costs one tick, typing into a turn costs the turn. After the bracket Codex may add its own
+        # «· 1 background terminal running · /ps to view · /stop to close» (codex 0.164): still busy.
         "idle": "^› Ask Codex",
-        "busy": "^\\S [A-Z][^\\n]*\\(\\d[^\\n]*• [Ee]sc to interrupt\\)\\s*$",
+        "busy": "^\\S [A-Z][^\\n]*\\(\\d[^\\n]*• [Ee]sc to interrupt\\)(?: · [^\\n]*)?\\s*$",
         # Also Codex's own start-up questions (hooks to trust): a new Codex
         # sat on «t trust all · enter review · esc close» while the room showed Connecting.
         # And the folder to trust: «› 1. Trust and continue» read as a draft.

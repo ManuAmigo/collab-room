@@ -113,6 +113,7 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = 
             # A muted agent still gets what is addressed to it by name — the text said all.
             ("/mute · /unmute", "Stop / resume room-wide messages to an agent; messages to it by name still arrive"),
             ("/unlimit", "An agent is back from its usage limit: the room delivers to it again"),
+            ("/rest", "An agent free on purpose, until a time or until taken off: the lead's round leaves it be"),
             ("/name", "Rename yourself or an agent: choose whom, type the new name"),
             ("/help", "Show this guide"),
             ("/view", "See an agent's screen, read-only; Esc — back to chat"),

@@ -800,10 +800,14 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
     without = "; ".join(m_i18n.words_in(f"without.{a}", lang) for a in allowed) or m_i18n.words_in("team.view.nothing", lang)
     output = m_store.output_of(config) or m_i18n.words_in("team.result.chat", lang)
     lines = [m_i18n.words_in("team.view.head", lang, title=title, output=output, without=without)]
+    resting = rests()
     for p in agents_of(config):
         state = assignment_state(p["id"], config, messages)
+        rest = resting.get(p["id"])
         lines.append(
-            f"  {m_text.visible(m_store.seat_line(m_screen.agent_kind(p), p, config))}" + (f" — {state}" if state else "")
+            f"  {m_text.visible(m_store.seat_line(m_screen.agent_kind(p), p, config))}"
+            + (f" — {state}" if state else "")
+            + (f" · {rest_words(rest, lang)}" if rest else "")
         )
     return lines if len(lines) > 1 else [*lines, "  " + m_i18n.words_in("team.view.empty", lang)]
 
@@ -812,6 +816,68 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
 # not changed». Kept here, not in the state files — the screen's words stay out of what others read.
 SCREEN_TAILS: dict[str, list[str]] = {}
 STUCK_MINUTES = 20  # a screen standing still this long while it works on a task: a tool may hang (a browser)
+
+
+def rest_path() -> Path:
+    return m_store.room().paths.state_dir / "rest.json"
+
+
+def rests() -> dict[str, dict[str, str]]:
+    """Agents free on purpose (`collab rest`): {pid: {"since", "until", "why", "by"}} — only well-formed records whose
+    «until» has not passed; the file is anyone's in the room."""
+    out: dict[str, dict[str, str]] = {}
+    for pid, rec in m_store.read_json(rest_path()).items():
+        if not (isinstance(rec, dict) and all(isinstance(rec.get(f), str) for f in ("since", "until", "why", "by"))):
+            continue
+        if rec["until"] and m_text.at_time(rec["until"]) <= time.time():
+            continue  # its time is over: the mark is gone by itself
+        if m_text.at_time(rec["since"]):
+            out[str(pid)] = {**{f: rec[f] for f in ("since", "until", "by")}, "why": m_text.clean_field(rec["why"], 80)}
+    return out
+
+
+@m_store.room_locked
+def set_rest(pid: str, by: str, until: str = "", why: str = "") -> None:
+    """Mark `pid` free on purpose (until: an ISO time or "" — until taken off); by "" — take the mark off."""
+    data = {k: v for k, v in rests().items() if k != pid}
+    if by:
+        data[pid] = {"since": m_store.now(), "until": until, "why": m_text.clean_field(why, 80), "by": by}
+    m_store.write_json(rest_path(), data)
+
+
+def rest_words(rec: dict[str, str], lang: str) -> str:
+    """«resting until 18:00 — a small limit», as /team and the round say it."""
+    words = (
+        m_i18n.tr("resting until {at}", lang, at=m_text.local_hm(rec["until"]))
+        if rec["until"]
+        else m_i18n.tr("resting since {at}", lang, at=m_text.local_hm(rec["since"]))
+    )
+    return words + (f" — {rec['why']}" if rec.get("why") else "")
+
+
+def rest_agent(config: dict[str, Any], pid: str, by: str, until: str = "", why: str = "", off: bool = False) -> str:
+    """Set (until: HH:MM or "") or take off `pid`'s rest in `by`'s name — that `by` is its caller is the caller's to
+    check (`collab rest` for the lead, the chat for the person); the room's line written, the words for the one who
+    set it returned. ValueError with the reason when it cannot be set."""
+    if pid not in [p["id"] for p in agents_of(config)] or pid == by:
+        raise ValueError(m_i18n.tr("{pid} is not one of the room's agents to rest", pid=repr(pid)))
+    people, name, who = m_store.people_ids(config), m_store.label_of(config, pid), m_store.label_of(config, by)
+    if off:
+        set_rest(pid, "")
+        m_log.room_line(people or ["all"], "{by}: {name} is no longer resting.", silent=True, by=who, name=name)
+        return m_i18n.tr("{name} is no longer resting.", name=name)
+    at = ""
+    if until:
+        if not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", until):
+            raise ValueError(m_i18n.tr("--until is a time of day, HH:MM: {until}", until=repr(until)))
+        hour, minute = map(int, until.split(":"))
+        today = dt.datetime.now().astimezone()
+        when = today.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        at = (when if when > today else when + dt.timedelta(days=1)).isoformat(timespec="seconds")
+    set_rest(pid, by, at, why)
+    words = rest_words(rests()[pid], m_store.room_language(config))
+    m_log.room_line(people or ["all"], "{by}: {name} — {rest}.", silent=True, by=who, name=name, rest=words)
+    return m_i18n.tr("{name}: {rest}.", name=name, rest=words)
 
 
 def rounds_path() -> Path:
@@ -825,11 +891,25 @@ def round_reasons(config: dict[str, Any], messages: list[dict[str, Any]], minute
     a screen standing still while it works on a task.
     Each a line of names, task ids and times."""
     lang, lead, now_ = m_store.room_language(config), m_store.lead_of(config), time.time()
-    tasks, status = m_tasks.current_tasks(), m_screen.read_status()
+    tasks, status, resting, events = m_tasks.current_tasks(), m_screen.read_status(), rests(), m_tasks.task_events()
     lines: dict[str, str] = {}  # each reason by its key: who, what, which task
     for p in agents_of(config):
         pid, name = p["id"], m_store.label_of(config, p["id"])
         if pid == lead:
+            continue
+        rest = resting.get(pid)
+        if rest:
+            # Free on purpose (`collab rest`): neither «free» nor «silent». A mark with no end is told once a day, so
+            # it is not forgotten for good.
+            days = int((now_ - m_text.at_time(rest["since"])) // 86400)
+            if not rest["until"] and days >= 1:
+                lines[f"rest:{pid}:{days}"] = m_i18n.tr(
+                    "- {name} is free on purpose: {rest}. Take it off: {cmd}",
+                    lang,
+                    name=name,
+                    rest=rest_words(rest, lang),
+                    cmd=lead_command("rest", f"{pid} off --from {lead}", config),
+                )
             continue
         st = status.get(pid) or {}
         # Busy is neither silent nor free: its turn runs, its tests run in the background, or its branch is in the
@@ -879,8 +959,16 @@ def round_reasons(config: dict[str, Any], messages: list[dict[str, Any]], minute
                     mins=int(held // 60),
                 )
         elif m_store.goal_of(config) and st.get("state") == "idle":
-            lines[f"idle:{pid}"] = m_i18n.tr("- {name} is free with no task, and the goal is not reached.", lang, name=name)
-    for e in m_tasks.task_events():
+            # Free since its last done or its last word, whichever is later (its idle screen when neither): one free a
+            # minute and one free an hour are not the same. Past two rounds with no task given it is told once more.
+            ats = [str(e.get("at") or "") for e in events if e.get("event") == "done" and e.get("pid") == pid]
+            ats += [str(m.get("at") or "") for m in messages if m.get("from") == pid]
+            free_since = max([m_text.at_time(at) for at in ats] or [m_text.at_time(str(st.get("since") or ""))])
+            free = int((now_ - free_since) // 60) if free_since else 0
+            lines[f"idle:{pid}" if free * 60 <= 2 * minutes * 60 else f"idle-long:{pid}"] = m_i18n.tr(
+                "- {name} has been free for {mins} min with no task, and the goal is not reached.", lang, name=name, mins=free
+            )
+    for e in events:
         if e.get("event") != "done" or m_text.at_time(str(e.get("at") or "")) <= since or e.get("pid") == lead:
             continue
         pid = str(e.get("pid"))
@@ -916,10 +1004,22 @@ def lead_round(config: dict[str, Any], messages: list[dict[str, Any]]) -> None:
         return
     if now_ - last < minutes * 60:
         return
+    goal = m_store.goal_of(config)
+    if not goal and not state.get("no_goal_told"):
+        # With no goal the round cannot tell a free agent: the person is told once — a line in their chat, no model
+        # woken — until a goal is set.
+        m_log.room_line(
+            m_store.people_ids(config) or ["all"],
+            "The lead's rounds are on, but the room has no goal: they will not notice a free agent. Set one: {cmd} → The room.",
+            silent=True,
+            cmd=m_i18n.shown_command("/team", m_store.room_language(config)),
+        )
+        state = {**state, "no_goal_told": True}
+    elif goal and "no_goal_told" in state:
+        state = {k: v for k, v in state.items() if k != "no_goal_told"}
     reasons = round_reasons(config, messages, minutes, last)
     # A reason told is not told again while it lasts: the lead knows it; gone and back, it is new. Only the new ones
     # wake the lead.
-    goal = m_store.goal_of(config)
     told = state.get("told")
     if not isinstance(told, list) or state.get("goal") != goal:
         told = []  # a new goal: anew
@@ -1226,10 +1326,17 @@ def clear_after_merge(pid: str, commit: str) -> None:
     m_log.write_set(clear_dir(), pid, m_log.read_set(clear_dir(), pid) | {commit})
 
 
-def wants_clear(p: dict[str, Any]) -> bool:
-    """Only a Claude: a Codex's conversation is found by its connection check in its log, and a new one
-    has none — /restart would lose it."""
-    return m_screen.agent_kind(p) == "claude" and bool(m_log.read_set(clear_dir(), p["id"]))
+def wants_clear(p: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Only a Claude whose memory is «clear after it hands in» — «keep», «compact» or none set is its own to
+    keep. Never a Codex: its conversation is found by its connection check in its log, and a new one has none
+    — /restart would lose it."""
+    if not m_log.read_set(clear_dir(), p["id"]):
+        return False
+    if m_screen.agent_kind(p) == "claude" and m_store.effective_trim("claude", p, config) == m_store.HANDOFF_CLEAR:
+        # Landed while a task is still its: the work goes on — the mark waits for `task done`, as a handing in does.
+        return p["id"] not in m_tasks.current_tasks()
+    m_log.write_set(clear_dir(), p["id"], set())  # not its to clear: a later «clear» set does not act on old landings
+    return False
 
 
 def clear_agent(p: dict[str, Any], pane: str) -> str:
@@ -1404,7 +1511,7 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
             # still sees and answers a direct message; room-wide talk passes it by.
             pending = [m for m in pending if p["id"] in m.get("to", [])]
         if state == "idle" and all(is_quiet(m, config) or not m_store.well_formed(m) for m in pending):
-            if wants_clear(p):
+            if wants_clear(p, config):
                 return clear_agent(p, pane)  # a landing done and nothing to say: the history goes
             due = None if background else trim_due(p, config, messages)
             if due:

@@ -4,6 +4,13 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.24
+
+- An agent can be marked free on purpose: the lead with `collab rest <id> [--until HH:MM] [--why …]`, you in your chat with `/rest`; the lead's round leaves it be until the mark ends, and `/team` shows it. · Агента можно отметить свободным намеренно: ведущий — `collab rest <id> [--until ЧЧ:ММ] [--why …]`, вы — в своём чате `/rest`; обход ведущего его не трогает, пока метка не кончится, `/team` её показывает.
+- With no goal set, the lead's round tells you once that it cannot see free agents; an agent free longer than two rounds while the goal is open is told to the lead once more. · Если цель не задана, обход один раз говорит вам, что не видит свободных агентов; об агенте, свободном дольше двух обходов при открытой цели, ведущему говорится ещё раз.
+- /clear after a landing is given only to a Claude whose memory is «clear after handing in», and not while it still holds a task. · /clear после влития получает только Claude с памятью «очищать после сдачи», и не пока у него взятая задача.
+- A Codex turn with a background terminal («… esc to interrupt) · 1 background terminal running») is read as busy: nothing is typed into it. · Ход Codex с фоновым терминалом («… esc to interrupt) · 1 background terminal running») читается как занятый: в него ничего не печатается.
+
 ## 0.1.23
 
 - collab starts about twice as fast when run as a command (and so do the Claude hooks): the compiled program is kept in `~/.collab-room/code`, checked by the hash of its code and by its owner and rights; anything else is compiled as before. · collab запускается примерно вдвое быстрее командой (и хуки Claude тоже): скомпилированная программа хранится в `~/.collab-room/code`, сверяется по хешу кода, владельцу и правам; иначе компилируется как раньше.

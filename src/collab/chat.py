@@ -592,7 +592,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
     COMMANDS = [
         (c, m_i18n.words_in(f"cmd.{c[1:]}", "en"))
         for c in (
-            "/add", "/remove", "/mute", "/unmute", "/unlimit", "/name", "/view", "/answer", "/open", "/pause",
+            "/add", "/remove", "/mute", "/unmute", "/unlimit", "/rest", "/name", "/view", "/answer", "/open", "/pause",
             "/resume", "/clear", "/help", "/mine", "/dm", "/restart", "/team", "/telegram", "/language", "/stop", "/exit",
         )
     ]  # fmt: skip

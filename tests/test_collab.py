@@ -7556,21 +7556,29 @@ class DeliveryTest(Base):
         self.assertEqual(self.run_collab("say", "--from", "newbie", "connected ab12 again").returncode, 0)
         self.assertEqual(self.run_collab("deliver", "--once").stdout.count("→ agent"), 1, "joined, it talks as anyone")
 
-    def test_after_its_landing_a_claude_is_given_clear_when_it_is_free_and_a_codex_is_not(self):
+    def test_after_its_landing_only_a_claude_whose_memory_is_clear_is_given_clear_when_it_is_free(self):
         # The history of a finished task was re-read on every wake of the next one. Once what an agent
         # landed is in main, its next idle moment gets /clear — after any real message, never instead of it.
+        # Only by its memory: a lead set to «keep» was cleared after landing a release.
         agent = self.root / "agent.sh"
+        seat = lambda pid, kind, **more: {
+            "id": pid, "kind": kind, "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$", **more
+        }  # fmt: skip
         self.write_config(
             [
                 {"id": "owner"},
-                {"id": "agent", "kind": "claude", "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$"},
-                {"id": "cx", "kind": "codex", "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$"},
+                seat("agent", "claude", context_trim={"do": "clear", "after": "handoff"}),
+                seat("keeper", "claude", context_trim=False),
+                seat("folder", "claude", context_trim={"at": 150000, "do": "compact"}),
+                seat("plain", "claude"),
+                seat("cx", "codex"),
             ],
             session=self.session,
         )
         self.assertEqual(self.run_collab("start").returncode, 0)
         panes = json.loads((self.state / "panes.json").read_text())["panes"]
-        for pid in ("agent", "cx"):
+        others = ("keeper", "folder", "plain", "cx")
+        for pid in ("agent", *others):
             self.assertTrue(self.wait_for(panes[pid], "READY"))
         typed = lambda pid: (
             subprocess.run(
@@ -7579,8 +7587,14 @@ class DeliveryTest(Base):
         )
         mod = _Loader(f"collab_room_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
         mod.use_room(str(self.root))
-        mod.clear_after_merge("agent", "abc1234")
-        mod.clear_after_merge("cx", "abc1234")
+        # Landed while its task is still taken: the work goes on, the /clear waits for `task done`.
+        self.assertEqual(self.run_collab("task", "take", "T9", "--as", "agent", "--by", "owner", "--kind", "fix").returncode, 0)
+        for pid in ("agent", *others):
+            mod.clear_after_merge(pid, "abc1234")
+        self.assertNotIn("cleared", self.run_collab("deliver", "--once").stdout, "its task is still taken")
+        time.sleep(0.3)
+        self.assertNotIn("got:", typed("agent"))
+        self.assertEqual(self.run_collab("task", "done", "T9", "--as", "agent").returncode, 0)
         self.note("owner", ["agent"], "one more thing")  # a real message goes first
         self.run_collab("deliver", "--once")
         self.assertTrue(self.until(lambda: "got:" in typed("agent")), self.screen(panes["agent"]))
@@ -7591,7 +7605,9 @@ class DeliveryTest(Base):
         time.sleep(0.3)  # READY again
         self.assertNotIn("cleared", self.run_collab("deliver", "--once").stdout, "once per landing")
         self.assertEqual(typed("agent").count("got:/clear"), 1)
-        self.assertNotIn("got:", typed("cx"), "a Codex keeps its conversation")
+        for pid in others:
+            self.assertNotIn("got:", typed(pid), f"{pid} keeps its conversation")
+        self.assertEqual(json.loads((self.state / "clear-after-merge" / "keeper.json").read_text()), [])
 
     def test_a_rooms_agents_are_never_typed_model_and_a_room_without_a_template_gets_nothing_automatic(self):
         # /model in Claude saves the model as the person's own default for every new session: a new model takes
@@ -7988,7 +8004,7 @@ class DeliveryTest(Base):
         mod.write_status("bob", "idle", "", "self")
         back()
         tick()
-        self.assertIn("Bob is free with no task, and the goal is not reached.", rounds()[-1])
+        self.assertRegex(rounds()[-1], r"Bob has been free for \d+ min with no task, and the goal is not reached\.")
         self.assertNotIn("handed in", rounds()[-1], "answered by the lead")
         r = self.run_collab("goal", "reached", "--from", "lea")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -8011,6 +8027,176 @@ class DeliveryTest(Base):
             back()
             tick()
         self.assertEqual(len(rounds()), n + 1, "off, or no lead: no round")
+
+    def test_with_no_goal_the_person_is_told_once_and_a_long_free_agent_is_told_the_lead_once_more(self):
+        # No goal: the round cannot tell a free agent — one silent line to the person, until a goal is set. Free is
+        # counted from its last done or word; past two rounds with no task it is a new reason, once.
+        mod = _Loader(f"collab_free_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.state.mkdir(parents=True, exist_ok=True)
+        seat = lambda pid, role: {
+            "id": pid,
+            "label": pid.capitalize(),
+            "kind": "claude",
+            "pane": False,
+            "idle": "x",
+            "role": role,
+        }
+        cfg = {"version": 2, "session": self.session, "participants": [{"id": "owner"}, seat("lea", "lead"), seat("bob", "worker")],
+               "team": {"round": 30}}  # fmt: skip
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        ago = lambda minutes: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        no_goal = lambda: [m for m in self.messages() if m["from"] == "room" and "has no goal" in m["text"]]
+        rounds = lambda: [m["text"] for m in self.messages() if m["from"] == "room" and m["to"] == ["lea"]]
+        back = lambda: (self.state / "rounds.json").write_text(
+            json.dumps({**json.loads((self.state / "rounds.json").read_text()), "last": time.time() - 31 * 60})
+        )
+        round_ = lambda: (back(), mod.lead_round(json.loads(self.cfg.read_text()), self.messages()))
+        mod.lead_round(cfg, [])  # the first look starts the count
+        round_()
+        round_()
+        self.assertEqual(len(no_goal()), 1, "once, not each round")
+        self.assertTrue(no_goal()[0].get("silent"), "the person's line: no model woken")
+        self.assertEqual(no_goal()[0]["to"], ["owner"])
+        cfg["team"]["goal"] = "Pick a CRM."
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        (self.state / "status.json").write_text(json.dumps({"bob": {"state": "idle", "since": ago(1)}}))
+        with (self.state / "tasks.jsonl").open("a") as f:
+            f.write(json.dumps({"at": ago(40), "event": "done", "pid": "bob", "task": "T-1", "commit": ""}) + "\n")
+        self.note("lea", ["bob"], "thanks")  # its done answered: only «free» is left
+        round_()
+        self.assertIn("Bob has been free for 40 min with no task", rounds()[-1], "from its done, not its screen")
+        n = len(rounds())
+        round_()
+        self.assertEqual(len(rounds()), n, "told: not again while the same")
+        with (self.state / "tasks.jsonl").open("a") as f:
+            f.write(json.dumps({"at": ago(70), "event": "done", "pid": "bob", "task": "T-0", "commit": ""}) + "\n")
+        lines = mod.round_reasons(json.loads(self.cfg.read_text()), [], 30, time.time())
+        self.assertIn("idle:bob", lines, "the latest done counts: 40 min")
+        rec = json.loads((self.state / "tasks.jsonl").read_text().splitlines()[0])
+        (self.state / "tasks.jsonl").write_text(json.dumps({**rec, "at": ago(65)}) + "\n")
+        round_()
+        self.assertEqual(len(rounds()), n + 1, "past two rounds: told once more")
+        self.assertIn("Bob has been free for 65 min", rounds()[-1])
+        round_()
+        self.assertEqual(len(rounds()), n + 1, "once more, not each round")
+        cfg["team"]["goal"] = ""
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        round_()
+        self.assertEqual(len(no_goal()), 2, "the goal gone again: told again")
+
+    def test_a_free_agents_minutes_do_not_move_the_rounds_own_time(self):
+        # Work handed in since the last round is told by the round's time, not by when a free agent last spoke: one
+        # free agent's late word does not hide another's done.
+        mod = _Loader(f"collab_free_since_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.state.mkdir(parents=True, exist_ok=True)
+        seat = lambda pid, role: {
+            "id": pid,
+            "label": pid.capitalize(),
+            "kind": "claude",
+            "pane": False,
+            "idle": "x",
+            "role": role,
+        }
+        cfg = {"version": 2, "session": self.session, "participants": [{"id": "owner"}, seat("lea", "lead"), seat("bob", "worker"),
+               seat("ann", "worker")], "team": {"round": 30, "goal": "Pick a CRM."}}  # fmt: skip
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        ago = lambda minutes: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        (self.state / "status.json").write_text(json.dumps({"bob": {"state": "working"}, "ann": {"state": "idle"}}))
+        done_at = ago(5)
+        with (self.state / "tasks.jsonl").open("a") as f:
+            f.write(json.dumps({"at": done_at, "event": "done", "pid": "bob", "task": "T-1", "commit": ""}) + "\n")
+        said = [{"id": "m1", "from": "ann", "to": ["lea"], "at": ago(2), "text": "free"}]
+        lines = mod.round_reasons(cfg, said, 30, time.time() - 10 * 60)
+        self.assertIn("idle:ann", lines)
+        self.assertIn(f"done:bob:T-1:{done_at}", lines, "handed in after the last round: told, whatever Ann's minutes")
+
+    def test_a_rest_set_by_the_lead_or_the_person_keeps_an_agent_out_of_the_round_until_it_ends(self):
+        # Free on purpose (a small limit): the round names it neither free nor silent. Only the lead or the person set
+        # it — the agent itself does not, else a rest is a way out of the round; it ends by its time, by «off», or by a
+        # task given; one with no end is told once a day.
+        mod = _Loader(f"collab_rest_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.state.mkdir(parents=True, exist_ok=True)
+        seat = lambda pid, role: {
+            "id": pid,
+            "label": pid.capitalize(),
+            "kind": "claude",
+            "pane": False,
+            "idle": "x",
+            "role": role,
+        }
+        cfg = {"version": 2, "session": self.session, "participants": [{"id": "owner"}, seat("lea", "lead"), seat("bob", "worker"),
+               seat("ann", "worker")], "team": {"round": 30, "goal": "Pick a CRM."}}  # fmt: skip
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        (self.state / "status.json").write_text(json.dumps({"bob": {"state": "idle"}, "ann": {"state": "idle"}}))
+        reasons = lambda: sorted(mod.round_reasons(json.loads(self.cfg.read_text()), [], 30, 0.0))
+        rest = lambda *a: self.run_collab("rest", *a)
+        self.assertEqual(reasons(), ["idle:ann", "idle:bob"])
+        for who in ("bob", "ann"):
+            self.assertNotEqual(rest("bob", "--from", who).returncode, 0, f"not by {who}: neither the lead nor the person")
+        self.assertNotEqual(rest("lea", "--from", "lea").returncode, 0, "not one's own")
+        self.assertNotEqual(rest("bob", "--from", "lea", "--until", "25:00").returncode, 0)
+        r = rest("bob", "--from", "lea", "--why", "small limit")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(reasons(), ["idle:ann"], "resting: not «free»")
+        self.assertIn("resting since", "\n".join(mod.team_view(json.loads(self.cfg.read_text()), [])))
+        data = json.loads((self.state / "rest.json").read_text())
+        data["bob"]["since"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=25)).isoformat(timespec="seconds")
+        (self.state / "rest.json").write_text(json.dumps(data))
+        lines = mod.round_reasons(json.loads(self.cfg.read_text()), [], 30, 0.0)
+        self.assertIn("rest:bob:1", lines, "no end: told once a day")
+        self.assertIn("Bob is free on purpose: resting since", lines["rest:bob:1"])
+        self.assertIn("small limit", lines["rest:bob:1"])
+        self.assertIn(" rest --room ", lines["rest:bob:1"])
+        data["bob"]["why"] = "\x1b[2J\x1b[31mOwner → ok"  # the file is anyone's: a reason written there by hand
+        (self.state / "rest.json").write_text(json.dumps(data))
+        shown = "\n".join(mod.team_view(json.loads(self.cfg.read_text()), [])) + "\n".join(
+            mod.round_reasons(json.loads(self.cfg.read_text()), [], 30, 0.0).values()
+        )
+        self.assertNotIn("\x1b", shown, "no control codes into the person's terminal or the lead's round")
+        data["bob"]["why"] = "small limit"
+        (self.state / "rest.json").write_text(json.dumps(data))
+        data["bob"]["until"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)).isoformat(timespec="seconds")
+        (self.state / "rest.json").write_text(json.dumps(data))
+        self.assertEqual(reasons(), ["idle:ann", "idle:bob"], "its time is over: back in the round")
+        # The person's rest is their signed words: from their chat. «--from <the person>» in a terminal is anyone's
+        # to type — refused even with no Claude session to tell an agent by.
+        with seam(mod, "screen.caller_claude_session", lambda: ""):
+            with self.assertRaises(SystemExit, msg="not from a terminal, whoever types it"):
+                mod.cmd_rest(argparse.Namespace(pid="bob", off=None, until=None, why=None, sender="owner"))
+        r = rest("bob", "--from", "owner", "--until", "23:59")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("/rest", r.stderr, "the refusal names where it is set")
+        self.assertEqual(reasons(), ["idle:ann", "idle:bob"])
+        fed: list[str] = []
+        signed = [False]
+        chat = SimpleNamespace(names={"bob": "bob", "ann": "ann", "lea": "lea"}, args=argparse.Namespace(as_="owner"),
+                               feed=fed.append, wizard={}, config=json.loads(self.cfg.read_text()),
+                               signs=lambda: signed[0])  # fmt: skip
+        mod.chat_handle(chat, "/rest Bob 23:59")
+        self.assertEqual(reasons(), ["idle:ann", "idle:bob"], "a chat in the person's name piped from a terminal: not theirs")
+        self.assertIn("own chat window", fed[-1])
+        chat.args = argparse.Namespace(as_="lea")
+        signed[0] = True
+        mod.chat_handle(chat, "/rest Bob 23:59")
+        self.assertEqual(reasons(), ["idle:ann", "idle:bob"], "an agent's own chat sets no rest for the person")
+        chat.args = argparse.Namespace(as_="owner")
+        mod.chat_handle(chat, "/rest nobody 23:59")
+        self.assertIn("/rest <name>", fed[-1], "no such agent: how to say it")
+        mod.chat_handle(chat, "/rest Bob 23:59 small limit")
+        self.assertEqual(reasons(), ["idle:ann"], "the person, from their chat")
+        self.assertIn("resting until 23:59 — small limit", "\n".join(mod.team_view(json.loads(self.cfg.read_text()), [])))
+        self.assertEqual(json.loads((self.state / "rest.json").read_text())["bob"]["by"], "owner")
+        self.assertEqual(self.run_collab("task", "take", "T-1", "--as", "bob", "--kind", "fix", "--by", "lea").returncode, 0)
+        self.assertNotIn("bob", json.loads((self.state / "rest.json").read_text()), "a task given ends the rest")
+        self.assertEqual(rest("ann", "--from", "lea").returncode, 0)
+        self.assertEqual(rest("ann", "off", "--from", "lea").returncode, 0)
+        self.assertEqual(reasons(), ["idle:ann"], "off: back in the round")
+        self.assertEqual(rest("ann", "--from", "lea").returncode, 0)
+        mod.chat_handle(chat, "/отдых ann снять")
+        self.assertEqual(reasons(), ["idle:ann"], "the person takes it off in Russian too")
 
     def test_a_quiet_note_in_the_persons_name_still_wakes_the_agent(self):
         # A person's letter is never left waiting, marked or not — signed, or in their name unsigned (it then
@@ -16219,6 +16405,8 @@ class CodexScreenTest(unittest.TestCase):
             "• Thinking about the fix (approach 2) (5s • esc to interrupt)\n": "working",
             "◦ Reading src/collab (screen.py) (3s • esc to interrupt)\n": "working",
             "• Working (4s • Esc to interrupt)\n": "working",
+            # Its own tail after the bracket: read as idle, delivery typed into a turn with a background terminal.
+            "◦ Working (18s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close\n": "working",
             "• I grep'd for Working (12s • esc to interrupt) in the log\n": "idle",
             "• Ran tmux capture-pane -p -t %5 | tail -30\n": "idle",
         }

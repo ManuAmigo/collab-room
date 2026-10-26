@@ -10,6 +10,7 @@ import collab.screen as m_screen
 import collab.log as m_log
 import collab.agents as m_agents
 import collab.lifecycle as m_lifecycle
+import collab.deliver as m_deliver
 import collab.chat_wizard as m_chat_wizard
 
 
@@ -224,6 +225,27 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
                 "38;5;252",
             )
         )
+        return
+    if line == "/rest" or line.startswith("/rest "):
+        # The person's rest for an agent: their chat is where their words are theirs — `collab rest --from <the
+        # person>` is refused, anyone could type it.
+        who, *more = line.split()[1:] or [""]
+        pid = ctx.names.get(who.lower().lstrip("@"), "")
+        off, until = more[:1] in (["off"], ["снять"]), more[0] if more and more[0][:1].isdigit() else ""
+        why = " ".join(more[1:] if off or until else more)
+        if not pid:
+            ctx.feed(m_text.paint(m_i18n.tr("! /rest <name> [HH:MM] [reason] · /rest <name> off"), "1;38;5;196"))
+            return
+        if ctx.args.as_ not in m_store.people_ids(ctx.config) or not ctx.signs():
+            # «printf '/rest …' | collab chat --as <the person>» is anyone's to type, as «--from» was.
+            ctx.feed(m_text.paint(m_i18n.tr("! A rest is set only in the person's own chat window."), "1;38;5;196"))
+            return
+        try:
+            text = m_deliver.rest_agent(m_store.load_config(), pid, ctx.args.as_, until, why, off)
+        except ValueError as exc:
+            ctx.feed(m_text.paint(m_i18n.tr("! {exc}", exc=exc), "1;38;5;196"))
+            return
+        ctx.feed(m_text.paint(text, "38;5;252"))
         return
     if line in ("/exit", "/quit"):
         raise EOFError
