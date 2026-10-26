@@ -181,6 +181,7 @@ def append_message(
     sign: bool = False,
     quiet: bool = False,
     silent: bool = False,
+    service: bool = False,
     brief: bool = False,
     proposal: dict[str, Any] | None = None,
     said: dict[str, Any] | None = None,
@@ -196,6 +197,8 @@ def append_message(
         record["quiet"] = True  # a note that wakes no one (is_quiet)
     if silent:
         record["silent"] = True  # the room's own note: never typed to an agent (is_silent)
+    if service:
+        record["service"] = True  # the merge queue's note in an agent's name: not its work (where_it_was)
     if brief:
         record["brief"] = True  # an agent's assignment (deliver.send_briefs): told by this, never by its words
     if proposal is not None:

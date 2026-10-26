@@ -4,6 +4,11 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.25
+
+- The room pauses agents' talk after 30 messages in a row by default, not 10; a room's own `talk_limit` still decides. · Комната останавливает разговор агентов после 30 сообщений подряд по умолчанию, а не 10; свой `talk_limit` комнаты по-прежнему главный.
+- After /clear or /compact, «where you were» shows the agent's own last message, not the merge queue's notes said in its name or its answer to the connection check, and no longer counts the room's notes to everyone («X connected») as messages waiting for it. · После /clear или /compact «где вы были» показывает последнее сообщение самого агента, а не строки очереди влития от его имени и не ответ на проверку подключения, и больше не считает общие строки комнаты («X подключён») ждущими его сообщениями.
+
 ## 0.1.24
 
 - An agent can be marked free on purpose: the lead with `collab rest <id> [--until HH:MM] [--why …]`, you in your chat with `/rest`; the lead's round leaves it be until the mark ends, and `/team` shows it. · Агента можно отметить свободным намеренно: ведущий — `collab rest <id> [--until ЧЧ:ММ] [--why …]`, вы — в своём чате `/rest`; обход ведущего его не трогает, пока метка не кончится, `/team` её показывает.

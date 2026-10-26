@@ -336,6 +336,7 @@ def set_paused(paused: bool) -> None:
                     h.get("re", "") if isinstance(h.get("re"), str) else "",
                     quiet=h.get("quiet") is True,
                     silent=h.get("silent") is True,
+                    service=h.get("service") is True,
                 )
         rp.held_path.unlink()
     if not paused:

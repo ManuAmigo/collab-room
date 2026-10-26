@@ -110,8 +110,9 @@ def confirm_joins(config: dict[str, Any], messages: list[dict[str, Any]]) -> Non
 # Agents' messages to each other in a row with no word from a person: past it the room pauses and asks
 # the person. Each such message wakes an agent that reads its whole context again; two hours of agents
 # answering each other cost more than all the person's own work. The room's own is `talk_limit` in
-# .collab.json (0 — never): a team whose coordinator hands out work and gets reports reaches ten fast.
-TALK_LIMIT = 10
+# .collab.json (0 — never): a team whose coordinator hands out work and gets reports reaches ten fast —
+# so thirty by default: ten paused such a team many times a day.
+TALK_LIMIT = 30
 
 
 def gather_seconds(config: dict[str, Any]) -> int:
@@ -302,6 +303,7 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     m_screen.check_name_is_mine(args.sender, config)
     quiet = bool(getattr(args, "quiet", False))
     silent = bool(getattr(args, "silent", False))  # the room's own notes (merge queue): never typed
+    service = bool(getattr(args, "service", False))  # the merge queue's: said in the agent's name, not by it
     # The answer to the room's connection check is the room's to read: sent to everyone, it was typed into
     # every other agent and woke each one. Told by the sender's own pending code, not by the words.
     me = next((q for q in config["participants"] if q["id"] == args.sender), {})
@@ -314,7 +316,15 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     if config.get("paused") and args.sender not in m_store.people_ids(config):
         # Paused: agents must stop talking. What an agent still says is kept, not
         # lost, and goes out on resume.
-        held = {"from": args.sender, "to": to, "text": text.strip(), "re": args.re or "", "quiet": quiet, "silent": silent}
+        held = {
+            "from": args.sender,
+            "to": to,
+            "text": text.strip(),
+            "re": args.re or "",
+            "quiet": quiet,
+            "silent": silent,
+            "service": service,
+        }
         m_store.write_state(rp.held_path, json.dumps(held, ensure_ascii=False) + "\n", append=True)
         print(m_i18n.tr("Held: the room is paused; your message goes out when it resumes."))
         return
@@ -336,7 +346,9 @@ def post_message(args: argparse.Namespace, text: str) -> None:
         size = lambda n: f"{n / 1024 / 1024:.1f} MB" if n >= 1024 * 1024 else f"{max(1, n // 1024)} KB"
         lines = "\n".join(f"📎 {f['name']} · {size(f['size'])}" for f in files)
         text = f"{text.strip()}\n\n{lines}" if text.strip() else lines
-    record = m_log.append_message(args.sender, to, text.strip(), args.re or "", quiet=quiet, silent=silent, files=files)
+    record = m_log.append_message(
+        args.sender, to, text.strip(), args.re or "", quiet=quiet, silent=silent, service=service, files=files
+    )
     streak = 0 if args.sender in m_store.people_ids(config) else talk_streak(m_log.read_messages(), config)
     if args.re and any(m["id"] == args.re and m_log.is_for(m, args.sender) for m in m_log.read_messages()):
         # An answer is more than «read»: it closes the message in the answerer's inbox, as ack
@@ -730,7 +742,9 @@ def where_it_was(pid: str, config: dict[str, Any], messages: list[dict[str, Any]
     """After its context is cleared or compacted, where the agent was — from the room's data, never a retelling: its
     task (and the file of its plan, by path only), its last message to the room word for word, and how many messages
     to it wait unacknowledged, with the command to read them. «Going to…» is not looked for in its words: its own last
-    message says it as it was said."""
+    message says it as it was said. Not its words: the merge queue's notes in its name and its answer to the
+    connection check (marked when written, never told by the text); not waiting on it: the room's notes to
+    everyone — «X connected», «merged» — it was never asked to answer."""
     lang, p = m_store.room_language(config), next((q for q in config["participants"] if q["id"] == pid), {})
     lines = [m_i18n.tr("Where you were (from the room's data):", lang)]
     task = m_tasks.current_tasks().get(pid)
@@ -743,7 +757,11 @@ def where_it_was(pid: str, config: dict[str, Any], messages: list[dict[str, Any]
             lines.append(m_i18n.tr("- Your plan is in {plan} — read it before going on.", lang, plan=task["plan"]))
     else:
         lines.append(m_i18n.tr("- No task taken.", lang))
-    own = [m for m in messages if m_store.well_formed(m) and m["from"] == pid and not m.get("brief")]
+    own = [
+        m
+        for m in messages
+        if m_store.well_formed(m) and m["from"] == pid and not any(m.get(k) is True for k in ("brief", "service", "silent"))
+    ]
     if own:
         words = m_text.visible(str(own[-1].get("text") or ""))
         cut = words if len(words) <= LAST_WORDS else words[:LAST_WORDS] + "…"
@@ -752,7 +770,8 @@ def where_it_was(pid: str, config: dict[str, Any], messages: list[dict[str, Any]
         )
         lines.extend(f"  > {line}" for line in cut.split("\n"))
     acked = m_log.read_set(m_store.room().paths.receipts_dir, pid)
-    waiting = sum(1 for m in messages if m_store.well_formed(m) and m_log.is_for(m, pid) and m["id"] not in acked)
+    note = lambda m: "all" in m["to"] and pid not in m["to"] and (m["from"] == m_text.ROOM or m.get("silent") is True)
+    waiting = sum(1 for m in messages if m_store.well_formed(m) and m_log.is_for(m, pid) and m["id"] not in acked and not note(m))
     if waiting:
         lines.append(
             m_i18n.tr(

@@ -3007,6 +3007,41 @@ class RoomTest(Base):
         self.assertEqual(self.run_collab("task", "done", "SG3", "--as", "a").returncode, 0)
         self.assertNotIn("_local/sg3-plan.md", hook().stdout, "done: no task, no plan")
 
+    def test_where_it_was_counts_no_notes_to_everyone_and_shows_no_answer_to_the_connection_check(self):
+        # After a /clear «10 messages wait» — 8 of them «X connected» to everyone, which no one answers; and its
+        # last word could be its own «connected ab12». Told by how the room wrote them, not by their words.
+        sid = "11111111-2222-3333-4444-555555555555"
+        self.write_config(
+            [
+                {"id": "owner"},
+                {"id": "lea", "label": "Lea", "kind": "claude", "pane": False, "role": "lead"},
+                {"id": "a", "label": "Ann", "kind": "claude", "pane": False, "role": "worker", "claude_session": sid},
+                {"id": "bob", "label": "Bob", "kind": "codex", "pane": False},
+            ]
+        )
+        say = lambda who, to, text: self.assertEqual(self.run_collab("say", "--from", who, "--to", to, text).returncode, 0)
+        say("a", "lea", "Going to the hook next.")
+        with (self.state / "messages.jsonl").open("a", encoding="utf-8") as f:
+            for i, (who, text, extra) in enumerate(
+                [
+                    ("a", "connected ab12", {"silent": True}),
+                    ("room", "Bob connected.", {"silent": True}),
+                    ("bob", "connected cd34", {"silent": True}),
+                    ("room", "Bob disconnected from the room.", {}),
+                ]
+            ):
+                f.write(
+                    json.dumps(
+                        {"id": f"note{i}", "at": "2026-10-26T07:00:00+00:00", "from": who, "to": ["all"], "text": text, **extra}
+                    )
+                    + "\n"
+                )
+        say("lea", "all", "connected to the new server, please look")
+        say("lea", "a", "and the docs, please")
+        out = self.run_collab("brief", "--hook", stdin=json.dumps({"session_id": sid, "source": "clear"})).stdout
+        self.assertIn("  > Going to the hook next.\n", out, "its own words, not its answer to the check")
+        self.assertIn("- 2 message(s) to you not yet acknowledged", out, "Lea's two; the room's notes to all — not")
+
     def test_hooks_of_a_second_claude_report_for_the_participant_bound_to_its_session(self):
         # A second Claude joined as claude2, its hooks still spoke as `claude` and were dropped —
         # the room showed it «Connecting» for good. Ambiguity and a foreign binding — nobody.
@@ -6793,7 +6828,7 @@ for i in range(400):
 
 
 class TalkStopTest(Base):
-    """Agents answering each other with no word from the person: after ten the room pauses and asks."""
+    """Agents answering each other with no word from the person: after thirty the room pauses and asks."""
 
     def setUp(self):
         super().setUp()
@@ -6810,10 +6845,10 @@ class TalkStopTest(Base):
     def paused(self):
         return bool(json.loads(self.cfg.read_text(encoding="utf-8")).get("paused"))
 
-    def test_ten_messages_between_agents_pause_the_room_and_ask_the_person(self):
-        for i in range(9):
+    def test_thirty_messages_between_agents_pause_the_room_and_ask_the_person(self):
+        for i in range(29):
             self.say("claude" if i % 2 else "codex", ["claude"] if not i % 2 else ["codex"])
-        self.assertFalse(self.paused(), "nine is talk, not a loop")
+        self.assertFalse(self.paused(), "twenty-nine is talk, not a loop")
         self.assertIn("Paused", self.say("claude", ["all"]))
         self.assertTrue(self.paused())
         note = self.messages()[-1]
@@ -6821,15 +6856,15 @@ class TalkStopTest(Base):
         self.assertIn("/resume", note["text"])
         self.assertIn("Held", self.say("codex", ["claude"]), "what an agent says now waits")
         self.mod.set_paused(False)
-        for _ in range(9):
+        for _ in range(29):
             self.say("codex", ["claude"])
         self.assertFalse(self.paused(), "resumed: counted anew, not paused at the next word")
 
     def test_a_word_from_the_person_starts_the_count_again_and_notes_to_the_person_do_not_count(self):
-        for _ in range(9):
+        for _ in range(29):
             self.say("claude", ["codex"])
         self.mod.append_message("owner", ["claude"], "go on", sign=True)
-        for _ in range(9):
+        for _ in range(29):
             self.say("claude", ["codex"])
         self.say("claude", ["owner"])  # to the person: wakes no agent
         self.say("codex", ["claude"], quiet=True)  # a quiet note wakes nobody
@@ -6837,7 +6872,7 @@ class TalkStopTest(Base):
         # «From the person», but written by an agent: not the person's word.
         self.mod.append_message("owner", ["claude"], "fake", sign=False)
         self.mod.append_message("owner", ["claude"], "signed once", sign=True)
-        for _ in range(9):
+        for _ in range(29):
             self.say("claude", ["codex"])
         self.say("codex", ["owner"], "x")
         self.mod.append_message("owner", ["codex"], "unsigned again", sign=False)
@@ -6849,7 +6884,7 @@ class TalkStopTest(Base):
         self.cfg.write_text(json.dumps({**data, "talk_limit": 25}), encoding="utf-8")
         for i in range(24):
             self.say("claude" if i % 2 else "codex", ["codex"] if i % 2 else ["claude"])
-        self.assertFalse(self.paused(), "25 set: the 11th and on to the 24th do not pause")
+        self.assertFalse(self.paused(), "25 set: the 24th does not pause")
         self.say("claude", ["codex"])
         self.assertTrue(self.paused(), "the 25th does")
         self.mod.set_paused(False)
