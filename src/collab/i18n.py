@@ -803,6 +803,14 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "{who} is idle, but hasn't replied in the room. Check the agent's window.",
         "ru": "Агент: {who}. Сейчас свободен, но ответа в комнате нет. Проверьте окно агента.",
     },
+    "t.d1346f70b5": {
+        "en": "{who} has not got your message of {hm} yet: it is busy, and the room could not give it — its input was not free, or taking it was not seen. It waits in its inbox.",
+        "ru": "Агент: {who}. Ваше сообщение от {hm} пока не доставлено: агент занят, а его поле ввода было не свободно или приём не подтвердился. Оно ждёт во входящих агента.",
+    },
+    "t.fa048c13a8": {
+        "en": "{who} has not got {n} of your messages since {hm} yet: it is busy, and the room could not give them — its input was not free, or taking them was not seen. They wait in its inbox.",
+        "ru": "Агент: {who}. Ваши сообщения пока не доставлены (сообщений: {n}, первое — в {hm}): агент занят, а его поле ввода было не свободно или приём не подтвердился. Они ждут во входящих агента.",
+    },
     "t.d73ae69d44": {
         "en": "{who} is out of its usage limit until about {hm}. Messages to it wait and go out again then ({n} to resend).",
         "ru": "Агент: {who}. Лимит исчерпан примерно до {hm}. После этого доставка возобновится. Сообщений для повторной отправки: {n}.",
@@ -1626,6 +1634,18 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "пропущены сообщения с неверным форматом. Участник: {p1}. Количество: {p0}",
     },
     "t.617c725aaf": {"en": "state must be working, idle or needs_owner", "ru": "состояние — working, idle или needs_owner"},
+    "t.83b66dde9c": {"en": "--urgent is the person's or the lead's", "ru": "--urgent — только для человека и ведущего"},
+    "t.a97c84d148": {
+        "en": "--urgent wakes at once; --quiet wakes no one: choose one",
+        "ru": "--urgent будит сразу, --quiet не будит никого: выберите одно",
+    },
+    "t.32c621bf63": {"en": "URGENT:", "ru": "СРОЧНО:"},
+    "t.62b065bfe2": {"en": "URGENT (by its first word «{word}»):", "ru": "СРОЧНО (по первому слову «{word}»):"},
+    "t.52b3ca0b5d": {
+        "en": "not sent to {p0}: its screen changed while typing",
+        "ru": "не отправлено агенту {p0}: его экран изменился, пока шёл набор",
+    },
+    "t.6bd247243a": {"en": "not delivered: {n}, the oldest {minutes} min", "ru": "не доставлено: {n}, старейшее {minutes} мин"},
     "t.b34da0ad12": {
         "en": "task {action} needs the task's id and --as <participant>",
         "ru": "Для task {action} укажите ID задачи и --as <участник>",

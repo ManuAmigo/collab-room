@@ -353,10 +353,17 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(m_i18n.tr("{as_}: {state}", as_=args.as_, state=args.state))
         return
     st = m_screen.read_status()
-    for pid in m_store.ids_of(config):
-        lang = m_store.room_language(config)
+    messages = m_log.read_messages()
+    for p in config["participants"]:
+        pid, lang = p["id"], m_store.room_language(config)
+        waiting = m_deliver.undelivered_words(p, config, messages, lang)
         print(
-            m_screen.describe(pid, st[pid], args.stale, lang) if pid in st else m_i18n.tr("· {pid}: No status yet", lang, pid=pid)
+            (
+                m_screen.describe(pid, st[pid], args.stale, lang)
+                if pid in st
+                else m_i18n.tr("· {pid}: No status yet", lang, pid=pid)
+            )
+            + (f" · {waiting}" if waiting else "")
         )
 
 
@@ -721,6 +728,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--re", help="id of the message this answers — closes the wait for it")
     s.add_argument(
         "--quiet", action="store_true", help="a note that wakes no agent («Taking: …», «done»): it goes with their next message"
+    )
+    s.add_argument(
+        "--urgent",
+        action="store_true",
+        help="the person's or the lead's: typed to the agent at once, even while it works («stop»)",
     )
     s.add_argument(
         "--file",

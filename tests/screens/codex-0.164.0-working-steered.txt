@@ -1,0 +1,11 @@
+• Выполню sleep 40 и дождусь завершения.
+ 
+◦ Working (6s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
+ 
+• Messages to be submitted after next tool call (press esc to interrupt and send immediately)
+  ↳ STEER-ENTER-42: When the running sleep finishes, change the final answer of this current turn to ENTER-ACK-42 instead of BASE-DONE. Do not start
+    another command.
+ 
+› Ask Codex to do anything
+ 
+  GPT-6.1-Sol default · /srv/room · Reply to room messages

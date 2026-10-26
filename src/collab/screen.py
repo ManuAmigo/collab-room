@@ -49,6 +49,11 @@ PRESETS: dict[str, dict[str, Any]] = {
         "paste_fold": "^› \\[Pasted Content \\d+ chars\\]",
         # Words of a mode may follow the effort: «GPT-6.1-Sol low fast ·» (no model was shown).
         "model": "^\\s+(\\S+) (?:default|minimal|low|medium|high|xhigh)(?: [a-z]+)* ·",
+        # While it works, a line typed with Enter goes into the running turn after its next tool call: shown
+        # under «• Messages to be submitted after next tool call», and its input is empty again (codex 0.164).
+        "input": "^›",
+        "input_empty": "^› Ask Codex",
+        "queued": "^• Messages to be submitted after next tool call",
     },
     "claude": {
         "label": "Claude",
@@ -83,6 +88,11 @@ PRESETS: dict[str, dict[str, Any]] = {
         # (Claude Code 2.1.302). «/tasks to see subagents» is a hint, not this:
         # it went on Ready with one alive and stayed with none; «← 1 agent» is there always.
         "subagent": "^  ◯ \\S",
+        # While it works, a line typed with Enter waits in its queue and goes in after its next tool call: the
+        # input shows a dim «Press up to edit queued messages» meanwhile (Claude Code 2.1.310).
+        "input": "^❯",
+        "input_empty": "^❯[ \u00a0]*$",
+        "queued": "Press up to edit queued messages",
     },
 }
 
@@ -226,6 +236,9 @@ SCREEN_KEYS = (
     "subagent",
     "paste_limit",
     "paste_fold",
+    "input",
+    "input_empty",
+    "queued",
 )
 
 
@@ -341,6 +354,23 @@ def pane_guard(p: dict[str, Any], pane: str, idle: bool = True, root: Path | Non
     return ""
 
 
+def screen_tail_text(p: dict[str, Any], text: str, whole: bool = False) -> str:
+    """The bottom lines of a screen (whole: all of it) as its state is read from them: no hints, no chips, no colour
+    codes."""
+    if p.get("dim_is_hint"):
+        # Claude Code puts a suggested next prompt into its input in dim text. It is not a
+        # draft: the agent is idle. Read as one, it painted an agent red and stopped delivery
+        # to it. Drop dim spans, then the remaining colour codes.
+        text = re.sub(r"\033\[2m.*?(?:\033\[(?:0|22)m|$)", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\033\[[0-9;:]*[A-Za-z]", "", text)
+    # Claude Code connected to an IDE shows the file open there as a chip in its input,
+    # «[⧉ In AGENTS.md]». It is not typed text: read as a draft, it painted five agents red and
+    # stopped delivery to them when the person opened a file in WebStorm.
+    text = re.sub(r"\[⧉[^\]\n]*\][ \u00a0]*", "", text)
+    lines = text.rstrip("\n").splitlines()
+    return "\n".join(line.rstrip() for line in (lines if whole else lines[-args_tail() :]))
+
+
 def screen_state(p: dict[str, Any], pane: str, shot: Shot | None = None) -> tuple[str, str]:
     """What the participant's screen says, from its bottom lines only.
 
@@ -355,19 +385,7 @@ def screen_state(p: dict[str, Any], pane: str, shot: Shot | None = None) -> tupl
     shown = shot or m_tmuxio.tmux("capture-pane", "-p", *(["-e"] if hints else []), "-t", pane, check=False)
     if shown.returncode != 0:
         return "lost", "Agent window not found."
-    text = shown.stdout
-    if hints:
-        # Claude Code puts a suggested next prompt into its input in dim text. It is not a
-        # draft: the agent is idle. Read as one, it painted an agent red and stopped delivery
-        # to it. Drop dim spans, then the remaining colour codes.
-        text = re.sub(r"\033\[2m.*?(?:\033\[(?:0|22)m|$)", "", text, flags=re.MULTILINE)
-        text = re.sub(r"\033\[[0-9;:]*[A-Za-z]", "", text)
-    # Claude Code connected to an IDE shows the file open there as a chip in its input,
-    # «[⧉ In AGENTS.md]». It is not typed text: read as a draft, it painted five agents red and
-    # stopped delivery to them when the person opened a file in WebStorm.
-    text = re.sub(r"\[⧉[^\]\n]*\][ \u00a0]*", "", text)
-    lines = [line.rstrip() for line in text.rstrip("\n").splitlines()[-args_tail() :]]
-    tail = "\n".join(lines)
+    tail = screen_tail_text(p, shown.stdout)
     if p.get("attention") and re.search(p["attention"], tail, re.MULTILINE):
         # The question itself may sit above the bottom lines in a long menu: look for its title
         # above the bottom lines (and above the visible screen), only to describe it — the trigger stays anchored at the bottom.

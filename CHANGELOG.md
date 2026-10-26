@@ -4,6 +4,12 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.28
+
+- An agent that works without a pause gets its messages: after a minute without a free moment a message is typed into its running turn — only into an empty input, marked delivered once the screen shows it taken (Claude Code's queue, Codex's «after next tool call» block), not typed again once its taking is confirmed, and no Enter if a question came up meanwhile. · Агент, работающий без пауз, получает письма: через минуту без свободного момента письмо печатается в идущий ход — только в пустое поле ввода, «доставлено» отмечается, когда экран показал приём (очередь Claude Code, блок Codex «after next tool call»), после подтверждённого приёма повторно не печатается, и Enter не жмётся, если в это время появился вопрос.
+- `collab status` and `/team` show «not delivered: N, the oldest M min»; after ten minutes untyped (two for urgent ones) the sender is told once that its message waits and why. · `collab status` и `/team` показывают «не доставлено: N, старейшее M мин»; через десять минут (для срочных — две) отправитель один раз узнаёт, что его письмо ждёт и почему.
+- Urgent messages: `say --urgent` from the person or the lead, or a person's message whose first word is «стоп»/«stop», go into the agent's running turn at once, marked «URGENT». · Срочные письма: `say --urgent` от человека или ведущего, или сообщение человека, начинающееся словом «стоп»/«stop», сразу идут в идущий ход агента с пометкой «СРОЧНО».
+
 ## 0.1.27
 
 - In the chat's states line, a Ready agent with background work blinks green and yellow, about once a second; without colours nothing changes. · В строке статусов чата свободный агент с фоновой работой мигает зелёным и жёлтым, примерно раз в секунду; без цвета ничего не меняется.

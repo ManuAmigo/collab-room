@@ -128,7 +128,11 @@ def gathering(pending: list[dict[str, Any]], config: dict[str, Any]) -> bool:
     than the room's window."""
     window = gather_seconds(config)
     waking = [m for m in pending if not is_quiet(m, config)]
-    if not window or not waking or any(m["from"] in (m_text.ROOM, *m_store.people_ids(config)) for m in waking):
+    if (
+        not window
+        or not waking
+        or any(m["from"] in (m_text.ROOM, *m_store.people_ids(config)) or urgent_word(m, config) for m in waking)
+    ):
         return False
     try:
         oldest = min(dt.datetime.fromisoformat(m["at"]) for m in waking)
@@ -309,6 +313,12 @@ def post_message(args: argparse.Namespace, text: str) -> None:
     me = next((q for q in config["participants"] if q["id"] == args.sender), {})
     code = me.get("join_code") if me.get("joined") == "pending" else ""
     silent = silent or bool(code and isinstance(code, str) and f"connected {code}" in text)
+    urgent = bool(getattr(args, "urgent", False))
+    if urgent and args.sender not in (*m_store.people_ids(config), m_store.lead_of(config)):
+        # Typed into a running turn at once: an agent's own urgency would stop the others' work at will.
+        m_store.fail(m_i18n.tr("--urgent is the person's or the lead's"))
+    if urgent and quiet:
+        m_store.fail(m_i18n.tr("--urgent wakes at once; --quiet wakes no one: choose one"))
     if quiet and args.re:
         # An answer is waited for by whoever asked: quiet, it waited for their next message — and an agent
         # with no task asks the room nothing. An answer always wakes.
@@ -324,6 +334,7 @@ def post_message(args: argparse.Namespace, text: str) -> None:
             "quiet": quiet,
             "silent": silent,
             "service": service,
+            "urgent": urgent,
         }
         m_store.write_state(rp.held_path, json.dumps(held, ensure_ascii=False) + "\n", append=True)
         print(m_i18n.tr("Held: the room is paused; your message goes out when it resumes."))
@@ -347,7 +358,7 @@ def post_message(args: argparse.Namespace, text: str) -> None:
         lines = "\n".join(f"📎 {f['name']} · {size(f['size'])}" for f in files)
         text = f"{text.strip()}\n\n{lines}" if text.strip() else lines
     record = m_log.append_message(
-        args.sender, to, text.strip(), args.re or "", quiet=quiet, silent=silent, service=service, files=files
+        args.sender, to, text.strip(), args.re or "", quiet=quiet, silent=silent, service=service, files=files, urgent=urgent
     )
     streak = 0 if args.sender in m_store.people_ids(config) else talk_streak(m_log.read_messages(), config)
     if args.re and any(m["id"] == args.re and m_log.is_for(m, args.sender) for m in m_log.read_messages()):
@@ -379,6 +390,60 @@ def waits_of(awaiting: dict[str, Any], pid: str) -> list[dict[str, Any]]:
     return [
         w for w in waits if isinstance(w, dict) and all(isinstance(w.get(k), str) for k in ("id", "at", "from")) and "worked" in w
     ]
+
+
+UNDELIVERED_MINUTES = 10  # untyped this long while the agent works: its sender is told, once
+URGENT_UNDELIVERED_MINUTES = 2  # an urgent one
+
+
+@m_store.room_locked
+def tell_undelivered(p: dict[str, Any], state: str, config: dict[str, Any], messages: list[dict[str, Any]]) -> None:
+    """Messages to an agent that worked without a pause were never typed, and their senders went on waiting for an
+    answer for half an hour. Ten minutes untyped still (its input not free, its taking not seen): each sender gets one
+    line for what of theirs waits — not again for the same messages."""
+    if state != "working" or p.get("delivery") != "tmux":
+        return
+    rp = m_store.room().paths
+    path = rp.state_dir / "undelivered.json"
+    told_all = m_store.read_json(path)
+    told = told_all.get(p["id"])
+    told = {x for x in told if isinstance(x, str)} if isinstance(told, list) else set()
+    pending, _ = undelivered(p, config, messages, m_log.read_set(rp.delivered_dir, p["id"]))
+    waking = [m for m in pending if m_store.well_formed(m) and not is_quiet(m, config) and m["from"] != m_text.ROOM]
+    late = [
+        m
+        for m in waking
+        if m["id"] not in told
+        and 0
+        < m_text.at_time(m.get("at", ""))
+        <= time.time() - (URGENT_UNDELIVERED_MINUTES if urgent_word(m, config) else UNDELIVERED_MINUTES) * 60
+    ]
+    keep = told & {m["id"] for m in waking}  # typed since, or closed: forgotten
+    if not late and keep == told:
+        return
+    who = p.get("label") or p["id"]
+    for sender in dict.fromkeys(m["from"] for m in late):
+        mine = [m for m in late if m["from"] == sender]
+        hm = m_text.local_hm(mine[0]["at"])
+        if len(mine) == 1:
+            m_log.room_line(
+                [sender],
+                "{who} has not got your message of {hm} yet: it is busy, and the room could not give it — its input was "
+                "not free, or taking it was not seen. It waits in its inbox.",
+                who=who,
+                hm=hm,
+            )
+        else:
+            m_log.room_line(
+                [sender],
+                "{who} has not got {n} of your messages since {hm} yet: it is busy, and the room could not give them — "
+                "its input was not free, or taking them was not seen. They wait in its inbox.",
+                who=who,
+                n=len(mine),
+                hm=hm,
+            )
+    told_all[p["id"]] = sorted(keep | {m["id"] for m in late})
+    m_store.write_json(path, told_all)
 
 
 # Under the room's lock, as everything else that changes awaiting.json and the delivered marks:
@@ -823,10 +888,12 @@ def team_view(config: dict[str, Any], messages: list[dict[str, Any]]) -> list[st
     for p in agents_of(config):
         state = assignment_state(p["id"], config, messages)
         rest = resting.get(p["id"])
+        waiting = undelivered_words(p, config, messages, lang)
         lines.append(
             f"  {m_text.visible(m_store.seat_line(m_screen.agent_kind(p), p, config))}"
             + (f" — {state}" if state else "")
             + (f" · {rest_words(rest, lang)}" if rest else "")
+            + (f" · {waiting}" if waiting else "")
         )
     return lines if len(lines) > 1 else [*lines, "  " + m_i18n.words_in("team.view.empty", lang)]
 
@@ -1174,6 +1241,7 @@ def deliver_one(p: dict[str, Any], pane: str, config: dict[str, Any], messages: 
         m_screen.write_status(p["id"], "limited", "until " + m_text.until_hm(until), "screen", model)
         return ""
     watch_for_reply(p, watch, messages)
+    tell_undelivered(p, state, config, messages)
     if p.get("delivery") != "tmux":
         return ""
     return deliver_to(p, pane, state, config, tasks)
@@ -1247,7 +1315,21 @@ def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], 
     you = w("hint.you", role=w(f"role.{role}")) if role in m_store.ROLES else ""
     if m.get("via") == "telegram" and not warn:
         warn = w("hint.via_telegram")  # the person writes from the phone: a short answer reads best there
-    return f"[{m['from']} → {', '.join(m['to'])}] {warn}{body}" + (f"  ({you}{hint})" if p.get("reply_hint", True) else "")
+    return f"[{m['from']} → {', '.join(m['to'])}] {urgent_mark(m, config)}{warn}{body}" + (
+        f"  ({you}{hint})" if p.get("reply_hint", True) else ""
+    )
+
+
+def urgent_mark(m: dict[str, Any], config: dict[str, Any]) -> str:
+    """«URGENT: » before an urgent message's text, said as the room's — the agent sees why it is typed into its work,
+    and that a person's «стоп» was taken for urgent by its word, not by a sender's own claim."""
+    why = urgent_word(m, config)
+    lang = m_store.room_language(config)
+    if not why:
+        return ""
+    if why == "flag":
+        return m_i18n.tr("URGENT:", lang) + " "
+    return m_i18n.tr("URGENT (by its first word «{word}»):", lang, word=why) + " "
 
 
 DIGEST_WORDS = 8  # words of each message's start in the digest — enough to tell what it is about
@@ -1284,6 +1366,23 @@ def is_quiet(m: dict[str, Any], config: dict[str, Any]) -> bool:
     return m.get("quiet") is True and m.get("from") not in (m_text.ROOM, *m_store.people_ids(config))
 
 
+STOP_WORD = re.compile(r"(?i)\s*(?:@\S+\s+)*(стоп|stop)(?![\w-])")  # «стоп, хватит», «@yadro stop» — not «стопка»
+
+
+def urgent_word(m: dict[str, Any], config: dict[str, Any]) -> str:
+    """Why the message is urgent: "flag" (say --urgent, the person's or the lead's), the word a person's message
+    begins with («стоп»), or "" — not urgent. A person's message must be the person's: an unsigned one in their name
+    stops nobody's work."""
+    people = m_store.people_ids(config)
+    sender = m.get("from")
+    if sender in people and m_log.unsigned_person(m, config):
+        return ""
+    if m.get("urgent") is True and sender in (*people, m_store.lead_of(config)):
+        return "flag"
+    found = STOP_WORD.match(m_text.body_text(str(m.get("text", "")))) if sender in people else None
+    return found.group(1) if found else ""
+
+
 def is_silent(m: dict[str, Any], config: dict[str, Any]) -> bool:
     """The room's own notes — «X connected», the merge queue's «waits», «merged», «stopped»: never typed to
     an agent. Each typing wakes it, and a wake re-reads its whole context; the note stays in its inbox and
@@ -1299,9 +1398,13 @@ def digest_order(pending: list[dict[str, Any]], config: dict[str, Any]) -> list[
     def first(m: dict[str, Any]) -> bool:
         return m["from"] == m_text.ROOM or (m["from"] in m_store.people_ids(config) and not m_log.unsigned_person(m, config))
 
-    rest = [m for m in pending if not first(m)]
+    urgent = [m for m in pending if urgent_word(m, config)]  # the person's or the lead's «stop» before all
+    rest = [m for m in pending if not first(m) and m not in urgent]
     return (
-        [m for m in pending if first(m)] + [m for m in rest if not is_quiet(m, config)] + [m for m in rest if is_quiet(m, config)]
+        urgent
+        + [m for m in pending if first(m) and m not in urgent]
+        + [m for m in rest if not is_quiet(m, config)]
+        + [m for m in rest if is_quiet(m, config)]
     )
 
 
@@ -1312,7 +1415,7 @@ def digest_text(p: dict[str, Any], pending: list[dict[str, Any]], config: dict[s
     parts = []
     for m in pending:
         words = digest_excerpt(m["text"])
-        mark = "⚠ unsigned " if m_log.unsigned_person(m, config) else ""
+        mark = ("⚠ unsigned " if m_log.unsigned_person(m, config) else "") + urgent_mark(m, config)
         # The sender by its id, as one message shows it: a name is the agent's own to set, and
         # «Room», «claude-5» or the person's name there read as someone else.
         parts.append(f"{mark}{m['from']}: «{words}…» (id {m['id']})")
@@ -1500,6 +1603,41 @@ def trim_agent(p: dict[str, Any], pane: str, config: dict[str, Any], due: tuple[
     return f"{do} {p['id']}"
 
 
+def undelivered(
+    p: dict[str, Any], config: dict[str, Any], messages: list[dict[str, Any]], delivered: set[str]
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """What still waits to be typed to the agent, and what is to be marked delivered without typing. Only reads:
+    the caller marks."""
+    pending = [m for m in messages if m_log.is_for(m, p["id"]) and m["id"] not in delivered]
+    # Not what the agent already took itself through inbox: typed later, one per idle moment,
+    # each cost it a turn (seven closed messages typed in a row). Marked delivered,
+    # so it is not looked at again; the same rule as after a limit.
+    # The room's own notes are never typed: marked delivered at once, they stay in inbox.
+    closed = m_log.closed_by(p["id"], messages)
+    settled = {m["id"] for m in pending if m["id"] in closed or is_silent(m, config)}
+    pending = [m for m in pending if m["id"] not in settled]
+    if p.get("muted"):
+        # Muted hears only what is addressed to it by name: a muted agent
+        # still sees and answers a direct message; room-wide talk passes it by.
+        pending = [m for m in pending if p["id"] in m.get("to", [])]
+    return pending, settled
+
+
+def undelivered_words(p: dict[str, Any], config: dict[str, Any], messages: list[dict[str, Any]], lang: str) -> str:
+    """«not delivered: 3, the oldest 12 min» — messages that would wake the agent, waiting a minute or more to be
+    typed; "" when none. An agent busy all the time is never typed to, and nothing showed its letters piling up."""
+    if p.get("delivery") != "tmux":
+        return ""  # one that reads its inbox itself is not typed to
+    delivered = m_log.read_set(m_store.room().paths.delivered_dir, p["id"])
+    pending, _ = undelivered(p, config, messages, delivered)
+    times = [m_text.at_time(m.get("at", "")) for m in pending if m_store.well_formed(m) and not is_quiet(m, config)]
+    times = [t for t in times if t]
+    minutes = int((time.time() - min(times)) // 60) if times else 0
+    if minutes < 1:
+        return ""
+    return m_i18n.tr("not delivered: {n}, the oldest {minutes} min", lang, n=len(times), minutes=minutes)
+
+
 @m_store.room_locked
 def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any], background: int = 0) -> str:
     """Type the next message for one agent, under the room's lock, from the log as it is now. `background`:
@@ -1510,32 +1648,24 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
     messages = m_log.read_log_tick()
     if True:
         delivered = m_log.read_set(rp.delivered_dir, p["id"])
-        pending = [m for m in messages if m_log.is_for(m, p["id"]) and m["id"] not in delivered]
-        # Not what the agent already took itself through inbox: typed later, one per idle moment,
-        # each cost it a turn (seven closed messages typed in a row). Marked delivered,
-        # so it is not looked at again; the same rule as after a limit.
-        closed = m_log.closed_by(p["id"], messages)
-        if any(m["id"] in closed for m in pending):
-            delivered |= {m["id"] for m in pending if m["id"] in closed}
+        pending, settled = undelivered(p, config, messages, delivered)
+        if settled:
+            delivered |= settled
             m_log.write_set(rp.delivered_dir, p["id"], delivered)
-            pending = [m for m in pending if m["id"] not in closed]
-        # The room's own notes are never typed: marked delivered at once, they stay in inbox.
-        silent = {m["id"] for m in pending if is_silent(m, config)}
-        if silent:
-            delivered |= silent
-            m_log.write_set(rp.delivered_dir, p["id"], delivered)
-            pending = [m for m in pending if m["id"] not in silent]
-        if p.get("muted"):
-            # Muted hears only what is addressed to it by name: a muted agent
-            # still sees and answers a direct message; room-wide talk passes it by.
-            pending = [m for m in pending if p["id"] in m.get("to", [])]
         if state == "idle" and all(is_quiet(m, config) or not m_store.well_formed(m) for m in pending):
             if wants_clear(p, config):
                 return clear_agent(p, pane)  # a landing done and nothing to say: the history goes
             due = None if background else trim_due(p, config, messages)
             if due:
                 return trim_agent(p, pane, config, due)  # a long context and nothing to say: it is cut
-        if not pending or state != "idle" or all(is_quiet(m, config) or not m_store.well_formed(m) for m in pending):
+        if p["id"] in UNSEEN:
+            return seen_typed(p, pane, config, delivered)  # one typing at a time: the last one's first
+        working = state == "working" and busy_due(pending, config)
+        if (
+            not pending
+            or (state != "idle" and not working)
+            or all(is_quiet(m, config) or not m_store.well_formed(m) for m in pending)
+        ):
             # Only quiet notes waiting: the agent is not woken for them — each wake re-reads its whole
             # context. They wait in its inbox and go with the next
             # message that is not quiet, in one digest. A malformed record is no reason to wake either:
@@ -1564,7 +1694,12 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
         # One waiting — typed as it is. Several — one line that names them all and how to read them
         # typed one per idle moment, ten took ten of the agent's turns.
         batch = [pending[0]] if len(pending) == 1 else digest_order(pending, config)
+        if working:
+            # Into a turn: a long one goes as a pointer to inbox — a fold there is not pressed again.
+            rules = {**rules, "paste_limit": min(int(rules.get("paste_limit") or BUSY_PASTE_LIMIT), BUSY_PASTE_LIMIT)}
         text = delivery_text(p, batch[0], config, rules) if len(batch) == 1 else digest_text(p, batch, config, rules)
+        if working:
+            return type_busy(p, pane, rules, batch, text, config, delivered)
         # A last look right before typing: the one deliver_one took was before the room's lock, and
         # what came into the input meanwhile (the person's draft, a question) went out with the
         # message, one line. The 0.3 s before Enter stay; this only narrows it.
@@ -1596,21 +1731,180 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
                 )
             stop_if_asked()
             return ""
-        m_log.write_set(rp.delivered_dir, p["id"], delivered | {m["id"] for m in batch})
+        given(p, batch, config, delivered)
         TYPED.setdefault(p["id"], []).extend((m["id"], time.time()) for m in batch)
         m_ledger.woke(p["id"])  # one typing, one wake — whatever the batch holds
-        # Only a person waits for an answer (twelve «hasn't replied» about agents'
-        # messages to each other reached him) — agents' talk among themselves is not watched.
-        asked = [m for m in batch if m["from"] != m_text.ROOM and m["from"] in m_store.people_ids(config)]
-        if asked:
-            awaiting = m_store.read_json(rp.await_path)
-            awaiting[p["id"]] = waits_of(awaiting, p["id"]) + [
-                {"id": m["id"], "from": m["from"], "at": m_store.now(), "worked": False} for m in asked
-            ]
-            m_store.write_json(rp.await_path, awaiting)
         STOPPING["typing"] = False
         stop_if_asked()
         return batch[0]["id"]
+
+
+BUSY_PASTE_LIMIT = 1000  # bytes of a message typed into a running turn; longer goes as a pointer to inbox
+UNSEEN_SECONDS = 120  # typed into a turn and not seen taken: not typed again before this
+
+
+def busy_after() -> float:
+    """How long a message waits for a free moment before it is typed into the agent's running turn."""
+    return float(os.environ.get("COLLAB_BUSY_AFTER_SECONDS", "60"))
+
+
+def busy_due(pending: list[dict[str, Any]], config: dict[str, Any]) -> bool:
+    """An agent that works without a pause is never seen free, and nothing was typed to it for half an hour (five
+    letters, its lead not knowing). A message that would wake it and has waited a minute goes into its turn; an
+    urgent one at once."""
+    if any(m_store.well_formed(m) and urgent_word(m, config) for m in pending):
+        return True
+    times = [m_text.at_time(m.get("at", "")) for m in pending if m_store.well_formed(m) and not is_quiet(m, config)]
+    times = [t for t in times if t]
+    return bool(times) and time.time() - min(times) >= busy_after()
+
+
+# What was typed into a running turn and not yet seen taken: {pid: (ids, token, times the token showed before, when)}.
+UNSEEN: dict[str, tuple[list[str], str, int, float]] = {}
+
+
+def typed_token(batch: list[dict[str, Any]], text: str) -> str:
+    """What on the screen says the typed text arrived: the first message's id (its ready commands carry it), else
+    the text's start. Without spaces — a screen breaks long lines anywhere."""
+    first = batch[0]["id"]
+    return first if first in text else "".join(text.split())[:40]
+
+
+def token_count(rules: dict[str, Any], shot: m_screen.Shot, token: str) -> int:
+    """How many times the token shows above the agent's input line (its own input does not count)."""
+    lines = shot.plain.split("\n")
+    marks = [i for i, line in enumerate(lines) if rules.get("input") and re.match(rules["input"], line)]
+    above = lines[: marks[-1]] if marks else lines
+    return "".join("".join(above).split()).count(token)
+
+
+def input_free(rules: dict[str, Any], shot: m_screen.Shot, queue_too: bool = True) -> bool:
+    """The agent's input line is empty — nobody's draft in it — and (queue_too) nothing it was given waits in its
+    queue: one typing at a time."""
+    if not rules.get("input") or not rules.get("input_empty") or not rules.get("queued"):
+        return False  # a kind whose input is not known is never typed to while it works
+    tail = m_screen.screen_tail_text(rules, shot.stdout).split("\n")
+    line = next((x for x in reversed(tail) if re.match(rules["input"], x)), None)
+    if line is None or not re.match(rules["input_empty"], line):
+        return False
+    plain = "\n".join(shot.plain.split("\n")[-m_screen.args_tail() :])
+    return not (queue_too and re.search(rules["queued"], plain, re.M))
+
+
+INPUT_FRAME = 400  # characters below a typed text that can still be its input's frame and footer
+
+
+def input_holds(rules: dict[str, Any], shot: m_screen.Shot, text: str) -> bool:
+    """The agent's input is the screen's last block and holds the whole text just typed, nothing else's: no question,
+    no menu below it. The whole screen: a long text wrapped in the input began above its bottom lines. A line of the
+    same text higher up (its history, its queue) is not its input."""
+    lines = m_screen.screen_tail_text(rules, shot.stdout, whole=True).split("\n")
+    at = next((i for i in range(len(lines) - 1, -1, -1) if rules.get("input") and re.match(rules["input"], lines[i])), None)
+    if at is None:
+        return False
+    typed = "".join(text.split())
+    end, got = at, 0  # the lines the typed text fills, wrapped
+    while end < len(lines) and got < len(typed) + len(rules["input"].lstrip("^")):
+        got += len("".join(lines[end].split()))
+        end += 1
+    below = "\n".join(lines[end:])
+    asks = [rules.get(k) for k in ("attention", "attention_title")] + [r"^\s*\S?\s*\d+\.\s"]  # «❯ 1. Yes»
+    if any(rule and re.search(rule, below, re.MULTILINE) for rule in asks):
+        return False
+    shown = "".join("".join(lines[at:]).split())[len(rules["input"].lstrip("^")) :]
+    # After the text only the input's frame and footer: a few short lines, not a screen of something else.
+    return shown.startswith(typed) and len(shown) - len(typed) <= INPUT_FRAME
+
+
+def type_busy(
+    p: dict[str, Any],
+    pane: str,
+    rules: dict[str, Any],
+    batch: list[dict[str, Any]],
+    text: str,
+    config: dict[str, Any],
+    delivered: set[str],
+) -> str:
+    """Type the message into the agent's running turn — only into an empty input, and marked delivered only once
+    the screen shows it taken: in its queue, or above its input. Not seen: not marked, and not typed again for a
+    while (seen_typed). Never a second Enter into a running turn."""
+    shot = m_screen.look(rules, pane)
+    if shot.returncode != 0 or shot.scrolled or m_screen.screen_state(rules, pane, shot)[0] != "working":
+        return ""
+    if not input_free(rules, shot) or m_screen.pane_guard(p, pane, shot=shot):
+        return ""
+    token = typed_token(batch, text)
+    before = token_count(rules, shot, token)
+    STOPPING["typing"] = True
+    sent = m_tmuxio.tmux("send-keys", "-t", pane, "-l", text, check=False)
+    if sent.returncode == 0:
+        time.sleep(float(os.environ.get("COLLAB_ENTER_DELAY", "0.3")))
+        # A turn may put a question on the screen at any moment («Do you want to proceed?»): an Enter then
+        # answers it for the person. Pressed only while its input holds what was typed and nothing asks. Not «still
+        # working»: with text in its input Claude drops «esc to interrupt», and a long text pushes its spinner above
+        # the bottom lines — the message stood as a draft.
+        shot = m_screen.look(rules, pane)
+        # Only states that can hold a typed text in an input: with text in it Claude drops «esc to interrupt», and a
+        # long one pushes its spinner above the bottom lines (a draft, or unknown).
+        if m_screen.screen_state(rules, pane, shot)[0] not in ("working", "draft", "unknown") or not input_holds(
+            rules, shot, text
+        ):
+            STOPPING["typing"] = False
+            UNSEEN[p["id"]] = ([m["id"] for m in batch], token, before, time.time())
+            print(m_i18n.tr("not sent to {p0}: its screen changed while typing", p0=p["id"]), file=sys.stderr, flush=True)
+            stop_if_asked()
+            return ""
+        sent = m_tmuxio.tmux("send-keys", "-t", pane, "Enter", check=False)
+    taken = False
+    for _ in range(6 if sent.returncode == 0 else 0):
+        time.sleep(0.5)
+        after = m_screen.look(rules, pane)
+        tail = "\n".join(after.plain.split("\n")[-m_screen.args_tail() :])
+        if (
+            after.returncode == 0
+            and input_free(rules, after, queue_too=False)
+            and (re.search(rules["queued"], tail, re.M) or token_count(rules, after, token) > before)
+        ):
+            taken = True
+            break
+    if taken:
+        given(p, batch, config, delivered)
+        TYPED.setdefault(p["id"], []).extend((m["id"], time.time()) for m in batch)
+    elif sent.returncode == 0:
+        UNSEEN[p["id"]] = ([m["id"] for m in batch], token, before, time.time())
+    STOPPING["typing"] = False
+    stop_if_asked()
+    return batch[0]["id"] if taken else ""
+
+
+def seen_typed(p: dict[str, Any], pane: str, config: dict[str, Any], delivered: set[str]) -> str:
+    """What was typed into a turn and not seen taken then: seen on the screen since — delivered now; still not
+    seen after a while — it may be typed again (it was never marked). Nothing else is typed meanwhile."""
+    ids, token, before, at = UNSEEN[p["id"]]
+    rules = m_screen.screen_rules(p) if p.get("started_by_room") else {**m_screen.PRESETS.get(m_screen.agent_kind(p), {}), **p}
+    shot = m_screen.look(rules, pane)
+    if shot.returncode == 0 and token_count(rules, shot, token) > before:
+        UNSEEN.pop(p["id"])
+        given(p, [m for m in m_log.read_log_tick() if m.get("id") in ids], config, delivered)
+        return ids[0]
+    if time.time() - at >= UNSEEN_SECONDS:
+        UNSEEN.pop(p["id"])
+    return ""
+
+
+def given(p: dict[str, Any], batch: list[dict[str, Any]], config: dict[str, Any], delivered: set[str]) -> None:
+    """The batch is the agent's now: marked delivered, and what a person asked is watched for an answer."""
+    rp = m_store.room().paths
+    m_log.write_set(rp.delivered_dir, p["id"], delivered | {m["id"] for m in batch})
+    # Only a person waits for an answer (twelve «hasn't replied» about agents'
+    # messages to each other reached him) — agents' talk among themselves is not watched.
+    asked = [m for m in batch if m["from"] != m_text.ROOM and m["from"] in m_store.people_ids(config)]
+    if asked:
+        awaiting = m_store.read_json(rp.await_path)
+        awaiting[p["id"]] = waits_of(awaiting, p["id"]) + [
+            {"id": m["id"], "from": m["from"], "at": m_store.now(), "worked": False} for m in asked
+        ]
+        m_store.write_json(rp.await_path, awaiting)
 
 
 def current_panes(config: dict[str, Any]) -> dict[str, str]:

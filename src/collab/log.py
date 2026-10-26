@@ -188,6 +188,7 @@ def append_message(
     via: str = "",
     tg: str = "",
     files: list[dict[str, Any]] | None = None,
+    urgent: bool = False,
 ) -> dict[str, Any]:
     rp = m_store.room().paths
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": m_store.now(), "from": sender, "to": to, "text": text}
@@ -195,6 +196,8 @@ def append_message(
         record["re"] = re_
     if quiet:
         record["quiet"] = True  # a note that wakes no one (is_quiet)
+    if urgent:
+        record["urgent"] = True  # typed even into a running turn, at once (deliver.is_urgent: only the person's or the lead's)
     if silent:
         record["silent"] = True  # the room's own note: never typed to an agent (is_silent)
     if service:

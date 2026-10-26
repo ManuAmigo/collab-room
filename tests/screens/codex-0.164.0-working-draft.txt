@@ -1,0 +1,9 @@
+• Выполню sleep 40 и дождусь завершения.
+ 
+◦ Working (6s • esc to interrupt) · 1 background terminal running · /ps to view · /stop to close
+ 
+ 
+› STEER-ENTER-42: When the running sleep finishes, change the final answer of this current turn to ENTER-ACK-42 instead of BASE-DONE. Do not start
+  another command.
+ 
+  tab to queue message                                                                                                              98% context left

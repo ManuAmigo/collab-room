@@ -337,6 +337,7 @@ def set_paused(paused: bool) -> None:
                     quiet=h.get("quiet") is True,
                     silent=h.get("silent") is True,
                     service=h.get("service") is True,
+                    urgent=h.get("urgent") is True,
                 )
         rp.held_path.unlink()
     if not paused:

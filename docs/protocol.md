@@ -253,6 +253,19 @@ command shell is rejected. These checks do not prove that the model is ready.
 
 This is an explicit permission to type text into another participant's window, enabled for a specific role. The regex is a heuristic on a screen snapshot, not confirmation of the model's state. A false match can send a message into an unexpected prompt; there is also a short race window between checking the screen and pressing Enter. Tune `idle` to the unique prompt of the CLI version you use and watch the first deliveries. A successful tmux call means only that text and Enter were entered into the pane; it does not prove that the model received or processed the message.
 
+An agent that works without a pause is never seen at its prompt. A message that would wake it and has
+waited a minute is typed into its running turn: Claude Code queues it and takes it after its next tool call;
+Codex submits it into the turn the same way. It is typed only into an empty input, never over the person's draft,
+one at a time, and is marked delivered only once the screen shows it taken (Claude's «Press up to edit queued
+messages», Codex's «Messages to be submitted after next tool call» block). Not seen taken, it is neither marked
+nor typed again for two minutes. A question that comes up on the screen while it is typed gets no Enter.
+`collab status` and `/team` show «not delivered: N, the oldest M min»; after ten minutes the sender is told once
+that the message waits.
+
+Urgent: `say --urgent` (the person's or the lead's only), or a person's message whose first word is «стоп» or
+«stop» (not «стопка»). It goes into the running turn at once, without the minute, marked «URGENT:» — or «URGENT
+(by its first word «стоп»)» — and its sender is told after two minutes if it still waits.
+
 A service message that expects no reply is written with `say --quiet`: «Taking», «machine is free»,
 «done checking». Such a message does not wake the agent. It sits in its `inbox` and goes to the window together
 with the next regular message, as one summary. Every wake-up rereads the agent's whole context.

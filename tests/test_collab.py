@@ -940,6 +940,35 @@ class RoomTest(Base):
         self.assertIn("claude: No update for", stale)
         self.assertEqual(self.run_collab("status", "--as", "claude", "sleeping").returncode, 2)
 
+    def test_status_and_team_show_how_many_messages_wait_untyped_and_since_when(self):
+        # An agent busy all the time is never typed to: its letters piled up for half an hour and the room said only
+        # «is working».
+        busy = {"idle": "x", "busy": "y"}
+        self.write_config(
+            [
+                {"id": "owner", "command": ["sh"]},
+                {"id": "lead", "delivery": "pull", **busy},
+                {"id": "yadro", "delivery": "tmux", "target": "t:0", **busy},
+                {"id": "reader", "delivery": "pull", **busy},
+            ]
+        )
+        for _ in range(3):
+            self.run_collab("say", "--from", "lead", "--to", "yadro", "--to", "reader", "do it")
+        log = self.state / "messages.jsonl"
+        records = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        for rec, minutes in zip(records, (12, 7, 0)):
+            rec["at"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        log.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        line = lambda out, pid: next(row for row in out.splitlines() if pid in row.split(" —")[0])
+        self.assertIn("· not delivered: 3, the oldest 12 min", line(self.run_collab("status").stdout, "yadro"))
+        self.assertIn("· not delivered: 3, the oldest 12 min", line(self.run_collab("team").stdout, "yadro"))
+        self.assertNotIn("not delivered", line(self.run_collab("status").stdout, "reader"), "it reads its inbox itself")
+        (self.state / "delivered").mkdir(exist_ok=True)
+        (self.state / "delivered" / "yadro.json").write_text(json.dumps([records[0]["id"]]), encoding="utf-8")
+        self.assertIn("· not delivered: 2, the oldest 7 min", line(self.run_collab("status").stdout, "yadro"))
+        (self.state / "delivered" / "yadro.json").write_text(json.dumps([r["id"] for r in records[:2]]), encoding="utf-8")
+        self.assertNotIn("not delivered", self.run_collab("status").stdout, "under a minute: on its way, not stuck")
+
     def test_a_screen_state_the_deliverer_stopped_renewing_is_not_shown_as_live(self):
         # The deliverer killed, its last screen states stayed on as «ready».
         mod = _Loader("collab_stale_screen", str(COLLAB)).load_module()
@@ -5698,6 +5727,197 @@ for i in range(400):
         back(25)
         tick(screen("Pondering", 5, more="\n⏺ The page opened."))
         self.assertEqual(reasons(), {}, "it moved: the clock starts anew")
+
+    FAKE_BUSY_AGENT = r"""
+import os, select, sys, time, tty
+mode, log = sys.argv[1], sys.argv[2]
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+typed = "a person's draft" if mode == "draft" else ""
+queue, history = [], []
+def note(what):
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(what + "\n")
+while True:
+    hint = "\x1b[2mPress up to edit queued messages\x1b[0m" if queue and not typed else typed
+    # As Claude Code: a long input wraps (its spinner goes above the bottom lines), and with text in the input the
+    # footer drops «esc to interrupt».
+    wrapped = [hint[i : i + 40] for i in range(0, len(hint), 40)] if typed else [hint]
+    rows = history[-6:] + ["❯ " + q[0] for q in queue] + ["✢ Crafting… (5s · ↓ 1 tokens)", "─" * 40, "❯ " + wrapped[0],
+            *["  " + w for w in wrapped[1:]], "─" * 40, "  ⏵⏵ auto mode on" + ("" if typed else " · esc to interrupt")]
+    if mode == "ask" and typed:  # its turn asks the person right as the text comes in
+        rows = history[-6:] + [" Do you want to proceed?", " ❯ 1. Yes", "   2. No", "", " Esc to cancel · Tab to amend"]
+    sys.stdout.write("\x1b[2J\x1b[H" + "\r\n".join(rows)); sys.stdout.flush()
+    if select.select([fd], [], [], 0.1)[0]:
+        for ch in os.read(fd, 65536).decode(errors="replace"):
+            if ch == "\r":
+                note("ENTER")
+                if mode == "take" and typed:
+                    queue.append((typed, time.time())); typed = ""
+            else:
+                typed += ch
+    for q in [q for q in queue if time.time() - q[1] > 1.5]:
+        queue.remove(q); history.append("❯ " + q[0]); note("TAKEN " + q[0])
+"""
+
+    @unittest.skipUnless(HAVE_TMUX, "tmux not installed")
+    def test_an_agent_that_works_without_a_pause_is_typed_to_in_its_turn_only_into_an_empty_input_and_only_once(self):
+        # Five letters to an agent working without a pause were never typed: delivery waited for a free moment that
+        # never came. Now, after a while, into the running turn — but never over a person's draft, and a message
+        # not seen taken is neither marked delivered nor typed again.
+        mod = _Loader("collab_busy_typing", str(COLLAB)).load_module()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("COLLAB_BUSY_AFTER_SECONDS", None)
+            self.assertEqual(mod.busy_after(), 60, "a minute at most without a free moment")
+        fake = self.root / "fake_agent.py"
+        fake.write_text(self.FAKE_BUSY_AGENT, encoding="utf-8")
+        session = f"bz-{uuid.uuid4().hex[:6]}"
+        modes = {"take": "Taker", "draft": "Drafted", "deaf": "Deaf", "ask": "Asker"}
+        logs = {m: self.root / f"{m}.log" for m in modes}
+        for i, mode in enumerate(modes):
+            cmd = f"exec python3 {fake} {mode} {logs[mode]}"
+            place = (
+                ["new-session", "-d", "-s", session, "-x", "120", "-y", "30"] if i == 0 else ["new-window", "-t", f"={session}:"]
+            )
+            subprocess.run(["tmux", *place, "-n", mode, cmd], check=True)
+        self.addCleanup(subprocess.run, ["tmux", "kill-session", "-t", f"={session}"], capture_output=True)
+        rules = {k: v for k, v in mod.PRESETS["claude"].items() if k in mod.SCREEN_KEYS}
+        agents = [{"id": m, "label": n, "kind": "claude", "delivery": "tmux", "target": f"{session}:{m}", "joined": True, **rules}
+                  for m, n in modes.items()]  # fmt: skip
+        self.write_config([{"id": "owner", "command": ["sh"]}, {"id": "lead", "delivery": "pull", "idle": "x"}, *agents])
+        start = time.time()  # before the messages: their time is written to the second
+        for mode in modes:
+            self.run_collab("say", "--from", "lead", "--to", mode, f"report to me, {mode}")
+        env = {**os.environ, "COLLAB_ROOT": str(self.root), "COLLAB_BUSY_AFTER_SECONDS": "3", "COLLAB_NO_ATTACH": "1"}
+        deliverer = subprocess.Popen(
+            [str(COLLAB), "deliver", "--interval", "0.5"],
+            cwd=self.root,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(lambda: (deliverer.kill(), deliverer.wait()))
+        read = lambda mode: logs[mode].read_text(encoding="utf-8").splitlines() if logs[mode].exists() else []
+        delivered = lambda mode: (
+            set(json.loads(f.read_text())) if (f := self.state / "delivered" / f"{mode}.json").exists() else set()
+        )
+        taken = self.until(lambda: [x for x in read("take") if x.startswith("TAKEN")], timeout=40)
+        took = time.time() - start
+        self.assertTrue(taken, "never typed into the running turn")
+        self.assertGreaterEqual(took, 2, "not before its while (3 s, its time to the second): a free moment is the way in")
+        self.assertIn("report to me, take", taken[0])
+        self.assertEqual(len(delivered("take")), 1, "marked once the screen showed it queued")
+        time.sleep(6)
+        self.assertEqual(read("take").count("ENTER"), 1, "typed once")
+        self.assertEqual(read("draft"), [], "a person's draft in the input: nothing typed over it")
+        self.assertEqual(delivered("draft"), set())
+        self.assertEqual(read("deaf").count("ENTER"), 1, "not seen taken: not typed again")
+        self.assertEqual(delivered("deaf"), set(), "and not marked delivered")
+        self.assertEqual(read("ask"), [], "a question came up while typing: no Enter to answer it for the person")
+        self.assertEqual(delivered("ask"), set())
+        self.assertEqual(json.loads((self.state / "status.json").read_text())["take"]["state"], "working", "it worked all along")
+
+    @unittest.skipUnless(HAVE_TMUX, "tmux not installed")
+    def test_an_urgent_message_of_the_person_or_the_lead_is_typed_into_a_running_turn_at_once(self):
+        # «Stop» to an agent working without a pause waited with the rest. The person's or the lead's urgent one —
+        # say --urgent, or a person's message whose first word is «стоп» — goes in at once, marked as such.
+        fake = self.root / "fake_agent.py"
+        fake.write_text(self.FAKE_BUSY_AGENT, encoding="utf-8")
+        session = f"ur-{uuid.uuid4().hex[:6]}"
+        names = ("flagged", "worded", "pile", "plain")
+        logs = {n: self.root / f"{n}.log" for n in names}
+        for i, name in enumerate(names):
+            place = (
+                ["new-session", "-d", "-s", session, "-x", "120", "-y", "30"] if i == 0 else ["new-window", "-t", f"={session}:"]
+            )
+            subprocess.run(["tmux", *place, "-n", name, f"exec python3 {fake} take {logs[name]}"], check=True)
+        self.addCleanup(subprocess.run, ["tmux", "kill-session", "-t", f"={session}"], capture_output=True)
+        mod = _Loader("collab_urgent", str(COLLAB)).load_module()
+        rules = {k: v for k, v in mod.PRESETS["claude"].items() if k in mod.SCREEN_KEYS}
+        agents = [
+            {"id": n, "kind": "claude", "delivery": "tmux", "target": f"{session}:{n}", "joined": True, **rules} for n in names
+        ]
+        self.write_config(
+            [{"id": "owner", "command": ["sh"]}, {"id": "lead", "delivery": "pull", "idle": "x"},
+             {"id": "worker", "delivery": "pull", "idle": "x"}, *agents],
+            team={"lead": "lead"},
+        )  # fmt: skip
+        refused = self.run_collab("say", "--from", "worker", "--to", "plain", "--urgent", "stop it")
+        self.assertNotEqual(refused.returncode, 0, "an agent's own urgency would stop the others' work at will")
+        self.assertIn("--urgent is the person's or the lead's", refused.stderr)
+        self.assertEqual(self.run_collab("say", "--from", "lead", "--to", "flagged", "--urgent", "drop it").returncode, 0)
+        self.run_collab("say", "--from", "owner", "--to", "worded", "Стоп, хватит тестов")
+        self.run_collab("say", "--from", "owner", "--to", "pile", "стопка бумаг на столе")
+        self.run_collab("say", "--from", "lead", "--to", "plain", "when you can")
+        env = {**os.environ, "COLLAB_ROOT": str(self.root), "COLLAB_BUSY_AFTER_SECONDS": "600", "COLLAB_NO_ATTACH": "1"}
+        deliverer = subprocess.Popen(
+            [str(COLLAB), "deliver", "--interval", "0.5"],
+            cwd=self.root,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(lambda: (deliverer.kill(), deliverer.wait()))
+        taken = lambda n: [
+            x for x in (logs[n].read_text(encoding="utf-8").splitlines() if logs[n].exists() else []) if x.startswith("TAKEN")
+        ]
+        self.assertTrue(self.until(lambda: taken("flagged") and taken("worded"), timeout=20), "not at once")
+        self.assertIn("[lead → flagged] URGENT: drop it", taken("flagged")[0])
+        self.assertIn("[owner → worded] URGENT (by its first word «Стоп»): Стоп, хватит тестов", taken("worded")[0])
+        time.sleep(3)
+        self.assertEqual(taken("pile"), [], "«стопка» is not «стоп»: it waits for a free moment")
+        self.assertEqual(taken("plain"), [], "not urgent: it waits")
+
+    def test_a_sender_is_told_once_when_its_messages_wait_ten_minutes_untyped_to_an_agent_that_works_on(self):
+        # Five letters to an agent working without a pause were never typed, and its lead waited half an hour unknowing.
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_undelivered_told", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        busy = {"idle": '^❯[  ]*(Try "|$)', "busy": "^  (?:[^\\n]*· )?esc to interrupt(?: ·|\\s*$)"}
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, **busy}
+        self.write_config([{"id": "owner", "command": ["sh"]}, {"id": "lead", "delivery": "pull", **busy}, p])
+        for name in ("screen.pane_guard", "screen.screen_model", "screen.claude_session_model"):
+            self.enterContext(seam(mod, name, lambda *a, **k: ""))
+        self.enterContext(seam(mod, "deliver.hold_for_limit", lambda *a, **k: False))
+        self.enterContext(seam(mod, "deliver.watch_for_reply", lambda *a, **k: None))
+        self.enterContext(seam(mod, "deliver.deliver_to", lambda *a, **k: ""))
+        working = "⏺ Working.\n────\n❯ \n────\n  ⏵⏵ auto mode on · esc to interrupt\n"
+        ready = "⏺ Done.\n────\n❯ \n────\n  ⏵⏵ auto mode on\n"
+        sent: list[dict] = []
+
+        def say(sender, minutes):
+            rec = mod.append_message(sender, ["yadro"], "do it")
+            at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
+            sent.append({**rec, "at": at.isoformat(timespec="seconds")})
+
+        def told(screen):
+            out = lambda argv: SimpleNamespace(returncode=0, stdout=screen + (argv[-1] + "\n" if ";" in argv else ""), stderr="")
+            before = len(mod.read_messages())
+            with seam(mod, "tmuxio.tmux", lambda *a, **k: out(a)):
+                mod.deliver_one(p, "t:0", mod.load_config(), list(sent))
+            return [(m["to"], m["text"]) for m in mod.read_messages()[before:]]
+
+        say("lead", 12)
+        say("lead", 11)
+        say("owner", 3)
+        ((to, text),) = told(working)
+        self.assertEqual(to, ["lead"], "only the one whose messages are late, nobody else")
+        self.assertTrue(text.startswith("Yadro has not got 2 of your messages since "), text)
+        self.assertIn("its input was not free, or taking them was not seen", text, "the real reason, not «only at a free moment»")
+        self.assertEqual(told(working), [], "once: not every tick")
+        sent[2]["at"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=11)).isoformat(timespec="seconds")
+        self.assertEqual(told(ready), [], "a free moment: it is typed now, nothing to tell")
+        ((to, text),) = told(working)
+        self.assertEqual(to, ["owner"])
+        self.assertTrue(text.startswith("Yadro has not got your message of "), text)
+        say("lead", 10)
+        ((to, text),) = told(working)
+        self.assertEqual(to, ["lead"], "a new late one: told about it alone")
+        self.assertTrue(text.startswith("Yadro has not got your message of "), text)
+        mod.write_set(mod.room().paths.delivered_dir, "yadro", {m["id"] for m in sent})
+        self.assertEqual(told(working), [])
+        self.assertEqual(mod.read_json(mod.room().paths.state_dir / "undelivered.json"), {"yadro": []}, "typed: forgotten")
 
     def test_the_background_clock_starts_at_the_first_command_seen_and_runs_on_over_ready(self):
         # Ready while background agents still run — the time goes on, from the earliest
@@ -16678,6 +16898,39 @@ class PromptsTest(unittest.TestCase):
 
     def screen(self, name: str) -> str:
         return (SCREENS / f"{name}.txt").read_text(encoding="utf-8")
+
+    def test_an_enter_into_a_turn_goes_only_to_an_input_that_is_the_last_block_and_holds_the_whole_text(self):
+        # The Enter after typing into a running turn must not answer a question for the person: the input is the
+        # screen's last block, with nothing asking below it, and it holds all of what was typed.
+        rules = self.mod.PRESETS["claude"]
+        text = "[lead → yadro] step 1. check the build and report  (answer: collab say --re 0123456789ab)"
+        box = "────\n❯ [lead → yadro] step\n  1. check the build and report  (answer: collab say --re 0123456789ab)\n────\n  ⏵⏵ auto mode on\n"
+        holds = lambda screen: self.mod.input_holds(rules, self.mod.Shot(0, screen, ""), text)
+        self.assertTrue(holds("✢ Crafting… (5s)\n" + box), "its own «1. » wrapped in the input is not a menu")
+        history = f"❯ {text}\n⏺ Done.\n"
+        menu = " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n"
+        self.assertFalse(holds(history + menu), "the same text in its history, a menu below: not its input")
+        self.assertFalse(holds(history + menu + " Esc to cancel · Tab to amend\n"))
+        self.assertFalse(holds("────\n❯ [lead → yadro] step 1. check the build\n────\n"), "only part of it")
+        self.assertFalse(holds(box + "⏺ " + "a screen of something else " * 20 + "\n"), "more than its frame below it")
+
+    def test_a_working_agents_input_is_read_as_empty_drafted_or_with_a_message_queued_from_real_screens(self):
+        # Typed into a running turn only into an empty input: a person's draft under «Working» is the person's, and
+        # a message already in the agent's queue waits there first.
+        cases = {
+            ("claude", "claude-2.1.310-busy-empty"): (True, True),
+            ("claude", "claude-2.1.310-busy-draft"): (False, False),
+            ("claude", "claude-2.1.310-busy-queued"): (False, True),
+            ("codex", "codex-0.164.0-working-empty"): (True, True),
+            ("codex", "codex-0.164.0-working-draft"): (False, False),
+            ("codex", "codex-0.164.0-working-steered"): (False, True),
+        }
+        for (kind, name), (free, empty) in cases.items():
+            rules = self.mod.PRESETS[kind]
+            shot = self.mod.Shot(0, self.screen(name), "")
+            self.assertEqual(self.mod.screen_state(rules, "%1", shot)[0], "working", name)
+            self.assertEqual(self.mod.input_free(rules, shot), free, name)
+            self.assertEqual(self.mod.input_free(rules, shot, queue_too=False), empty, f"{name}: the input line alone")
 
     def test_a_claude_dialog_is_read_whole_with_every_option_as_shown(self):
         got = self.mod.read_prompt("claude", "2.1.310", self.screen("claude-2.1.310-bash"), 110)
