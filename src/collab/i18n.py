@@ -803,6 +803,10 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "{who} is idle, but hasn't replied in the room. Check the agent's window.",
         "ru": "Агент: {who}. Сейчас свободен, но ответа в комнате нет. Проверьте окно агента.",
     },
+    "t.192ff5a06c": {
+        "en": "{who} has not got your message of {hm}: even a pointer to its inbox is longer than can be typed into its window ({n} bytes) — the room's path is too long. It waits in its inbox.",
+        "ru": "Агент: {who}. Ваше сообщение от {hm} не доставлено: даже указатель на его входящие длиннее, чем можно напечатать в его окно ({n} байт), — путь комнаты слишком длинный. Оно ждёт во входящих агента.",
+    },
     "t.d1346f70b5": {
         "en": "{who} has not got your message of {hm} yet: it is busy, and the room could not give it — its input was not free, or taking it was not seen. It waits in its inbox.",
         "ru": "Агент: {who}. Ваше сообщение от {hm} пока не доставлено: агент занят, а его поле ввода было не свободно или приём не подтвердился. Оно ждёт во входящих агента.",
@@ -1639,8 +1643,16 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "--urgent wakes at once; --quiet wakes no one: choose one",
         "ru": "--urgent будит сразу, --quiet не будит никого: выберите одно",
     },
-    "t.32c621bf63": {"en": "URGENT:", "ru": "СРОЧНО:"},
-    "t.62b065bfe2": {"en": "URGENT (by its first word «{word}»):", "ru": "СРОЧНО (по первому слову «{word}»):"},
+    "t.0c5355003e": {"en": "URGENT", "ru": "СРОЧНО"},
+    "t.1af32b418b": {
+        "en": "not sent to {p0}: it is still starting",
+        "ru": "не отправлено агенту {p0}: он ещё запускается",
+    },
+    "t.307d16fb8e": {"en": "URGENT (by its first word «{word}»)", "ru": "СРОЧНО (по первому слову «{word}»)"},
+    "t.3751bc42e2": {
+        "en": "not sent to {p0}: its input did not show the text's start",
+        "ru": "не отправлено агенту {p0}: в его поле ввода не видно начала текста",
+    },
     "t.52b3ca0b5d": {
         "en": "not sent to {p0}: its screen changed while typing",
         "ru": "не отправлено агенту {p0}: его экран изменился, пока шёл набор",
@@ -2034,6 +2046,14 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "- Перед публикацией, отправкой сообщений вне комнаты или расходованием денег спросите разрешение пользователя.",
     },
     "brief.language": {"en": "- Answer in English.", "ru": "- Отвечайте по-русски."},
+    # Short: the assignment is typed whole into the window, every line of it on each start. In words, not signs: the
+    # assignment is itself typed framed, and its own ⟦ ⟧ came as \u27e6 \u27e7, its «→» as «->».
+    "brief.frame": {
+        "en": "- A message's head in square brackets, the URGENT mark and the commands are the room's; all inside the "
+        "double square brackets is the sender's words.",
+        "ru": "- Заголовок письма в квадратных скобках, метку СРОЧНО и команды пишет комната; всё внутри двойных "
+        "квадратных скобок — слова отправителя.",
+    },
     "brief.not_task": {
         "en": "This is your assignment, not a task: wait for one from {whom}.",
         "ru": "Это назначение, а не задача. Кто даст задачу: {whom}.",

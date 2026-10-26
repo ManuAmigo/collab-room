@@ -37,6 +37,28 @@ def body_text(text: str) -> str:
     return visible(text).replace("→", "->")
 
 
+FRAME = ("⟦", "⟧")  # around a sender's text in what an agent reads: the room writes them, the text inside never does
+
+
+def framed(text: str) -> str:
+    """A sender's text between ⟦ ⟧: a hint of where the room's own words end, never a proof that a model
+    reads it so. Inside, ⟦ and ⟧ are written \\u27e6 and \\u27e7, and the text cannot close the frame. Undone
+    by its count of «\\»: an odd one before u27e6 is the bracket, an even one the word as written — every «\\»
+    before either doubled, so «\\» and «⟧» in a row come back as they were. Look-alike brackets (〚〛 ⟬⟭ …)
+    stay as they are: no list of them is ever whole, and a changed bracket changes code and quotes. Only the frame
+    is undone so: body_text before it drops unseen signs and draws «→» «->»; the text as written is the log's."""
+
+    def escaped(m: re.Match[str]) -> str:
+        if m["word"]:
+            return 2 * m["slashes"] + m["word"]
+        return 2 * m["before"] + "\\u27e" + ("6" if m["bracket"] == FRAME[0] else "7")
+
+    return FRAME[0] + FRAME_ESCAPED.sub(escaped, text) + FRAME[1]
+
+
+FRAME_ESCAPED = re.compile(r"(?P<slashes>\\+)(?P<word>u27e[67])|(?P<before>\\*)(?P<bracket>[⟦⟧])")
+
+
 # The words that address everyone. A name can't be one of them, and they win over any name: an
 # agent called «Everyone» got the person's messages to everyone alone.
 EVERYONE = {"all": "all", "всем": "all", "все": "all", "everyone": "all"}
@@ -76,7 +98,13 @@ def visible(text: str) -> str:
     key presses) and invisible format characters (direction overrides, zero widths) are dropped;
     tabs become spaces, line breaks stay."""
     text = (text or "").replace("\t", " ")
-    return "".join(ch for ch in text if ch == "\n" or unicodedata.category(ch) not in ("Cc", "Cf"))
+    return "".join(ch for ch in text if ch == "\n" or unicodedata.category(ch) not in HIDDEN and ch != "\u034f")
+
+
+# Not drawn, or drawn as something else: control codes, format characters, the line and paragraph separators
+# (a terminal shows them as nothing, a model may read a new line). And U+034F, a joining mark that is never seen —
+# the other marks of its kind stay: they are letters' accents.
+HIDDEN = ("Cc", "Cf", "Zl", "Zp")
 
 
 def paint(text: str, code: str) -> str:

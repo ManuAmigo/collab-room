@@ -770,6 +770,7 @@ def brief(pid: str, config: dict[str, Any], version: int = 0, propose: str = "")
     else:
         lines.append(t("brief.without.none"))
     lines.append(t("brief.language"))
+    lines.append(t("brief.frame"))
     # Live, a reviewer told its topic and no task began reviewing the folder on its own.
     lines.append(t("brief.not_task", whom=named(to, "whom.person.from")))
     lines.append(t("brief.foot"))

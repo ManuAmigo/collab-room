@@ -263,8 +263,22 @@ nor typed again for two minutes. A question that comes up on the screen while it
 that the message waits.
 
 Urgent: `say --urgent` (the person's or the lead's only), or a person's message whose first word is «стоп» or
-«stop» (not «стопка»). It goes into the running turn at once, without the minute, marked «URGENT:» — or «URGENT
-(by its first word «стоп»)» — and its sender is told after two minutes if it still waits.
+«stop» (not «стопка»). It goes into the running turn at once, without the minute, marked in its head by the room —
+«[lead → you · URGENT]» or «· URGENT (by its first word «стоп»)»; a text that only begins with «URGENT:» is not — and its sender is told after two minutes if it still waits.
+
+A delivered message is one line: the room's head, the sender's text between ⟦ and ⟧, the ready commands —
+`[mal → you] ⟦…⟧  (answer: …)`. Inside, the text's own ⟦ and ⟧ are written `\u27e6` and `\u27e7` (and every
+`\` right before either is doubled), so a text cannot close its frame; `inbox` and `show` frame it the same way,
+and the room's log keeps it as written. Only the frame is undone exactly: what is shown also drops
+invisible characters, draws «→» as «->», and a delivered line joins the text's spaces and line breaks into one
+space — the raw text is only in the log. The digest of several messages is a format of its own, without the frame:
+each entry keeps only letters, digits and plain marks. Look-alike brackets (〚〛, ⟬⟭ and others) are left as they are: no list of
+them is complete. The frame is a hint of where the room's words end, not a guarantee that a model reads it so —
+and not a sign that a message was taken: a folded paste hides it on screen. A line longer than the limit — head,
+text, frame and commands together — goes as a pointer to `inbox` with the commands to answer; then as the `inbox` command alone — `inbox` prints
+the ready commands under each of an agent's messages. A command is never cut short of its room or program: if
+even the `inbox` command does not fit, the message is not typed, and its sender is told the room's path is too long. The
+same rule is in each agent's assignment, which it receives at start.
 
 A service message that expects no reply is written with `say --quiet`: «Taking», «machine is free»,
 «done checking». Such a message does not wake the agent. It sits in its `inbox` and goes to the window together

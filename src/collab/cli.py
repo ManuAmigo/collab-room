@@ -180,7 +180,16 @@ def cmd_inbox(args: argparse.Namespace) -> None:
     if not mine:
         print(m_i18n.tr("No unacknowledged messages for {participant}.", participant=args.participant))
         return
-    print("\n\n".join(m_chat_base.fmt(m, config=config) for m in mine))
+    me = m_store.participant(config, args.participant)
+    # An agent's, with the ready commands under each: a long message's pointer is the inbox command alone.
+    hints = me.get("reply_hint", True) and args.participant not in m_store.people_ids(config)
+    print(
+        "\n\n".join(
+            m_chat_base.fmt(m, config=config)
+            + (f"\n  ({hint})" if hints and (hint := m_deliver.answer_hint(me, m, config, check_rule=False)) else "")
+            for m in mine
+        )
+    )
 
 
 @m_store.room_locked

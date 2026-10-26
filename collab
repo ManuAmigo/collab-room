@@ -262,7 +262,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.28"
+VERSION = "0.1.29"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:
@@ -642,6 +642,28 @@ def body_text(text: str) -> str:
     return visible(text).replace("→", "->")
 
 
+FRAME = ("⟦", "⟧")  # around a sender's text in what an agent reads: the room writes them, the text inside never does
+
+
+def framed(text: str) -> str:
+    """A sender's text between ⟦ ⟧: a hint of where the room's own words end, never a proof that a model
+    reads it so. Inside, ⟦ and ⟧ are written \\u27e6 and \\u27e7, and the text cannot close the frame. Undone
+    by its count of «\\»: an odd one before u27e6 is the bracket, an even one the word as written — every «\\»
+    before either doubled, so «\\» and «⟧» in a row come back as they were. Look-alike brackets (〚〛 ⟬⟭ …)
+    stay as they are: no list of them is ever whole, and a changed bracket changes code and quotes. Only the frame
+    is undone so: body_text before it drops unseen signs and draws «→» «->»; the text as written is the log's."""
+
+    def escaped(m: re.Match[str]) -> str:
+        if m["word"]:
+            return 2 * m["slashes"] + m["word"]
+        return 2 * m["before"] + "\\u27e" + ("6" if m["bracket"] == FRAME[0] else "7")
+
+    return FRAME[0] + FRAME_ESCAPED.sub(escaped, text) + FRAME[1]
+
+
+FRAME_ESCAPED = re.compile(r"(?P<slashes>\\+)(?P<word>u27e[67])|(?P<before>\\*)(?P<bracket>[⟦⟧])")
+
+
 # The words that address everyone. A name can't be one of them, and they win over any name: an
 # agent called «Everyone» got the person's messages to everyone alone.
 EVERYONE = {"all": "all", "всем": "all", "все": "all", "everyone": "all"}
@@ -681,7 +703,13 @@ def visible(text: str) -> str:
     key presses) and invisible format characters (direction overrides, zero widths) are dropped;
     tabs become spaces, line breaks stay."""
     text = (text or "").replace("\t", " ")
-    return "".join(ch for ch in text if ch == "\n" or unicodedata.category(ch) not in ("Cc", "Cf"))
+    return "".join(ch for ch in text if ch == "\n" or unicodedata.category(ch) not in HIDDEN and ch != "\u034f")
+
+
+# Not drawn, or drawn as something else: control codes, format characters, the line and paragraph separators
+# (a terminal shows them as nothing, a model may read a new line). And U+034F, a joining mark that is never seen —
+# the other marks of its kind stay: they are letters' accents.
+HIDDEN = ("Cc", "Cf", "Zl", "Zp")
 
 
 def paint(text: str, code: str) -> str:
@@ -2068,6 +2096,10 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "{who} is idle, but hasn't replied in the room. Check the agent's window.",
         "ru": "Агент: {who}. Сейчас свободен, но ответа в комнате нет. Проверьте окно агента.",
     },
+    "t.192ff5a06c": {
+        "en": "{who} has not got your message of {hm}: even a pointer to its inbox is longer than can be typed into its window ({n} bytes) — the room's path is too long. It waits in its inbox.",
+        "ru": "Агент: {who}. Ваше сообщение от {hm} не доставлено: даже указатель на его входящие длиннее, чем можно напечатать в его окно ({n} байт), — путь комнаты слишком длинный. Оно ждёт во входящих агента.",
+    },
     "t.d1346f70b5": {
         "en": "{who} has not got your message of {hm} yet: it is busy, and the room could not give it — its input was not free, or taking it was not seen. It waits in its inbox.",
         "ru": "Агент: {who}. Ваше сообщение от {hm} пока не доставлено: агент занят, а его поле ввода было не свободно или приём не подтвердился. Оно ждёт во входящих агента.",
@@ -2904,8 +2936,16 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "--urgent wakes at once; --quiet wakes no one: choose one",
         "ru": "--urgent будит сразу, --quiet не будит никого: выберите одно",
     },
-    "t.32c621bf63": {"en": "URGENT:", "ru": "СРОЧНО:"},
-    "t.62b065bfe2": {"en": "URGENT (by its first word «{word}»):", "ru": "СРОЧНО (по первому слову «{word}»):"},
+    "t.0c5355003e": {"en": "URGENT", "ru": "СРОЧНО"},
+    "t.1af32b418b": {
+        "en": "not sent to {p0}: it is still starting",
+        "ru": "не отправлено агенту {p0}: он ещё запускается",
+    },
+    "t.307d16fb8e": {"en": "URGENT (by its first word «{word}»)", "ru": "СРОЧНО (по первому слову «{word}»)"},
+    "t.3751bc42e2": {
+        "en": "not sent to {p0}: its input did not show the text's start",
+        "ru": "не отправлено агенту {p0}: в его поле ввода не видно начала текста",
+    },
     "t.52b3ca0b5d": {
         "en": "not sent to {p0}: its screen changed while typing",
         "ru": "не отправлено агенту {p0}: его экран изменился, пока шёл набор",
@@ -3299,6 +3339,14 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "- Перед публикацией, отправкой сообщений вне комнаты или расходованием денег спросите разрешение пользователя.",
     },
     "brief.language": {"en": "- Answer in English.", "ru": "- Отвечайте по-русски."},
+    # Short: the assignment is typed whole into the window, every line of it on each start. In words, not signs: the
+    # assignment is itself typed framed, and its own ⟦ ⟧ came as \u27e6 \u27e7, its «→» as «->».
+    "brief.frame": {
+        "en": "- A message's head in square brackets, the URGENT mark and the commands are the room's; all inside the "
+        "double square brackets is the sender's words.",
+        "ru": "- Заголовок письма в квадратных скобках, метку СРОЧНО и команды пишет комната; всё внутри двойных "
+        "квадратных скобок — слова отправителя.",
+    },
     "brief.not_task": {
         "en": "This is your assignment, not a task: wait for one from {whom}.",
         "ru": "Это назначение, а не задача. Кто даст задачу: {whom}.",
@@ -4356,6 +4404,7 @@ def brief(pid: str, config: dict[str, Any], version: int = 0, propose: str = "")
     else:
         lines.append(t("brief.without.none"))
     lines.append(t("brief.language"))
+    lines.append(t("brief.frame"))
     # Live, a reviewer told its topic and no task began reviewing the folder on its own.
     lines.append(t("brief.not_task", whom=named(to, "whom.person.from")))
     lines.append(t("brief.foot"))
@@ -6448,6 +6497,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "input": "^›",
         "input_empty": "^› Ask Codex",
         "queued": "^• Messages to be submitted after next tool call",
+        # Still starting (its servers): an Enter given then shows «Waiting for startup  · esc cancel» under the input,
+        # the fold stays, and it took one more Enter after it (codex 0.164) — that Enter is no proof it was taken.
+        "starting": "^\\s*Waiting for startup\\b",
     },
     "claude": {
         "label": "Claude",
@@ -6487,6 +6539,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "input": "^❯",
         "input_empty": "^❯[ \u00a0]*$",
         "queued": "Press up to edit queued messages",
+        # Typed as keys, a text past about a kilobyte lost its first ~1022 bytes on the way into the input, before
+        # the Enter — 6 or 7 times in 10 (Claude Code 2.1.310). As one bracketed paste none of 20 did.
+        "bracketed_paste": True,
     },
 }
 
@@ -6633,6 +6688,8 @@ SCREEN_KEYS = (
     "input",
     "input_empty",
     "queued",
+    "bracketed_paste",
+    "starting",
 )
 
 
@@ -6790,6 +6847,8 @@ def screen_state(p: dict[str, Any], pane: str, shot: Shot | None = None) -> tupl
             titles = re.findall(p["attention_title"], above, re.MULTILINE)
             detail = titles[-1].strip() if titles else ""
         return "needs_owner", detail[:160]
+    if p.get("starting") and re.search(p["starting"], tail, re.MULTILINE):
+        return "joining", ""  # not ready yet: nothing is typed into it
     if p.get("busy") and re.search(p["busy"], tail, re.MULTILINE):
         return "working", ""
     if p.get("idle") and re.search(p["idle"], tail, re.MULTILINE):
@@ -6831,6 +6890,50 @@ def fold_left(rules: dict[str, Any], pane: str, typed: str = "") -> bool:
     return not any(
         rules.get(key) and re.search(rules[key], tail, re.MULTILINE) for key in ("attention", "attention_title", "busy")
     )
+
+
+def type_text(rules: dict[str, Any], pane: str, text: str) -> subprocess.CompletedProcess[str]:
+    """The text into the agent's input, no Enter: as keys, or for an agent that loses the start of a long typed
+    text, as one bracketed paste from a buffer of its own (removed after it)."""
+    if not rules.get("bracketed_paste"):
+        return tmux("send-keys", "-t", pane, "-l", text, check=False)
+    buffer = f"collab-{secrets.token_hex(8)}"
+    loaded = tmux("set-buffer", "-b", buffer, "--", text, check=False)
+    if loaded.returncode != 0:
+        return loaded
+    pasted = tmux("paste-buffer", "-p", "-d", "-b", buffer, "-t", pane, check=False)
+    if pasted.returncode != 0:
+        # -d removes it only with a paste: the message's text is not left on the server.
+        tmux("delete-buffer", "-b", buffer, check=False)
+    return pasted
+
+
+def wait_started(rules: dict[str, Any], pane: str, limit: float = 20.0) -> bool:
+    """Its screen no longer says it is starting — or it never did; False when still starting after the limit."""
+    if not rules.get("starting"):
+        return True
+    until = time.time() + limit
+    while True:
+        shown = tmux("capture-pane", "-p", "-t", pane, check=False)
+        if shown.returncode != 0 or not re.search(rules["starting"], screen_tail_text(rules, shown.stdout), re.MULTILINE):
+            return True
+        if time.time() >= until:
+            return False
+        time.sleep(0.5)
+
+
+def input_starts(rules: dict[str, Any], shot: Shot, text: str) -> bool:
+    """The last input line begins with the text's start, or is its fold — not with its middle: what came in
+    lost its start, and an Enter would send the rest as the whole message. No input line on the screen at all (a
+    seat with a screen of its own) is nothing to judge by: it goes as before."""
+    lines = shot.plain.rstrip("\n").split("\n")[-args_tail() :]
+    at = max((i for i, line in enumerate(lines) if re.match(rules["input"], line)), default=-1)
+    if at < 0:
+        return True
+    if rules.get("paste_fold") and re.match(rules["paste_fold"], lines[at]):
+        return True
+    shown = "".join(re.sub(rules["input"], "", lines[at], count=1).split())
+    return bool(shown) and "".join(text.split()).startswith(shown[:16])
 
 
 def screen_count_any(pane: str, pattern: str) -> bool:
@@ -10808,56 +10911,85 @@ def reply_body(p: dict[str, Any]) -> str:
     return f"- <<'{end}' ↵ … ↵ {end}"
 
 
+def answer_hint(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], check_rule: bool = True) -> str:
+    """The ready commands that answer one message, or close it with none: typed with it, and printed under it in inbox.
+    "" for a record whose sender or id is not a plain word: a line written into the log by hand put «$(…)» and
+    «; …» into a command the agent was told to run — delivery puts such a record aside, inbox did not.
+    `check_rule` — the delivery's: inbox runs as the agent itself, which must not withdraw a Codex rule nor write
+    into the room, and in a sandbox could not write the rules file at all."""
+    if not well_formed(m):
+        return ""
+    pid = p["id"] if check_rule else ""
+    lang = room_language(config)  # the labels in the room's language — the commands stay as they are
+    w = lambda key, **kw: words_in(key, lang, **kw)
+    if m["from"] == ROOM and m.get("brief") is True:
+        # An assignment is taken, not discussed: closed with ack; a question about it goes to the lead or the person.
+        return w("hint.no_answer") + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), pid)
+    if m["from"] == ROOM:
+        return w("hint.reply_room") + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), pid)
+    # Both ways to close it, ready to run.
+    return (
+        w("hint.answer")
+        + room_cmd("say", f"--from {p['id']} --to {m['from']} --re {m['id']} {reply_body(p)}", p.get("cli", ""), pid)
+        + " · "
+        + w("hint.no_answer")
+        + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), pid)
+    )
+
+
 def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], rules: dict[str, Any]) -> str:
     """The line typed into the agent's window for one message: its head, the text, the ready commands."""
     # The room is named in the command itself: an agent working in another folder (or with
     # another room in its COLLAB_ROOT) must still answer here.
     lang = room_language(config)  # the labels in the room's language — the commands stay as they are
     w = lambda key, **kw: words_in(key, lang, **kw)
-    if m["from"] == ROOM and m.get("brief") is True:
-        # An assignment is taken, not discussed: closed with ack; a question about it goes to the lead or the person.
-        hint = w("hint.no_answer") + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"])
-    elif m["from"] == ROOM:
-        hint = w("hint.reply_room") + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), p["id"])
-    else:
-        # Both ways to close it, ready to run.
-        hint = (
-            w("hint.answer")
-            + room_cmd("say", f"--from {p['id']} --to {m['from']} --re {m['id']} {reply_body(p)}", p.get("cli", ""), p["id"])
-            + " · "
-            + w("hint.no_answer")
-            + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"])
-        )
+    hint = answer_hint(p, m, config)
     warn = (w("hint.unsigned") + " ") if unsigned_person(m, config) else ""
-    body = " ".join(body_text(m["text"]).split())  # no head of another inside
-    limit = min(LONG_MESSAGE, int(rules.get("paste_limit") or LONG_MESSAGE))
-    if len(body.encode("utf-8")) > limit:
-        # tmux refuses a line of about 16 KB, and the deliverer died on it at every restart
-        # A long message is read by the agent itself.
-        # Read through inbox: a room-started Codex may run only say/ack/inbox, through its
-        # read-only copy — `show` there was refused. inbox prints it in full.
-        body = w("hint.long", n=len(body), cmd=room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"]))
     # Its role, one word of a closed list, reminds an agent whose context was cut of its assignment; the topic,
     # free text, is never typed with it.
     role = effective(agent_kind(p), p, config, "role")
     you = w("hint.you", role=w(f"role.{role}")) if role in ROLES else ""
     if m.get("via") == "telegram" and not warn:
         warn = w("hint.via_telegram")  # the person writes from the phone: a short answer reads best there
-    return f"[{m['from']} → {', '.join(m['to'])}] {urgent_mark(m, config)}{warn}{body}" + (
-        f"  ({you}{hint})" if p.get("reply_hint", True) else ""
-    )
+    # The mark in the head, which only the room draws («→»): at the text's start an agent's own «URGENT: …» read the same.
+    mark = urgent_tag(m, config)
+    head = f"[{m['from']} → {', '.join(m['to'])}{' · ' + mark if mark else ''}] {warn}"
+    tail = f"  ({you}{hint})" if p.get("reply_hint", True) else ""
+    text = " ".join(body_text(m["text"]).split())  # no head of another inside
+    body = framed(text)
+    limit = min(LONG_MESSAGE, int(rules.get("paste_limit") or LONG_MESSAGE))
+    # tmux refuses a line of about 16 KB, and the deliverer died on it at every restart; Codex folds a long
+    # paste. The whole line counts: a text just under the limit pushed the frame's end and the commands past it.
+    # A long message is read by the agent itself.
+    # Read through inbox: a room-started Codex may run only say/ack/inbox, through its
+    # read-only copy — `show` there was refused. inbox prints it in full.
+    inbox = room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"])
+    # The first that fits: in a room of a long path the commands alone, three times over, were past the limit.
+    # Then the one command that reads it, whole — its room and program never dropped for the size: a bare
+    # «collab inbox» read another room, or an old copy; inbox prints the commands to answer. Even that too long,
+    # deliver_to types nothing (too_long).
+    for line in (head + body + tail, head + w("hint.long", n=len(text), cmd=inbox) + tail):
+        if len(line.encode("utf-8")) <= limit:
+            return line
+    return head + w("hint.long", n=len(text), cmd=inbox)
 
 
-def urgent_mark(m: dict[str, Any], config: dict[str, Any]) -> str:
-    """«URGENT: » before an urgent message's text, said as the room's — the agent sees why it is typed into its work,
-    and that a person's «стоп» was taken for urgent by its word, not by a sender's own claim."""
+def urgent_tag(m: dict[str, Any], config: dict[str, Any]) -> str:
+    """«URGENT» for an urgent message, said as the room's — the agent sees why it is typed into its work, and that a
+    person's «стоп» was taken for urgent by its word, not by a sender's own claim; "" — not urgent."""
     why = urgent_word(m, config)
     lang = room_language(config)
     if not why:
         return ""
     if why == "flag":
-        return tr("URGENT:", lang) + " "
-    return tr("URGENT (by its first word «{word}»):", lang, word=why) + " "
+        return tr("URGENT", lang)
+    return tr("URGENT (by its first word «{word}»)", lang, word=why)
+
+
+def urgent_mark(m: dict[str, Any], config: dict[str, Any]) -> str:
+    """«URGENT: » before a message's excerpt in a digest, where the sender's text stands quoted after it."""
+    tag = urgent_tag(m, config)
+    return f"{tag}: " if tag else ""
 
 
 DIGEST_WORDS = 8  # words of each message's start in the digest — enough to tell what it is about
@@ -11226,6 +11358,8 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
             # Into a turn: a long one goes as a pointer to inbox — a fold there is not pressed again.
             rules = {**rules, "paste_limit": min(int(rules.get("paste_limit") or BUSY_PASTE_LIMIT), BUSY_PASTE_LIMIT)}
         text = delivery_text(p, batch[0], config, rules) if len(batch) == 1 else digest_text(p, batch, config, rules)
+        if too_long(p, batch, text, rules, tell=not working):
+            return ""  # too long for a running turn: it waits for a free moment, where the agent's own limit counts
         if working:
             return type_busy(p, pane, rules, batch, text, config, delivered)
         # A last look right before typing: the one deliver_one took was before the room's lock, and
@@ -11237,12 +11371,30 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
         # deliverer between the text and its Enter, and the text stayed in the agent's input as a
         # draft — nothing more was typed to it until someone cleared it by hand.
         STOPPING["typing"] = True
-        sent = tmux("send-keys", "-t", pane, "-l", text, check=False)
+        sent = type_text(rules, pane, text)
         if sent.returncode == 0:
             time.sleep(float(os.environ.get("COLLAB_ENTER_DELAY", "0.3")))
+            if rules.get("bracketed_paste") and not input_starts(rules, look(rules, pane), text):
+                # Its start did not come in: an Enter would send the rest as the message. It stays in the input,
+                # the room shows a draft, and the message waits in the inbox.
+                STOPPING["typing"] = False
+                print(
+                    tr("not sent to {p0}: its input did not show the text's start", p0=p["id"]),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                stop_if_asked()
+                return ""
             sent = tmux("send-keys", "-t", pane, "Enter", check=False)
             if sent.returncode == 0 and rules.get("paste_fold"):
                 time.sleep(float(os.environ.get("COLLAB_ENTER_DELAY", "0.3")) + 0.5)
+                if not wait_started(rules, pane):
+                    # Still starting: its Enter is not proof it was taken. The message waits in the inbox; the
+                    # fold left in the input shows as a draft.
+                    STOPPING["typing"] = False
+                    print(tr("not sent to {p0}: it is still starting", p0=p["id"]), file=sys.stderr, flush=True)
+                    stop_if_asked()
+                    return ""
                 # The fold was not sent yet. Only once, and only into the same process: a
                 # window reused since the look is not pressed. Still there after that, it reads as a
                 # draft — the room shows it and types nothing more there.
@@ -11265,6 +11417,36 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
         STOPPING["typing"] = False
         stop_if_asked()
         return batch[0]["id"]
+
+
+def too_long(p: dict[str, Any], batch: list[dict[str, Any]], text: str, rules: dict[str, Any], tell: bool = True) -> bool:
+    """Even its pointer to inbox is past the limit (a room of a very long path): typed, it would fold, and a command
+    cut short of its room is no command. It waits in the agent's inbox; each sender is told once, at once — not by
+    the limit of a running turn, shorter than the agent's own: it said «path too long» of a pointer that fits an
+    idle agent, and the once spent there kept quiet the real one."""
+    limit = min(LONG_MESSAGE, int(rules.get("paste_limit") or LONG_MESSAGE))
+    if len(text.encode("utf-8")) <= limit:
+        return False
+    if not tell:
+        return True
+    path = room().paths.state_dir / "undelivered.json"
+    told_all = read_json(path)
+    told = told_all.get(p["id"])
+    told = {x for x in told if isinstance(x, str)} if isinstance(told, list) else set()
+    late = [m for m in batch if m["id"] not in told and m["from"] != ROOM]
+    for sender in dict.fromkeys(m["from"] for m in late):
+        room_line(
+            [sender],
+            "{who} has not got your message of {hm}: even a pointer to its inbox is longer than can be typed into its "
+            "window ({n} bytes) — the room's path is too long. It waits in its inbox.",
+            who=p.get("label") or p["id"],
+            hm=local_hm(next(m for m in late if m["from"] == sender)["at"]),
+            n=len(text.encode("utf-8")),
+        )
+    if late:
+        told_all[p["id"]] = sorted(told | {m["id"] for m in late})
+        write_json(path, told_all)
+    return True
 
 
 BUSY_PASTE_LIMIT = 1000  # bytes of a message typed into a running turn; longer goes as a pointer to inbox
@@ -14691,8 +14873,9 @@ def fmt(message: dict[str, Any], with_id: bool = True, config: dict[str, Any] | 
     )
     tail = tr("\n  id: {p0}", p0=" ".join(visible(str(message["id"])).split())) if with_id else ""
     warn = UNSIGNED + "\n" if config and unsigned_person(message, config) else ""
-    # The text indented: a head starts at the line's first column, a line of a text never does.
-    body = "\n".join("  " + line if line else "" for line in body_text(message["text"]).split("\n"))
+    # The text indented: a head starts at the line's first column, a line of a text never does. And framed, as
+    # an agent's window shows it.
+    body = "\n".join("  " + line if line else "" for line in framed(body_text(message["text"])).split("\n"))
     return f"{head}\n{warn}{body}{tail}"
 
 
@@ -19337,7 +19520,16 @@ def cmd_inbox(args: argparse.Namespace) -> None:
     if not mine:
         print(tr("No unacknowledged messages for {participant}.", participant=args.participant))
         return
-    print("\n\n".join(fmt(m, config=config) for m in mine))
+    me = participant(config, args.participant)
+    # An agent's, with the ready commands under each: a long message's pointer is the inbox command alone.
+    hints = me.get("reply_hint", True) and args.participant not in people_ids(config)
+    print(
+        "\n\n".join(
+            fmt(m, config=config)
+            + (f"\n  ({hint})" if hints and (hint := answer_hint(me, m, config, check_rule=False)) else "")
+            for m in mine
+        )
+    )
 
 
 @room_locked

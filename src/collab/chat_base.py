@@ -31,8 +31,9 @@ def fmt(message: dict[str, Any], with_id: bool = True, config: dict[str, Any] | 
     )
     tail = m_i18n.tr("\n  id: {p0}", p0=" ".join(m_text.visible(str(message["id"])).split())) if with_id else ""
     warn = m_deliver.UNSIGNED + "\n" if config and m_log.unsigned_person(message, config) else ""
-    # The text indented: a head starts at the line's first column, a line of a text never does.
-    body = "\n".join("  " + line if line else "" for line in m_text.body_text(message["text"]).split("\n"))
+    # The text indented: a head starts at the line's first column, a line of a text never does. And framed, as
+    # an agent's window shows it.
+    body = "\n".join("  " + line if line else "" for line in m_text.framed(m_text.body_text(message["text"])).split("\n"))
     return f"{head}\n{warn}{body}{tail}"
 
 

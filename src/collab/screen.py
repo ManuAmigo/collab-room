@@ -54,6 +54,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "input": "^›",
         "input_empty": "^› Ask Codex",
         "queued": "^• Messages to be submitted after next tool call",
+        # Still starting (its servers): an Enter given then shows «Waiting for startup  · esc cancel» under the input,
+        # the fold stays, and it took one more Enter after it (codex 0.164) — that Enter is no proof it was taken.
+        "starting": "^\\s*Waiting for startup\\b",
     },
     "claude": {
         "label": "Claude",
@@ -93,6 +96,9 @@ PRESETS: dict[str, dict[str, Any]] = {
         "input": "^❯",
         "input_empty": "^❯[ \u00a0]*$",
         "queued": "Press up to edit queued messages",
+        # Typed as keys, a text past about a kilobyte lost its first ~1022 bytes on the way into the input, before
+        # the Enter — 6 or 7 times in 10 (Claude Code 2.1.310). As one bracketed paste none of 20 did.
+        "bracketed_paste": True,
     },
 }
 
@@ -239,6 +245,8 @@ SCREEN_KEYS = (
     "input",
     "input_empty",
     "queued",
+    "bracketed_paste",
+    "starting",
 )
 
 
@@ -396,6 +404,8 @@ def screen_state(p: dict[str, Any], pane: str, shot: Shot | None = None) -> tupl
             titles = re.findall(p["attention_title"], above, re.MULTILINE)
             detail = titles[-1].strip() if titles else ""
         return "needs_owner", detail[:160]
+    if p.get("starting") and re.search(p["starting"], tail, re.MULTILINE):
+        return "joining", ""  # not ready yet: nothing is typed into it
     if p.get("busy") and re.search(p["busy"], tail, re.MULTILINE):
         return "working", ""
     if p.get("idle") and re.search(p["idle"], tail, re.MULTILINE):
@@ -437,6 +447,50 @@ def fold_left(rules: dict[str, Any], pane: str, typed: str = "") -> bool:
     return not any(
         rules.get(key) and re.search(rules[key], tail, re.MULTILINE) for key in ("attention", "attention_title", "busy")
     )
+
+
+def type_text(rules: dict[str, Any], pane: str, text: str) -> subprocess.CompletedProcess[str]:
+    """The text into the agent's input, no Enter: as keys, or for an agent that loses the start of a long typed
+    text, as one bracketed paste from a buffer of its own (removed after it)."""
+    if not rules.get("bracketed_paste"):
+        return m_tmuxio.tmux("send-keys", "-t", pane, "-l", text, check=False)
+    buffer = f"collab-{secrets.token_hex(8)}"
+    loaded = m_tmuxio.tmux("set-buffer", "-b", buffer, "--", text, check=False)
+    if loaded.returncode != 0:
+        return loaded
+    pasted = m_tmuxio.tmux("paste-buffer", "-p", "-d", "-b", buffer, "-t", pane, check=False)
+    if pasted.returncode != 0:
+        # -d removes it only with a paste: the message's text is not left on the server.
+        m_tmuxio.tmux("delete-buffer", "-b", buffer, check=False)
+    return pasted
+
+
+def wait_started(rules: dict[str, Any], pane: str, limit: float = 20.0) -> bool:
+    """Its screen no longer says it is starting — or it never did; False when still starting after the limit."""
+    if not rules.get("starting"):
+        return True
+    until = time.time() + limit
+    while True:
+        shown = m_tmuxio.tmux("capture-pane", "-p", "-t", pane, check=False)
+        if shown.returncode != 0 or not re.search(rules["starting"], screen_tail_text(rules, shown.stdout), re.MULTILINE):
+            return True
+        if time.time() >= until:
+            return False
+        time.sleep(0.5)
+
+
+def input_starts(rules: dict[str, Any], shot: Shot, text: str) -> bool:
+    """The last input line begins with the text's start, or is its fold — not with its middle: what came in
+    lost its start, and an Enter would send the rest as the whole message. No input line on the screen at all (a
+    seat with a screen of its own) is nothing to judge by: it goes as before."""
+    lines = shot.plain.rstrip("\n").split("\n")[-args_tail() :]
+    at = max((i for i, line in enumerate(lines) if re.match(rules["input"], line)), default=-1)
+    if at < 0:
+        return True
+    if rules.get("paste_fold") and re.match(rules["paste_fold"], lines[at]):
+        return True
+    shown = "".join(re.sub(rules["input"], "", lines[at], count=1).split())
+    return bool(shown) and "".join(text.split()).startswith(shown[:16])
 
 
 def screen_count_any(pane: str, pattern: str) -> bool:

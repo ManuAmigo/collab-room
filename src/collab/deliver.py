@@ -1280,56 +1280,85 @@ def reply_body(p: dict[str, Any]) -> str:
     return f"- <<'{end}' ↵ … ↵ {end}"
 
 
+def answer_hint(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], check_rule: bool = True) -> str:
+    """The ready commands that answer one message, or close it with none: typed with it, and printed under it in inbox.
+    "" for a record whose sender or id is not a plain word: a line written into the log by hand put «$(…)» and
+    «; …» into a command the agent was told to run — delivery puts such a record aside, inbox did not.
+    `check_rule` — the delivery's: inbox runs as the agent itself, which must not withdraw a Codex rule nor write
+    into the room, and in a sandbox could not write the rules file at all."""
+    if not m_store.well_formed(m):
+        return ""
+    pid = p["id"] if check_rule else ""
+    lang = m_store.room_language(config)  # the labels in the room's language — the commands stay as they are
+    w = lambda key, **kw: m_i18n.words_in(key, lang, **kw)
+    if m["from"] == m_text.ROOM and m.get("brief") is True:
+        # An assignment is taken, not discussed: closed with ack; a question about it goes to the lead or the person.
+        return w("hint.no_answer") + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), pid)
+    if m["from"] == m_text.ROOM:
+        return w("hint.reply_room") + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), pid)
+    # Both ways to close it, ready to run.
+    return (
+        w("hint.answer")
+        + room_cmd("say", f"--from {p['id']} --to {m['from']} --re {m['id']} {reply_body(p)}", p.get("cli", ""), pid)
+        + " · "
+        + w("hint.no_answer")
+        + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), pid)
+    )
+
+
 def delivery_text(p: dict[str, Any], m: dict[str, Any], config: dict[str, Any], rules: dict[str, Any]) -> str:
     """The line typed into the agent's window for one message: its head, the text, the ready commands."""
     # The room is named in the command itself: an agent working in another folder (or with
     # another room in its COLLAB_ROOT) must still answer here.
     lang = m_store.room_language(config)  # the labels in the room's language — the commands stay as they are
     w = lambda key, **kw: m_i18n.words_in(key, lang, **kw)
-    if m["from"] == m_text.ROOM and m.get("brief") is True:
-        # An assignment is taken, not discussed: closed with ack; a question about it goes to the lead or the person.
-        hint = w("hint.no_answer") + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"])
-    elif m["from"] == m_text.ROOM:
-        hint = w("hint.reply_room") + room_cmd("say", f"--from {p['id']} --to all {reply_body(p)}", p.get("cli", ""), p["id"])
-    else:
-        # Both ways to close it, ready to run.
-        hint = (
-            w("hint.answer")
-            + room_cmd("say", f"--from {p['id']} --to {m['from']} --re {m['id']} {reply_body(p)}", p.get("cli", ""), p["id"])
-            + " · "
-            + w("hint.no_answer")
-            + room_cmd("ack", f"--for {p['id']} --no-reply --id {m['id']}", p.get("cli", ""), p["id"])
-        )
+    hint = answer_hint(p, m, config)
     warn = (w("hint.unsigned") + " ") if m_log.unsigned_person(m, config) else ""
-    body = " ".join(m_text.body_text(m["text"]).split())  # no head of another inside
-    limit = min(LONG_MESSAGE, int(rules.get("paste_limit") or LONG_MESSAGE))
-    if len(body.encode("utf-8")) > limit:
-        # tmux refuses a line of about 16 KB, and the deliverer died on it at every restart
-        # A long message is read by the agent itself.
-        # Read through inbox: a room-started Codex may run only say/ack/inbox, through its
-        # read-only copy — `show` there was refused. inbox prints it in full.
-        body = w("hint.long", n=len(body), cmd=room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"]))
     # Its role, one word of a closed list, reminds an agent whose context was cut of its assignment; the topic,
     # free text, is never typed with it.
     role = m_store.effective(m_screen.agent_kind(p), p, config, "role")
     you = w("hint.you", role=w(f"role.{role}")) if role in m_store.ROLES else ""
     if m.get("via") == "telegram" and not warn:
         warn = w("hint.via_telegram")  # the person writes from the phone: a short answer reads best there
-    return f"[{m['from']} → {', '.join(m['to'])}] {urgent_mark(m, config)}{warn}{body}" + (
-        f"  ({you}{hint})" if p.get("reply_hint", True) else ""
-    )
+    # The mark in the head, which only the room draws («→»): at the text's start an agent's own «URGENT: …» read the same.
+    mark = urgent_tag(m, config)
+    head = f"[{m['from']} → {', '.join(m['to'])}{' · ' + mark if mark else ''}] {warn}"
+    tail = f"  ({you}{hint})" if p.get("reply_hint", True) else ""
+    text = " ".join(m_text.body_text(m["text"]).split())  # no head of another inside
+    body = m_text.framed(text)
+    limit = min(LONG_MESSAGE, int(rules.get("paste_limit") or LONG_MESSAGE))
+    # tmux refuses a line of about 16 KB, and the deliverer died on it at every restart; Codex folds a long
+    # paste. The whole line counts: a text just under the limit pushed the frame's end and the commands past it.
+    # A long message is read by the agent itself.
+    # Read through inbox: a room-started Codex may run only say/ack/inbox, through its
+    # read-only copy — `show` there was refused. inbox prints it in full.
+    inbox = room_cmd("inbox", f"--for {p['id']}", p.get("cli", ""), p["id"])
+    # The first that fits: in a room of a long path the commands alone, three times over, were past the limit.
+    # Then the one command that reads it, whole — its room and program never dropped for the size: a bare
+    # «collab inbox» read another room, or an old copy; inbox prints the commands to answer. Even that too long,
+    # deliver_to types nothing (too_long).
+    for line in (head + body + tail, head + w("hint.long", n=len(text), cmd=inbox) + tail):
+        if len(line.encode("utf-8")) <= limit:
+            return line
+    return head + w("hint.long", n=len(text), cmd=inbox)
 
 
-def urgent_mark(m: dict[str, Any], config: dict[str, Any]) -> str:
-    """«URGENT: » before an urgent message's text, said as the room's — the agent sees why it is typed into its work,
-    and that a person's «стоп» was taken for urgent by its word, not by a sender's own claim."""
+def urgent_tag(m: dict[str, Any], config: dict[str, Any]) -> str:
+    """«URGENT» for an urgent message, said as the room's — the agent sees why it is typed into its work, and that a
+    person's «стоп» was taken for urgent by its word, not by a sender's own claim; "" — not urgent."""
     why = urgent_word(m, config)
     lang = m_store.room_language(config)
     if not why:
         return ""
     if why == "flag":
-        return m_i18n.tr("URGENT:", lang) + " "
-    return m_i18n.tr("URGENT (by its first word «{word}»):", lang, word=why) + " "
+        return m_i18n.tr("URGENT", lang)
+    return m_i18n.tr("URGENT (by its first word «{word}»)", lang, word=why)
+
+
+def urgent_mark(m: dict[str, Any], config: dict[str, Any]) -> str:
+    """«URGENT: » before a message's excerpt in a digest, where the sender's text stands quoted after it."""
+    tag = urgent_tag(m, config)
+    return f"{tag}: " if tag else ""
 
 
 DIGEST_WORDS = 8  # words of each message's start in the digest — enough to tell what it is about
@@ -1698,6 +1727,8 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
             # Into a turn: a long one goes as a pointer to inbox — a fold there is not pressed again.
             rules = {**rules, "paste_limit": min(int(rules.get("paste_limit") or BUSY_PASTE_LIMIT), BUSY_PASTE_LIMIT)}
         text = delivery_text(p, batch[0], config, rules) if len(batch) == 1 else digest_text(p, batch, config, rules)
+        if too_long(p, batch, text, rules, tell=not working):
+            return ""  # too long for a running turn: it waits for a free moment, where the agent's own limit counts
         if working:
             return type_busy(p, pane, rules, batch, text, config, delivered)
         # A last look right before typing: the one deliver_one took was before the room's lock, and
@@ -1709,12 +1740,30 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
         # deliverer between the text and its Enter, and the text stayed in the agent's input as a
         # draft — nothing more was typed to it until someone cleared it by hand.
         STOPPING["typing"] = True
-        sent = m_tmuxio.tmux("send-keys", "-t", pane, "-l", text, check=False)
+        sent = m_screen.type_text(rules, pane, text)
         if sent.returncode == 0:
             time.sleep(float(os.environ.get("COLLAB_ENTER_DELAY", "0.3")))
+            if rules.get("bracketed_paste") and not m_screen.input_starts(rules, m_screen.look(rules, pane), text):
+                # Its start did not come in: an Enter would send the rest as the message. It stays in the input,
+                # the room shows a draft, and the message waits in the inbox.
+                STOPPING["typing"] = False
+                print(
+                    m_i18n.tr("not sent to {p0}: its input did not show the text's start", p0=p["id"]),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                stop_if_asked()
+                return ""
             sent = m_tmuxio.tmux("send-keys", "-t", pane, "Enter", check=False)
             if sent.returncode == 0 and rules.get("paste_fold"):
                 time.sleep(float(os.environ.get("COLLAB_ENTER_DELAY", "0.3")) + 0.5)
+                if not m_screen.wait_started(rules, pane):
+                    # Still starting: its Enter is not proof it was taken. The message waits in the inbox; the
+                    # fold left in the input shows as a draft.
+                    STOPPING["typing"] = False
+                    print(m_i18n.tr("not sent to {p0}: it is still starting", p0=p["id"]), file=sys.stderr, flush=True)
+                    stop_if_asked()
+                    return ""
                 # The fold was not sent yet. Only once, and only into the same process: a
                 # window reused since the look is not pressed. Still there after that, it reads as a
                 # draft — the room shows it and types nothing more there.
@@ -1737,6 +1786,36 @@ def deliver_to(p: dict[str, Any], pane: str, state: str, config: dict[str, Any],
         STOPPING["typing"] = False
         stop_if_asked()
         return batch[0]["id"]
+
+
+def too_long(p: dict[str, Any], batch: list[dict[str, Any]], text: str, rules: dict[str, Any], tell: bool = True) -> bool:
+    """Even its pointer to inbox is past the limit (a room of a very long path): typed, it would fold, and a command
+    cut short of its room is no command. It waits in the agent's inbox; each sender is told once, at once — not by
+    the limit of a running turn, shorter than the agent's own: it said «path too long» of a pointer that fits an
+    idle agent, and the once spent there kept quiet the real one."""
+    limit = min(LONG_MESSAGE, int(rules.get("paste_limit") or LONG_MESSAGE))
+    if len(text.encode("utf-8")) <= limit:
+        return False
+    if not tell:
+        return True
+    path = m_store.room().paths.state_dir / "undelivered.json"
+    told_all = m_store.read_json(path)
+    told = told_all.get(p["id"])
+    told = {x for x in told if isinstance(x, str)} if isinstance(told, list) else set()
+    late = [m for m in batch if m["id"] not in told and m["from"] != m_text.ROOM]
+    for sender in dict.fromkeys(m["from"] for m in late):
+        m_log.room_line(
+            [sender],
+            "{who} has not got your message of {hm}: even a pointer to its inbox is longer than can be typed into its "
+            "window ({n} bytes) — the room's path is too long. It waits in its inbox.",
+            who=p.get("label") or p["id"],
+            hm=m_text.local_hm(next(m for m in late if m["from"] == sender)["at"]),
+            n=len(text.encode("utf-8")),
+        )
+    if late:
+        told_all[p["id"]] = sorted(told | {m["id"] for m in late})
+        m_store.write_json(path, told_all)
+    return True
 
 
 BUSY_PASTE_LIMIT = 1000  # bytes of a message typed into a running turn; longer goes as a pointer to inbox
