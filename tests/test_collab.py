@@ -10148,8 +10148,9 @@ class DeliveryTest(Base):
         )
         ends(lambda pane: subprocess.run(["tmux", "kill-pane", "-t", pane]), "signal SIGHUP")
 
-    def test_a_long_name_gives_way_and_the_state_word_stays(self):
-        # With one to three agents, a long name in a narrow window pushed «: Ready» out.
+    def test_a_long_name_in_a_narrow_window_is_cut_and_the_state_words_go_from_the_whole_row(self):
+        # Two agents, long names, a narrow window: the word no longer fits beside a whole name — colour and mark
+        # say the state, in both cells alike; the name is cut only as far as it must, the model stays.
         self.write_config(
             [
                 {
@@ -10168,9 +10169,9 @@ class DeliveryTest(Base):
         pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
         subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", "60", "-y", "20"], check=True)
         bar = lambda: ([x for x in self.screen(pane).splitlines() if x.strip()] or [""])[-1]  # empty while the chat starts
-        self.assertTrue(self.until(lambda: bar().count(": Ready") == 2), bar())
-        self.assertIn("…: Ready", bar(), "the name is cut, the state kept")
-        self.assertIn("Opus 5.5", bar())
+        self.assertTrue(self.until(lambda: bar().count("Opus 5.5") == 2 and "Очень-длинное" in bar()), bar())
+        self.assertNotIn("Ready", bar(), "no word in either cell")
+        self.assertIn("…", bar(), "the long name is cut to fit")
 
     def test_a_resize_while_the_chat_starts_keeps_the_feed_above_the_input(self):
         # tmux resets the scroll region on a resize. One that came after the chat laid out its screen,
@@ -11607,6 +11608,58 @@ class DeliveryTest(Base):
             ),
             cells()[1],
         )
+
+    def test_a_ready_agent_with_background_work_blinks_green_and_yellow(self):
+        # Ready, its own commands still running: the badge turns green and yellow tick by tick, so it is not
+        # taken for done. Ready with nothing running, and a chat without colours, keep one look.
+        mod = _Loader(f"collab_blink_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        detail = ["background 2"]
+        self.enterContext(seam(mod, "screen.read_status", lambda: {"claude": {"state": "idle", "detail": detail[0]}}))
+        ctx = SimpleNamespace(
+            old_versions=lambda: [],
+            known=["owner", "claude"],
+            args=SimpleNamespace(as_="owner", stale=30.0, interval=1.0),
+            config=json.loads(self.cfg.read_text()),
+            shown_state={},
+            stale_chat=lambda: False,
+            status_bar_rows=mod.status_bar_rows,
+            ui=mod.ChatState(),
+        )
+
+        def ticks(colour=True):
+            with seam(mod, "text.use_color", lambda: colour):
+                return [(mod.chat_states(ctx), re.findall(r"48;5;(\d+)m", ctx.ui.bar))[1] for _ in range(4)]
+
+        seen = ticks()
+        self.assertTrue(all(seen), seen)
+        self.assertTrue(all(a != b for a, b in zip(seen, seen[1:])), f"each next tick the other colour: {seen}")
+        self.assertEqual({x[0] for x in seen}, {"40", "220"}, "green and yellow")
+        ctx.args.interval = 0.25
+        seen = ticks() + ticks()
+        turns = sum(a != b for a, b in zip(seen, seen[1:]))
+        self.assertIn(turns, (1, 2), f"a quicker chat turns it about once a second, not each tick: {seen}")
+        self.assertEqual(ticks(colour=False), [[]] * 4, "no colours: nothing to blink")
+        detail[0] = ""
+        ctx.args.interval = 1.0
+        self.assertEqual({tuple(x) for x in ticks()}, {("40",)}, "Ready, nothing in the background: green only")
+
+    def test_the_state_word_is_shown_while_it_fits_in_every_cell_not_by_how_many_agents(self):
+        # The word by the width the cells have, one choice for the whole row: four agents on a wide window
+        # have room for it; the same four on a narrow one, or three on a very narrow one, do not.
+        mod = _Loader(f"collab_words_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        cell = lambda name, short="Ready", mark=" ", since="": (name, "Opus 5.5", short, mark, since, 40)
+        four = [cell("Ann"), cell("Bob", "Working", "⠋", "3m"), cell("Cid", "Ready", "⠙ 2", "5m"), cell("Dan")]
+        words = lambda cells, cols: [
+            w for w in ("Ready", "Working") if w in "\n".join(mod.status_bar_rows(cells, [], os.terminal_size((cols, 24))))
+        ]
+        self.assertEqual(words(four, 200), ["Ready", "Working"], "four on a wide window: the words fit")
+        self.assertEqual(words(four, 60), [], "the same four on a narrow one: colour and mark")
+        self.assertEqual(words(four[:3], 25), [], "three on a very narrow one: none either")
+        self.assertEqual(words(four[:3], 120), ["Ready", "Working"])
+        # One name too long for its word beside it: no cell has the word — the row is not motley.
+        long = four[:2] + [cell("Клод-с-очень-длинным-именем", "Ready", "⠙ 2", "5m")]
+        self.assertEqual(words(long, 100), [], mod.status_bar_rows(long, [], os.terminal_size((100, 24))))
 
     def test_a_link_in_place_of_the_windows_file_never_signs(self):
         # In the chat: whose window signs as the person was read from panes.json by its path —

@@ -178,13 +178,15 @@ Hints sit on the line above the input: empty — `↑ History · / Commands · T
 draft — `N chars · Ctrl+U Clear draft`, history — navigation with `Esc Latest`.
 They are not part of the message buffer; menus and `/view` use their own hints.
 
-With 1–3 agents, the status shows the name, model, state words and the current work's elapsed time;
-with 4+, only the state words are dropped. Name, model, time, colour and indicator remain,
+The status shows the name, model, state words and the current work's elapsed time; when a state
+word does not fit whole in every cell, only the state words are dropped, in all cells at once.
+Name, model, time, colour and indicator remain,
 cells have equal width, based on the available space, up to 40 text columns plus padding:
  name on the left, model and time on the right.
 The order is fixed; a state change does not move neighbours. Agents that do not fit
 wrap onto additional lines, with no hiding counter; long names and models
 are shortened. The text is always bold black. Green background — ready,
+green and yellow by turns with a spinner and a number — ready, its background tasks still run,
 yellow with a spinner — working, red `!` — needs attention, orange `×`/`◷` — mute/usage limit,
 light-grey `?` — unknown or stale, `…` — connecting. Neither the spinner nor a successful delivery
 proves that a task is progressing; do not present the animation as confirmation of work.

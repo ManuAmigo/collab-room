@@ -82,9 +82,9 @@ room message.
 
 ## The status bar
 
-With one to three agents, each cell shows the name, model, state word and, while working, the
-elapsed time. With four or more, the state words are dropped; name, model, time, colour and mark
-remain. Cells have equal widths, at most 40 text columns plus padding; the name and mark are on
+Each cell shows the name, model, state word and, while working, the elapsed time. When the
+state word does not fit whole in every cell — a narrow window, many agents, a long name — the
+words are dropped in all cells at once; name, model, time, colour and mark remain. Cells have equal widths, at most 40 text columns plus padding; the name and mark are on
 the left, the model and working time on the right. State changes do not move neighbouring cells.
 Agents keep their order and wrap into more rows when needed — none are hidden behind a counter.
 Long names and models are shortened with `…`. While an agent is out of its usage limit, its cell

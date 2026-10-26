@@ -166,18 +166,17 @@ class ChatState:
     menu_moved: bool = False
     suggested: bool = False
     came_back: bool = False
+    ticks: int = 0  # the states line drawn so many times: the blink of a Ready agent's background work
 
 
 def status_bar_rows(cells: list[tuple[str, str, str, str, str, int]], parts: list[str], size: os.terminal_size) -> list[str]:
     """Lay out the status cells for this terminal, without reading or changing chat state."""
     # Only five used to fit on a 15-inch screen, the sixth hidden, with no clear way to see it.
     # The cells share the whole width equally; inside, «to the edges»:
-    # mark and name (and, up to three agents, the state word) on the left, the model and the
-    # working time on the right — no empty room under the time for a Ready agent. Up to three
-    # agents the words help; four and more, colour and mark say it. The order never changes.
+    # mark and name (and, where it fits, the state word) on the left, the model and the
+    # working time on the right — no empty room under the time for a Ready agent. The order never changes.
     lead = sum(len(m_text.ANSI.sub("", x)) + 1 for x in parts)  # «Paused», on the first row
     space = size.columns - lead
-    words = len(cells) <= 3
     n = len(cells)
     # As many cells a row as fit at BAR_MIN columns or more; what doesn't fit goes to the next
     # row of the same cells (two letters can't tell «Claude» from «Claude-2»), spread evenly;
@@ -187,6 +186,15 @@ def status_bar_rows(cells: list[tuple[str, str, str, str, str, int]], parts: lis
     # …but not wider than BAR_MAX: with three agents on a wide screen the name and the model drifted
     # half a screen apart; the rest of the row stays empty.
     inner = min(BAR_MAX, (space + 1) // max(1, per) - 3)
+
+    def whole(name: str, model: str, short: str, mark: str, since: str) -> bool:
+        right = " ".join(x for x in (model, since) if x)
+        left = f"{mark.replace(' ', '')} {name}: {m_i18n.status_word(short)}"
+        return m_text.text_cols(left) + (1 + m_text.text_cols(right) if right else 0) <= inner - 2
+
+    # The state words while every cell holds its whole — mark, name, word, model and time, nothing cut;
+    # else colour and mark say it, in every cell alike: a row half with words and half without is motley.
+    words = all(whole(*cell[:5]) for cell in cells)
     rendered = []
     for name, model, short, mark, since, fill in cells:
         rendered.append(

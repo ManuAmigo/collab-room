@@ -171,9 +171,9 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "× muted · ◷ limit reached · ? no recent data · … connecting",
         "ru": "× заглушён · ◷ лимит · ? нет свежих данных · … подключается",
     },
-    "help.85d38c9be9": {
-        "en": "Green with a spinner and a number: ready for messages, background tasks still run",
-        "ru": "Зелёный с вращающимся значком и числом: принимает сообщения, фоновые задачи ещё выполняются",
+    "help.6f998b6ec2": {
+        "en": "Blinking green and yellow, with a spinner and a number: ready for messages, background tasks still run",
+        "ru": "Мигает зелёным и жёлтым, с вращающимся значком и числом: принимает сообщения, фоновые задачи ещё выполняются",
     },
     "help.9dfa9c133f": {
         "en": "More agents wrap to another row; none are hidden",

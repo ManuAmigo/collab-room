@@ -137,6 +137,9 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
     out, parts, cells = [], [], []
     out += [m_text.paint(x, "38;5;214") for x in ctx.old_versions()]
     st = m_screen.read_status()
+    # The chat's ticks counted for the blink below: its colour turns about once a second, or every tick when the interval is longer.
+    ctx.ui.ticks += 1
+    blink = ctx.ui.ticks // max(1, round(1 / ctx.args.interval)) % 2
     for pid in ctx.known:
         if pid == ctx.args.as_ or pid not in st:
             continue
@@ -159,6 +162,7 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
         # Out of limit, the cell shows when it is back instead of the model.
         right = st[pid].get("detail", "") if state == "limited" else st[pid].get("model", "")
         bg = re.fullmatch(r"background (\d+)", str(st[pid].get("detail", "")))
+        fill = BAR_FILL.get(short, 250)
         if bg and short == "Ready":
             # Ready for messages, its own commands run in the background: green, and
             # how many by the mark; the model stays where it is («it hid the model»). The
@@ -166,9 +170,10 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
             # background command still running (bg_since), not from when it became Ready.
             mark = SPINNER[int(time.time() * 4) % len(SPINNER)] + " " + bg.group(1)
             since = m_text.age(st[pid].get("bg_since") or st[pid].get("since", ""))
-        cells.append(
-            (m_store.label_of(ctx.config, pid), m_text.clean_field(right, 40), short, mark, since, BAR_FILL.get(short, 250))
-        )
+            # And the badge turns green and yellow by turns, about once a second: Ready, and work goes on. Not
+            # the terminal's blink — most terminals drop it. Without colours it stays as it is.
+            fill = BAR_FILL["Working"] if blink else BAR_FILL["Ready"]
+        cells.append((m_store.label_of(ctx.config, pid), m_text.clean_field(right, 40), short, mark, since, fill))
         # «No update for 40 min», «41 min»…: the same news, not a new line in the feed every minute.
         news = re.sub(r"No update for \d+ min", "No update", line)
         if ctx.shown_state.get(pid) != news:

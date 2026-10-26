@@ -196,7 +196,7 @@ working.
 | Look | State | What to do |
 | --- | --- | --- |
 | Green | Ready | Nothing; it takes messages |
-| Green, spinner and a number | Ready, with background tasks still running | Nothing |
+| Blinking green and yellow, spinner and a number | Ready, with background tasks still running | Nothing |
 | Yellow, spinner | Working | Wait |
 | Red `!` | Needs your input | Answer its question: `/answer` |
 | Red `!` | Unsent draft | Text in its input blocks delivery: `/answer`, then send or clear it |

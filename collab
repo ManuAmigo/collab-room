@@ -262,7 +262,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.26"
+VERSION = "0.1.27"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:
@@ -1436,9 +1436,9 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "× muted · ◷ limit reached · ? no recent data · … connecting",
         "ru": "× заглушён · ◷ лимит · ? нет свежих данных · … подключается",
     },
-    "help.85d38c9be9": {
-        "en": "Green with a spinner and a number: ready for messages, background tasks still run",
-        "ru": "Зелёный с вращающимся значком и числом: принимает сообщения, фоновые задачи ещё выполняются",
+    "help.6f998b6ec2": {
+        "en": "Blinking green and yellow, with a spinner and a number: ready for messages, background tasks still run",
+        "ru": "Мигает зелёным и жёлтым, с вращающимся значком и числом: принимает сообщения, фоновые задачи ещё выполняются",
     },
     "help.9dfa9c133f": {
         "en": "More agents wrap to another row; none are hidden",
@@ -14490,18 +14490,17 @@ class ChatState:
     menu_moved: bool = False
     suggested: bool = False
     came_back: bool = False
+    ticks: int = 0  # the states line drawn so many times: the blink of a Ready agent's background work
 
 
 def status_bar_rows(cells: list[tuple[str, str, str, str, str, int]], parts: list[str], size: os.terminal_size) -> list[str]:
     """Lay out the status cells for this terminal, without reading or changing chat state."""
     # Only five used to fit on a 15-inch screen, the sixth hidden, with no clear way to see it.
     # The cells share the whole width equally; inside, «to the edges»:
-    # mark and name (and, up to three agents, the state word) on the left, the model and the
-    # working time on the right — no empty room under the time for a Ready agent. Up to three
-    # agents the words help; four and more, colour and mark say it. The order never changes.
+    # mark and name (and, where it fits, the state word) on the left, the model and the
+    # working time on the right — no empty room under the time for a Ready agent. The order never changes.
     lead = sum(len(ANSI.sub("", x)) + 1 for x in parts)  # «Paused», on the first row
     space = size.columns - lead
-    words = len(cells) <= 3
     n = len(cells)
     # As many cells a row as fit at BAR_MIN columns or more; what doesn't fit goes to the next
     # row of the same cells (two letters can't tell «Claude» from «Claude-2»), spread evenly;
@@ -14511,6 +14510,15 @@ def status_bar_rows(cells: list[tuple[str, str, str, str, str, int]], parts: lis
     # …but not wider than BAR_MAX: with three agents on a wide screen the name and the model drifted
     # half a screen apart; the rest of the row stays empty.
     inner = min(BAR_MAX, (space + 1) // max(1, per) - 3)
+
+    def whole(name: str, model: str, short: str, mark: str, since: str) -> bool:
+        right = " ".join(x for x in (model, since) if x)
+        left = f"{mark.replace(' ', '')} {name}: {status_word(short)}"
+        return text_cols(left) + (1 + text_cols(right) if right else 0) <= inner - 2
+
+    # The state words while every cell holds its whole — mark, name, word, model and time, nothing cut;
+    # else colour and mark say it, in every cell alike: a row half with words and half without is motley.
+    words = all(whole(*cell[:5]) for cell in cells)
     rendered = []
     for name, model, short, mark, since, fill in cells:
         rendered.append(
@@ -14790,7 +14798,7 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = 
             ("Red status", "An agent needs your input — use /answer, then Ctrl+] to return"),
             ("Status colours", "Green: ready · Yellow: working · Orange: muted or limit · Red !: act in its window"),
             ("Status marks", "× muted · ◷ limit reached · ? no recent data · … connecting"),
-            ("", "Green with a spinner and a number: ready for messages, background tasks still run"),
+            ("", "Blinking green and yellow, with a spinner and a number: ready for messages, background tasks still run"),
             ("Status layout", "More agents wrap to another row; none are hidden"),
             ("/open", "Open an agent's window in a new terminal tab, to answer it"),
             (
@@ -17178,6 +17186,9 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
     out, parts, cells = [], [], []
     out += [paint(x, "38;5;214") for x in ctx.old_versions()]
     st = read_status()
+    # The chat's ticks counted for the blink below: its colour turns about once a second, or every tick when the interval is longer.
+    ctx.ui.ticks += 1
+    blink = ctx.ui.ticks // max(1, round(1 / ctx.args.interval)) % 2
     for pid in ctx.known:
         if pid == ctx.args.as_ or pid not in st:
             continue
@@ -17200,6 +17211,7 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
         # Out of limit, the cell shows when it is back instead of the model.
         right = st[pid].get("detail", "") if state == "limited" else st[pid].get("model", "")
         bg = re.fullmatch(r"background (\d+)", str(st[pid].get("detail", "")))
+        fill = BAR_FILL.get(short, 250)
         if bg and short == "Ready":
             # Ready for messages, its own commands run in the background: green, and
             # how many by the mark; the model stays where it is («it hid the model»). The
@@ -17207,9 +17219,10 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
             # background command still running (bg_since), not from when it became Ready.
             mark = SPINNER[int(time.time() * 4) % len(SPINNER)] + " " + bg.group(1)
             since = age(st[pid].get("bg_since") or st[pid].get("since", ""))
-        cells.append(
-            (label_of(ctx.config, pid), clean_field(right, 40), short, mark, since, BAR_FILL.get(short, 250))
-        )
+            # And the badge turns green and yellow by turns, about once a second: Ready, and work goes on. Not
+            # the terminal's blink — most terminals drop it. Without colours it stays as it is.
+            fill = BAR_FILL["Working"] if blink else BAR_FILL["Ready"]
+        cells.append((label_of(ctx.config, pid), clean_field(right, 40), short, mark, since, fill))
         # «No update for 40 min», «41 min»…: the same news, not a new line in the feed every minute.
         news = re.sub(r"No update for \d+ min", "No update", line)
         if ctx.shown_state.get(pid) != news:

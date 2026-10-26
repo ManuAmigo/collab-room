@@ -105,7 +105,7 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = 
             ("Red status", "An agent needs your input — use /answer, then Ctrl+] to return"),
             ("Status colours", "Green: ready · Yellow: working · Orange: muted or limit · Red !: act in its window"),
             ("Status marks", "× muted · ◷ limit reached · ? no recent data · … connecting"),
-            ("", "Green with a spinner and a number: ready for messages, background tasks still run"),
+            ("", "Blinking green and yellow, with a spinner and a number: ready for messages, background tasks still run"),
             ("Status layout", "More agents wrap to another row; none are hidden"),
             ("/open", "Open an agent's window in a new terminal tab, to answer it"),
             (

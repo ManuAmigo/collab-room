@@ -4,9 +4,14 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.27
+
+- In the chat's states line, a Ready agent with background work blinks green and yellow, about once a second; without colours nothing changes. · В строке статусов чата свободный агент с фоновой работой мигает зелёным и жёлтым, примерно раз в секунду; без цвета ничего не меняется.
+- The state word beside each agent in the states line shows while it fits whole in every cell, not up to three agents: four agents on a wide window get it, the same four on a narrow one do not. · Слово состояния в строке статусов показывается, пока целиком помещается в каждой ячейке, а не до трёх агентов: четыре агента в широком окне его получают, те же четыре в узком — нет.
+
 ## 0.1.26
 
-- The chat's command menu, the full /help guide and the README list commands most used first: /open /dm /mine … and /clear /stop /exit last. · Меню команд чата, полная справка /help и README перечисляют команды от самых нужных: /open /dm /mine … и /clear /stop /exit в конце.
+- The chat's command menu, the full /help guide and the README list commands in a base order: /open /dm /mine … and /clear /stop /exit last. · Меню команд чата, полная справка /help и README перечисляют команды в базовом порядке: /open /dm /mine … и /clear /stop /exit в конце.
 - The command menu puts the commands you run most first. Counts stay on this computer in `~/.collab-room/command-counts.json` and are never sent; the order is taken as the chat opens, so the menu does not move while you type. · Меню команд ставит первыми те, что вы запускаете чаще. Счёт хранится только на этом компьютере в `~/.collab-room/command-counts.json` и никуда не отправляется; порядок берётся при открытии чата, поэтому меню не прыгает, пока вы пишете.
 
 ## 0.1.25
