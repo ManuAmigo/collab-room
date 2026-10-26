@@ -4,6 +4,11 @@ What each release brings. Newest first. · Что приносит каждый 
 
 ## Unreleased · Готовится
 
+## 0.1.26
+
+- The chat's command menu, the full /help guide and the README list commands most used first: /open /dm /mine … and /clear /stop /exit last. · Меню команд чата, полная справка /help и README перечисляют команды от самых нужных: /open /dm /mine … и /clear /stop /exit в конце.
+- The command menu puts the commands you run most first. Counts stay on this computer in `~/.collab-room/command-counts.json` and are never sent; the order is taken as the chat opens, so the menu does not move while you type. · Меню команд ставит первыми те, что вы запускаете чаще. Счёт хранится только на этом компьютере в `~/.collab-room/command-counts.json` и никуда не отправляется; порядок берётся при открытии чата, поэтому меню не прыгает, пока вы пишете.
+
 ## 0.1.25
 
 - The room pauses agents' talk after 30 messages in a row by default, not 10; a room's own `talk_limit` still decides. · Комната останавливает разговор агентов после 30 сообщений подряд по умолчанию, а не 10; свой `talk_limit` комнаты по-прежнему главный.

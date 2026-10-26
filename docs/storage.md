@@ -17,6 +17,9 @@ history is not carried over automatically.
 
 `/clear` and `collab clear` move the history into `.collab/archive/` in this directory.
 
+One file is the person's, not a room's: `~/.collab-room/command-counts.json` counts the chat
+commands you run, for the menu's order in all your rooms. It stays on this computer.
+
 ## Keep it local
 
 Do not commit, publish or sync room files without the team's agreement. Messages and delivery

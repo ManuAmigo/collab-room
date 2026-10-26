@@ -128,11 +128,31 @@ def chat_submit(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
         )
 
 
+# The menu with nothing counted yet; /clear, /stop and /exit close it whatever the counts (menu_order).
+MENU_COMMANDS = (
+    "/open", "/dm", "/mine", "/answer", "/view", "/team", "/restart", "/add", "/pause", "/resume", "/rest",
+    "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/language", "/clear", "/stop", "/exit",
+)  # fmt: skip
+MENU_LAST = ("/clear", "/stop", "/exit")
+
+
+def menu_order(counts: dict[str, int]) -> list[str]:
+    """The menu's commands, the most run first; a tie keeps MENU_COMMANDS' order. The ones that clear or close
+    stay last, in their order: running them often must not bring them up under the hand."""
+    rest = [c for c in MENU_COMMANDS if c not in MENU_LAST]
+    return sorted(rest, key=lambda c: -counts.get(c, 0)) + list(MENU_LAST)
+
+
 def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
     # A command by either of its names — /добавить or /add — goes on as one: its English name.
     line = m_i18n.command(line.strip())
     if not line and not ctx.wizard:
         return
+    verb = line.split()[0] if line else ""
+    if not ctx.wizard and verb in (*MENU_COMMANDS, "/quit"):
+        # Run, not just highlighted; a step of an open question (whom to mute) is not another run. The menu
+        # takes the counts when a chat opens, so it does not move under the hand.
+        m_store.note_command("/exit" if verb == "/quit" else verb)
     if (
         ctx.wizard
         or line

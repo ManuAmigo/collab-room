@@ -36,6 +36,13 @@ Type `/` to open the command menu. ↑/↓ choose, Enter selects, Esc goes back 
 Selecting an action opens its next step or performs it; it does not put a command into your
 draft. Choosing **Rename** asks only for the new name.
 
+The commands you run most come first. Until you have run any, the menu starts with **/open**,
+**/dm**, **/mine**; after that it follows your counts, and a tie keeps that order. The
+order is taken when the chat opens, so the menu does not move while you use it. `/clear`, `/stop`
+and `/exit` always stay at the bottom. The counts are kept on this computer only
+(`~/.collab-room/command-counts.json`, readable by you alone), for all your rooms; delete the file to
+start over.
+
 Confirmations — in the chat and in `collab clear`, `stop`, `install` and when an older room is
 moved (see [storage.md](storage.md)) — are **No / Yes** menus: ↑/↓ select, Enter confirms, Esc
 means No, and **No** is selected first. You choose; you do not type y/n. Without a terminal,

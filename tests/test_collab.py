@@ -5068,6 +5068,43 @@ class RoomTest(Base):
         task = next(t for t in mod.HELP_TASKS if t[0] == "answer")
         self.assertIn("Ctrl+]", " ".join(task[2]))
 
+    def test_the_full_guide_lists_the_commands_in_the_menus_order(self):
+        # Most used first, as the «/» menu shows them.
+        mod = _Loader("collab_guide_order", str(COLLAB)).load_module()
+        expected = [
+            "/open", "/dm", "/mine", "/answer", "/view", "/team", "/restart", "/add", "/pause", "/resume", "/rest",
+            "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/language", "/clear", "/stop", "/exit",
+        ]  # fmt: skip
+        named: list[str] = []
+        for line in mod.ANSI.sub("", mod.HELP("Андрей", full=True)).splitlines():
+            key = line.strip(" │").split("   ")[0]
+            named += [w for w in key.split() if w in expected]
+        self.assertEqual(list(dict.fromkeys(named)), expected)
+
+    def test_the_menu_puts_the_most_run_commands_first_and_the_closing_ones_last(self):
+        mod = _Loader("collab_menu_counts", str(COLLAB)).load_module()
+        base = list(mod.menu_order({}))
+        self.assertEqual(base[:2], ["/open", "/dm"], "nothing counted: the base order")
+        for _ in range(3):
+            mod.note_command("/team")
+        order = mod.menu_order(mod.command_counts())
+        self.assertLess(order.index("/team"), order.index("/dm"), order)
+        self.assertEqual([c for c in order if c != "/team"], [c for c in base if c != "/team"], "a tie keeps the base order")
+        path = self.root / "command-counts.json"
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600, "the person's own")
+        # However often they ran, the commands that clear or close stay at the bottom, in their order.
+        path.write_text(json.dumps({"/exit": 900, "/stop": 500, "/clear": 100, "/team": 1}), encoding="utf-8")
+        order = mod.menu_order(mod.command_counts())
+        self.assertEqual(order[-3:], ["/clear", "/stop", "/exit"], order)
+        self.assertEqual(order[0], "/team", order)
+        # A broken file is the base order, not a failure.
+        for broken in ("{not json", "[1, 2]", '{"/team": "many", "/dm": true}', "\x00\xff"):
+            path.write_text(broken, encoding="utf-8")
+            self.assertEqual(mod.menu_order(mod.command_counts()), base, broken)
+        path.write_text("{not json", encoding="utf-8")
+        mod.note_command("/mine")
+        self.assertEqual(mod.command_counts(), {"/mine": 1}, "a broken file starts the count again")
+
     def test_a_codex_conversation_is_found_by_the_check_as_delivery_writes_it_now(self):
         # /restart of a Codex said «conversation was not found» — delivery now heads a message
         # «[room → codex] 09:17» and puts the text on the next line, and the search wanted them glued.
@@ -10571,7 +10608,7 @@ class DeliveryTest(Base):
         back = lambda: (lambda t: "Back in the room." in t and t.rfind("Answer whom?") < t.rfind("Back in the room."))(tail())
         self.assertTrue(self.until(back), "back in the room, the question behind, not the last word: " + tail())
         keys("-l", "/")
-        self.assertTrue(self.wait_for(chat, "/add"), "no question open: «/» opens the commands: " + self.screen(chat))
+        self.assertTrue(self.wait_for(chat, "› /open"), "no question open: «/» opens the commands: " + self.screen(chat))
         keys("C-u")
 
     def test_the_cursor_stands_after_wide_characters(self):
@@ -12716,10 +12753,12 @@ class DeliveryTest(Base):
 
         keys("-l", "/")
         self.assertTrue(self.wait_for(pane, "↑↓ choose"), self.screen(pane))
-        self.assertIn("/remove", self.screen(pane))
+        self.assertIn("/dm", self.screen(pane))
         keys("Down")
-        self.assertTrue(self.wait_for(pane, "› /remove"), self.screen(pane))
+        self.assertTrue(self.wait_for(pane, "› /dm"), self.screen(pane))
         keys("Up")
+        self.assertTrue(self.wait_for(pane, "› /open"), self.screen(pane))
+        keys(*["Down"] * 7)
         self.assertTrue(self.wait_for(pane, "› /add"), self.screen(pane))
         keys("Enter")  # /add runs at once: its next step is a choice
         self.assertTrue(self.wait_for(pane, "Which agent to start?  ↑↓ choose"), self.screen(pane))
@@ -12904,16 +12943,33 @@ class DeliveryTest(Base):
         pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
         self.assertTrue(self.wait_chat(pane))
         keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+        # Most used first; the menu is taller than the window, so its top and its end are read apart.
+        expected = [
+            "/open", "/dm", "/mine", "/answer", "/view", "/team", "/restart", "/add", "/pause", "/resume", "/rest",
+            "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/language", "/clear", "/stop", "/exit",
+        ]  # fmt: skip
+
+        def column():  # the menu's rows: the last unbroken run of command lines (the start card names a few too)
+            run: list[str] = []
+            last: list[str] = []
+            for x in self.screen(pane).splitlines():
+                w = x.strip().removeprefix("› ").split()
+                run = run + [w[0]] if w and w[0] in expected else []
+                last = run or last
+            return last
+
         keys("-l", "/")
-        self.assertTrue(self.wait_for(pane, "› /add"))
-        lines = [x.strip() for x in self.screen(pane).splitlines()]
-        order = [
-            next(i for i, x in enumerate(lines) if c in x and ("› " + c) in x or x.startswith(c))
-            for c in ("/add", "/remove", "/mute")
-        ]
-        self.assertEqual(order, sorted(order), "a column, top to bottom, fixed order")
-        keys("Down", "Down")
-        self.assertTrue(self.wait_for(pane, "› /mute"))
+        self.assertTrue(self.wait_for(pane, "› /open"), self.screen(pane))
+        shown = column()
+        self.assertGreater(len(shown), 2, self.screen(pane))
+        self.assertEqual(shown, expected[: len(shown)], "a column, top to bottom, most used first")
+        keys("Up")  # from the first to the last
+        self.assertTrue(self.wait_for(pane, "› /exit"), self.screen(pane))
+        shown = column()
+        self.assertGreater(len(shown), 2, self.screen(pane))
+        self.assertEqual(shown, expected[-len(shown) :], "and the column ends with /clear, /stop, /exit")
+        keys("Down", *["Down"] * expected.index("/mute"))  # back to the first, then down to /mute
+        self.assertTrue(self.wait_for(pane, "› /mute"), self.screen(pane))
         keys("Enter")  # /mute runs: whom — the next menu
         self.assertTrue(self.wait_for(pane, "› Коди"), self.screen(pane))
         self.assertIn("Клод", self.screen(pane))
@@ -12932,12 +12988,57 @@ class DeliveryTest(Base):
         self.assertTrue(self.wait_for(pane, "› Коди"), "only muted ones are offered")
         self.assertNotIn("Клод", [x.strip().lstrip("› ").strip() for x in self.screen(pane).splitlines()][-6:])
         keys("Escape")  # names → back to the commands
-        self.assertTrue(self.wait_for(pane, "› /unmute    deliver"), self.screen(pane))
+        back = lambda: any(x.strip().startswith("› /unmute ") and "deliver" in x for x in self.screen(pane).splitlines())
+        self.assertTrue(self.until(back), self.screen(pane))
         keys("Escape")  # commands → closed
         self.assertTrue(self.wait_for(pane, "Андрей → Everyone ›"))
         self.until(lambda: "↑↓ choose" not in self.screen(pane), timeout=10)
         self.assertNotIn("↑↓ choose", self.screen(pane), "Esc, step by step, closes the menu and drops the half-typed command")
         self.assertNotIn("/unmute", self.screen(pane).splitlines()[-2])
+
+    def test_the_menu_takes_the_counts_as_the_chat_opens_and_counts_a_command_run_not_highlighted(self):
+        counts = self.root / "command-counts.json"
+        counts.write_text(json.dumps({"/team": 3}), encoding="utf-8")
+        counts.chmod(0o600)
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {"id": "codex", "label": "Коди", "pane": False},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(pane))
+        keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+
+        def first_two():  # the top of the menu: the last unbroken run of command lines
+            run: list[str] = []
+            last: list[str] = []
+            for x in self.screen(pane).splitlines():
+                w = x.strip().removeprefix("› ").split()
+                run = run + [w[0]] if w and w[0].startswith("/") and len(w[0]) > 1 else []
+                last = run or last
+            return last[:2]
+
+        keys("-l", "/")
+        self.assertTrue(self.wait_for(pane, "› /team"), "run most, first: " + self.screen(pane))
+        self.assertEqual(first_two(), ["/team", "/open"], self.screen(pane))
+        keys("Down", "Down")
+        self.assertTrue(self.wait_for(pane, "› /dm"), self.screen(pane))
+        keys("Escape")
+        self.until(lambda: "↑↓ choose" not in self.screen(pane), timeout=10)
+        self.assertEqual(json.loads(counts.read_text()), {"/team": 3}, "highlighted is not run")
+        keys("-l", "/resume")
+        keys("Enter")
+        self.assertTrue(self.until(lambda: json.loads(counts.read_text()).get("/resume") == 1), counts.read_text())
+        keys("-l", "/")
+        self.assertTrue(self.wait_for(pane, "› /team"), self.screen(pane))
+        self.assertEqual(first_two(), ["/team", "/open"], "the open chat's menu does not move: " + self.screen(pane))
 
     def test_rename_from_the_menu_asks_only_the_new_name(self):
         # «a command must not land in the input line; only what has to be written».
@@ -13085,6 +13186,8 @@ class DeliveryTest(Base):
         self.assertTrue(self.wait_chat(pane))
         keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
         keys("-l", "/")
+        self.assertTrue(self.wait_for(pane, "› /open"), self.screen(pane))
+        keys(*["Down"] * 7)  # /add, eighth
         self.assertTrue(self.wait_for(pane, "› /add"))
         keys("Enter")  # one Enter: /add runs, its choices appear
         self.assertTrue(self.wait_for(pane, "Which agent to start?  ↑↓ choose"), self.screen(pane))
@@ -13117,6 +13220,8 @@ class DeliveryTest(Base):
         self.assertTrue(self.wait_chat(pane))
         keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
         keys("-l", "/")
+        self.assertTrue(self.wait_for(pane, "› /open"), self.screen(pane))
+        keys(*["Down"] * 7)  # /add, eighth
         self.assertTrue(self.wait_for(pane, "› /add"))
         keys("Enter")
         self.assertTrue(self.wait_for(pane, "Which agent to start?  ↑↓"), self.screen(pane))
@@ -13164,6 +13269,8 @@ class DeliveryTest(Base):
         keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
         bottom = lambda: "\n".join(self.screen(pane).splitlines()[-8:])
         keys("-l", "/")
+        self.assertTrue(self.wait_for(pane, "› /open"), self.screen(pane))
+        keys(*["Down"] * 7)  # /add, eighth
         self.assertTrue(self.wait_for(pane, "› /add"))
         keys("Enter")
         self.assertTrue(self.wait_for(pane, "Which agent to start?  ↑↓"), self.screen(pane))
@@ -13179,12 +13286,13 @@ class DeliveryTest(Base):
         keys("Escape")
         self.assertTrue(self.wait_for(pane, "› /add"), "first step → the command menu")
         self.assertNotIn("Which agent to start?  ↑↓", bottom())
-        keys("Down", "Down")
+        keys(*["Down"] * 5)  # /add → /mute
         self.assertTrue(self.wait_for(pane, "› /mute"))
         keys("Enter")
         self.assertTrue(self.wait_for(pane, "› Коди"), self.screen(pane))
         keys("Escape")
-        self.assertTrue(self.wait_for(pane, "› /mute      room-wide"), "names → the command menu, on the same command")
+        on_mute = lambda: any(x.strip().startswith("› /mute ") and "room-wide" in x for x in self.screen(pane).splitlines())
+        self.assertTrue(self.until(on_mute), "names → the command menu, on the same command")
         self.assertTrue(self.wait_until(lambda: "Андрей → Everyone › /" in bottom()), bottom())
         keys("Escape")
         time.sleep(0.5)
@@ -13195,6 +13303,8 @@ class DeliveryTest(Base):
         )
         # And forward: the first folder in the list is the room's, one Enter, no path typed.
         keys("-l", "/")
+        self.assertTrue(self.wait_for(pane, "› /open"), self.screen(pane))
+        keys(*["Down"] * 7)  # /add, eighth
         self.assertTrue(self.wait_for(pane, "› /add"))
         keys("Enter")
         self.assertTrue(self.wait_for(pane, "Which agent to start?  ↑↓"))
@@ -15132,8 +15242,8 @@ class DeliveryTest(Base):
         self.assertNotIn("Не получилось", self.screen(pane))
         keys("Up")
         keys("Enter")  # Keys and commands, the last task
-        self.assertTrue(self.wait_for(pane, "уходят в архив"), self.screen(pane))
-        self.narrow_screen(pane, "Очистить историю для всех; старые сообщения уходят в архив")
+        self.assertTrue(self.wait_for(pane, "после окончания"), self.screen(pane))
+        self.narrow_screen(pane, "Возобновить доставку агенту после окончания лимита")
         keys("Escape")
         keys("Escape")
         # The command menu: a hint longer than the window ends with «…», not in the middle of a word.

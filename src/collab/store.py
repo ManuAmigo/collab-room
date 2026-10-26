@@ -1671,6 +1671,26 @@ def write_private(path: Path, text: str) -> None:
     replace_file(path, (text + "\n").encode("utf-8"), 0o600)
 
 
+def command_counts() -> dict[str, int]:
+    """How many times the person ran each chat command, in all their rooms; {} when there is no file or it is broken."""
+    try:
+        data = json.loads(m_boot.read_private(m_boot.paths().command_counts) or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    items = cast("dict[object, object]", data).items()
+    return {k: v for k, v in items if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v > 0}
+
+
+def note_command(cmd: str) -> None:
+    """One more run of a chat command. Kept on this computer only; a write that fails is not the chat's failure."""
+    counts = command_counts()
+    counts[cmd] = counts.get(cmd, 0) + 1
+    with contextlib.suppress(OSError):
+        write_private(m_boot.paths().command_counts, json.dumps(counts, sort_keys=True))
+
+
 def write_config(data: dict[str, Any]) -> None:
     """Replace .collab.json in one step: chat, deliver and join read it concurrently, and a
     half-written file read as empty JSON crashed a reader (found by a flaky test)."""

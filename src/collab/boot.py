@@ -210,6 +210,7 @@ class InstallPaths:
     update_state: Path
     invites: Path
     welcomed_path: Path
+    command_counts: Path  # how many times the person ran each chat command, in all their rooms
     owner_key: Path  # the person's signing key — see UNSIGNED
     rooms_path: Path
 
@@ -234,6 +235,7 @@ class InstallPaths:
             update_state=home / ".collab-room" / "update.json",
             invites=invites,
             welcomed_path=invites.parent / "welcomed",
+            command_counts=invites.parent / "command-counts.json",
             owner_key=invites.parent / "owner.key",
             rooms_path=Path(os.environ.get("COLLAB_ROOMS", "~/.collab-room/rooms.json")).expanduser(),
         )
@@ -260,7 +262,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.25"
+VERSION = "0.1.26"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:

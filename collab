@@ -210,6 +210,7 @@ class InstallPaths:
     update_state: Path
     invites: Path
     welcomed_path: Path
+    command_counts: Path  # how many times the person ran each chat command, in all their rooms
     owner_key: Path  # the person's signing key — see UNSIGNED
     rooms_path: Path
 
@@ -234,6 +235,7 @@ class InstallPaths:
             update_state=home / ".collab-room" / "update.json",
             invites=invites,
             welcomed_path=invites.parent / "welcomed",
+            command_counts=invites.parent / "command-counts.json",
             owner_key=invites.parent / "owner.key",
             rooms_path=Path(os.environ.get("COLLAB_ROOMS", "~/.collab-room/rooms.json")).expanduser(),
         )
@@ -260,7 +262,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.25"
+VERSION = "0.1.26"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:
@@ -5233,6 +5235,26 @@ def write_private(path: Path, text: str) -> None:
     """A small file of ours in ~/.collab-room (as PYTHON_FILE)."""
     private_dir(path.parent, strict=False)
     replace_file(path, (text + "\n").encode("utf-8"), 0o600)
+
+
+def command_counts() -> dict[str, int]:
+    """How many times the person ran each chat command, in all their rooms; {} when there is no file or it is broken."""
+    try:
+        data = json.loads(read_private(paths().command_counts) or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    items = cast("dict[object, object]", data).items()
+    return {k: v for k, v in items if isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v > 0}
+
+
+def note_command(cmd: str) -> None:
+    """One more run of a chat command. Kept on this computer only; a write that fails is not the chat's failure."""
+    counts = command_counts()
+    counts[cmd] = counts.get(cmd, 0) + 1
+    with contextlib.suppress(OSError):
+        write_private(paths().command_counts, json.dumps(counts, sort_keys=True))
 
 
 def write_config(data: dict[str, Any]) -> None:
@@ -14770,30 +14792,30 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = 
             ("Status marks", "× muted · ◷ limit reached · ? no recent data · … connecting"),
             ("", "Green with a spinner and a number: ready for messages, background tasks still run"),
             ("Status layout", "More agents wrap to another row; none are hidden"),
-            ("/add", "Start a new agent: choose its kind, its folder, its name"),
-            ("/team", "See the team and where each agent is with its assignment; in a new room, start a ready team"),
-            ("/remove", "Disconnect a participant; the agent keeps running in its window"),
-            # A muted agent still gets what is addressed to it by name — the text said all.
-            ("/mute · /unmute", "Stop / resume room-wide messages to an agent; messages to it by name still arrive"),
-            ("/unlimit", "An agent is back from its usage limit: the room delivers to it again"),
-            ("/rest", "An agent free on purpose, until a time or until taken off: the lead's round leaves it be"),
-            ("/name", "Rename yourself or an agent: choose whom, type the new name"),
-            ("/help", "Show this guide"),
-            ("/view", "See an agent's screen, read-only; Esc — back to chat"),
-            ("/answer", "Respond in an agent terminal over the chat; Ctrl+] returns"),
             ("/open", "Open an agent's window in a new terminal tab, to answer it"),
-            ("/restart", "Restart an agent the room started; its conversation continues (new rules too)"),
-            ("/mine", "What is for you: agents waiting for you, then unread messages to you and answers to yours"),
             (
                 "/dm name · /dm close",
                 "Talk with one agent in a panel beside the chat: Ctrl+O there and back, Tab tabs in it, Ctrl+] close",
             ),
+            ("/mine", "What is for you: agents waiting for you, then unread messages to you and answers to yours"),
+            ("/answer", "Respond in an agent terminal over the chat; Ctrl+] returns"),
+            ("/view", "See an agent's screen, read-only; Esc — back to chat"),
+            ("/team", "See the team and where each agent is with its assignment; in a new room, start a ready team"),
+            ("/restart", "Restart an agent the room started; its conversation continues (new rules too)"),
+            ("/add", "Start a new agent: choose its kind, its folder, its name"),
             ("/pause · /resume", "Pause the room: agents get no messages until /resume"),
+            ("/rest", "An agent free on purpose, until a time or until taken off: the lead's round leaves it be"),
+            ("/help", "Show this guide"),
+            # A muted agent still gets what is addressed to it by name — the text said all.
+            ("/mute · /unmute", "Stop / resume room-wide messages to an agent; messages to it by name still arrive"),
+            ("/unlimit", "An agent is back from its usage limit: the room delivers to it again"),
+            ("/name", "Rename yourself or an agent: choose whom, type the new name"),
+            ("/remove", "Disconnect a participant; the agent keeps running in its window"),
+            ("/telegram", "Write to the room's lead from Telegram: connect, turn off, unlink"),
+            ("/language", "The room's language: Russian or English"),
             ("/clear", "Clear the history for everyone; old messages move to an archive"),
             ("/stop", "Stop the room: its windows and the agents it started close; history stays"),
             ("Ctrl+C · /exit", "Close this chat panel (asks first); agents keep running"),
-            ("/telegram", "Write to the room's lead from Telegram: connect, turn off, unlink"),
-            ("/language", "The room's language: Russian or English"),
         ]
     # In the room's language: each command by the name it shows, each line from the catalog; keys stay as they are.
     labels = ("Red status", "Status colours", "Status marks", "Status layout", "@name text", "/dm name · /dm close")
@@ -16724,11 +16746,31 @@ def chat_submit(ctx: ChatCommandContext, line: str) -> None:
         )
 
 
+# The menu with nothing counted yet; /clear, /stop and /exit close it whatever the counts (menu_order).
+MENU_COMMANDS = (
+    "/open", "/dm", "/mine", "/answer", "/view", "/team", "/restart", "/add", "/pause", "/resume", "/rest",
+    "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/language", "/clear", "/stop", "/exit",
+)  # fmt: skip
+MENU_LAST = ("/clear", "/stop", "/exit")
+
+
+def menu_order(counts: dict[str, int]) -> list[str]:
+    """The menu's commands, the most run first; a tie keeps MENU_COMMANDS' order. The ones that clear or close
+    stay last, in their order: running them often must not bring them up under the hand."""
+    rest = [c for c in MENU_COMMANDS if c not in MENU_LAST]
+    return sorted(rest, key=lambda c: -counts.get(c, 0)) + list(MENU_LAST)
+
+
 def chat_handle(ctx: ChatCommandContext, line: str) -> None:
     # A command by either of its names — /добавить or /add — goes on as one: its English name.
     line = command(line.strip())
     if not line and not ctx.wizard:
         return
+    verb = line.split()[0] if line else ""
+    if not ctx.wizard and verb in (*MENU_COMMANDS, "/quit"):
+        # Run, not just highlighted; a step of an open question (whom to mute) is not another run. The menu
+        # takes the counts when a chat opens, so it does not move under the hand.
+        note_command("/exit" if verb == "/quit" else verb)
     if (
         ctx.wizard
         or line
@@ -18265,14 +18307,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
     ui.suggested = False  # the draft is a suggested name: typing replaces it, ← → edit it
     ui.came_back = False  # Esc just stepped back from a command's menu to «/»
     after_lock: list[Any] = []  # what runs once a key is handled, without the chat's lock (the popup)
-    # The menu's order; each shown in the room's language when the menu is drawn (chat_cmds.chat_menu_items).
-    COMMANDS = [
-        (c, words_in(f"cmd.{c[1:]}", "en"))
-        for c in (
-            "/add", "/remove", "/mute", "/unmute", "/unlimit", "/rest", "/name", "/view", "/answer", "/open", "/pause",
-            "/resume", "/clear", "/help", "/mine", "/dm", "/restart", "/team", "/telegram", "/language", "/stop", "/exit",
-        )
-    ]  # fmt: skip
+    # The menu's order: the person's most run first, counted as this chat opens; each shown in the room's language
+    # when the menu is drawn (chat_cmds.chat_menu_items).
+    COMMANDS = [(c, words_in(f"cmd.{c[1:]}", "en")) for c in menu_order(command_counts())]
     slash_commands = tuple(c for c, _ in COMMANDS) + tuple(shown_command(c, "ru") for c, _ in COMMANDS)
 
     def people_for(cmd: str) -> list[str]:

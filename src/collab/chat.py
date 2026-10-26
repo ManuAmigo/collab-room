@@ -588,14 +588,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
     ui.suggested = False  # the draft is a suggested name: typing replaces it, ← → edit it
     ui.came_back = False  # Esc just stepped back from a command's menu to «/»
     after_lock: list[Any] = []  # what runs once a key is handled, without the chat's lock (the popup)
-    # The menu's order; each shown in the room's language when the menu is drawn (chat_cmds.chat_menu_items).
-    COMMANDS = [
-        (c, m_i18n.words_in(f"cmd.{c[1:]}", "en"))
-        for c in (
-            "/add", "/remove", "/mute", "/unmute", "/unlimit", "/rest", "/name", "/view", "/answer", "/open", "/pause",
-            "/resume", "/clear", "/help", "/mine", "/dm", "/restart", "/team", "/telegram", "/language", "/stop", "/exit",
-        )
-    ]  # fmt: skip
+    # The menu's order: the person's most run first, counted as this chat opens; each shown in the room's language
+    # when the menu is drawn (chat_cmds.chat_menu_items).
+    COMMANDS = [(c, m_i18n.words_in(f"cmd.{c[1:]}", "en")) for c in m_chat_cmds.menu_order(m_store.command_counts())]
     slash_commands = tuple(c for c, _ in COMMANDS) + tuple(m_i18n.shown_command(c, "ru") for c, _ in COMMANDS)
 
     def people_for(cmd: str) -> list[str]:

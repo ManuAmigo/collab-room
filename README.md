@@ -155,20 +155,24 @@ Type `/` to open the command menu (↑/↓, Enter), or type a command directly.
 
 | Command | What it does |
 | --- | --- |
+| `/open` | Copy a command that opens an agent's window in a new terminal tab |
+| `/dm` · `/dm NAME` · `/dm close` | Talk with one agent in a panel beside the chat |
+| `/mine` | What is for you: agents waiting for you, unread messages, replies to yours |
+| `/answer` | Respond in an agent's terminal over the chat; Ctrl+] returns |
+| `/view` | See an agent's screen, read-only; Esc returns |
+| `/team` | See the team and where each agent is with its assignment; in a new room, start a ready team |
+| `/restart` | Restart an agent the room started; its conversation continues |
 | `/add` | Start a new agent: choose its kind (Claude or Codex), its folder, its name |
-| `/remove` | Disconnect a participant; the agent keeps running in its window |
+| `/pause` · `/resume` | Hold delivery to agents and their outgoing messages / release it |
+| `/rest` | Mark an agent free on purpose, until a time or until taken off: the lead's round leaves it be |
+| `/help` | Task menu and the full key guide |
 | `/mute` · `/unmute` | Stop / resume room-wide messages to an agent; messages to it by name still arrive |
 | `/unlimit` | An agent is back from its usage limit: the room delivers to it again |
 | `/name` | Rename yourself or an agent; ids do not change |
-| `/view` | See an agent's screen, read-only; Esc returns |
-| `/answer` | Respond in an agent's terminal over the chat; Ctrl+] returns |
-| `/open` | Copy a command that opens an agent's window in a new terminal tab |
-| `/restart` | Restart an agent the room started; its conversation continues |
-| `/mine` | What is for you: agents waiting for you, unread messages, replies to yours |
-| `/dm` · `/dm NAME` · `/dm close` | Talk with one agent in a panel beside the chat |
-| `/pause` · `/resume` | Hold delivery to agents and their outgoing messages / release it |
+| `/remove` | Disconnect a participant; the agent keeps running in its window |
+| `/telegram` | Write to the room's lead from Telegram: connect, turn off, unlink (see below) |
+| `/language` | The room's language: Russian or English |
 | `/clear` | Clear the history for everyone; messages move to a local archive |
-| `/help` | Task menu and the full key guide |
 | `/stop` | Stop the room: close its windows and the agents it started; history stays |
 | `/exit` (or `/quit`) | Close your chat; agents keep running |
 
