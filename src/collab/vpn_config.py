@@ -7,10 +7,11 @@ are validated by the platform-specific launcher.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 import stat
 from urllib.parse import parse_qsl, urlsplit
@@ -141,6 +142,9 @@ class VpnAccount:
     credentials: VpnCredentials = field(repr=False)
     peer: str
     expires: int | None
+    port: int = 80
+    tls_server_name: str | None = field(default=None, repr=False)
+    ws_host: str = field(default="", repr=False)
 
 
 def vpn_account(path: Path, now: float) -> VpnAccount:
@@ -160,29 +164,68 @@ def vpn_account(path: Path, now: float) -> VpnAccount:
         links = document["links"]
         if not isinstance(links, list) or len(links) != 1 or not isinstance(links[0], str) or len(links[0]) > 8192:
             raise ValueError()
-        uri = urlsplit(links[0])
-        pairs = parse_qsl(uri.query, keep_blank_values=True, strict_parsing=True)
+        account = vpn_link(links[0])
+        if account.credentials.uuid != identifier:
+            raise ValueError()
+        return replace(account, expires=expiry)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise VpnSecretError("VPN account profile rejected") from None
+
+
+def vpn_link(link: str) -> VpnAccount:
+    """Parse the supported transport without retaining or reporting the original link."""
+    try:
+        if not isinstance(link, str) or not 1 <= len(link) <= 8192 or any(ord(c) < 33 or ord(c) > 126 for c in link):
+            raise ValueError()
+        if re.search(r"%(?![0-9A-Fa-f]{2})", link):
+            raise ValueError()
+        uri = urlsplit(link)
+        identifier = uri.username
+        pairs = parse_qsl(uri.query, keep_blank_values=True, strict_parsing=True, errors="strict")
         query = dict(pairs)
         if (
             uri.scheme != "vless"
-            or uri.username != identifier
             or uri.password is not None
-            or uri.port != 80
+            or uri.port is None
+            or not 1 <= uri.port <= 65535
             or uri.path not in ("", "/")
             or len(query) != len(pairs)
             or query.get("type") != "ws"
-            or query.get("security", "none") != "none"
+            or query.get("security", "none") not in ("none", "tls")
             or query.get("encryption", "none") != "none"
             or query.get("headerType", "none") not in ("", "none")
-            or any(query.get(key) for key in ("host", "sni", "flow"))
+            or query.get("flow")
+            or (query.get("security", "none") != "tls" and query.get("sni"))
             or set(query) - {"type", "security", "path", "encryption", "headerType", "host", "sni", "flow"}
         ):
             raise ValueError()
         hostname = uri.hostname
         if not isinstance(hostname, str):
             raise ValueError()
-        peer = vpn_routed_ipv4(hostname)
+        peer = vpn_server_name(hostname)
         credentials = vpn_credentials_from_document({"uuid": identifier, "ws_path": query["path"]})
-        return VpnAccount(credentials, peer, expiry)
+        tls_name = vpn_server_name(query.get("sni") or peer) if query.get("security") == "tls" else None
+        ws_host = vpn_server_name(query["host"]) if query.get("host") else ""
+        return VpnAccount(credentials, peer, None, uri.port, tls_name, ws_host)
     except (ValueError, TypeError, KeyError, AttributeError):
-        raise VpnSecretError("VPN account profile rejected") from None
+        raise VpnSecretError(
+            "Unsupported or invalid VPN link: use VLESS, WebSocket, security none or tls, IPv4 or an ASCII domain, and a valid port."
+        ) from None
+
+
+def vpn_server_name(value: str) -> str:
+    """Accept canonical IPv4 or ASCII DNS labels, never resolver shortcuts or header syntax."""
+    if not isinstance(value, str):
+        raise ValueError("invalid VPN server name")
+    if re.fullmatch(r"[0-9.]+", value):
+        return vpn_routed_ipv4(value)
+    name = value.lower()
+    labels = name.split(".")
+    if (
+        len(name) > 253
+        or len(labels) < 2
+        or any(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) is None for label in labels)
+        or labels[-1].isdigit()
+    ):
+        raise ValueError("invalid VPN server name")
+    return name

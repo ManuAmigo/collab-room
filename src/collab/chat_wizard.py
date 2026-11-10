@@ -19,6 +19,7 @@ import collab.telegram as m_telegram
 import collab.vpn_macos_room as m_vpn_macos_room
 import collab.vpn_macos_process as m_vpn_macos_process
 import collab.vpn_config as m_vpn_config
+import collab.vpn_macos_daemon as m_vpn_macos_daemon
 import collab.usage as m_usage
 import collab.agents as m_agents
 import collab.lifecycle as m_lifecycle
@@ -574,10 +575,29 @@ def vpn_unprotected(config: dict[str, Any], ready: bool) -> int:
     return count
 
 
-def start_vpn_job(ctx: ChatCommandContext, action: str) -> None:
+def start_vpn_job(ctx: ChatCommandContext, action: str, link: str | None = None) -> None:
     def work(cancel: Any, progress: Any) -> dict[str, Any]:
         if cancel():
             return {}
+        if link is not None:
+            folder = m_vpn_macos_daemon.mac_vpn_folder()
+            try:
+                current = m_vpn_macos_daemon.mac_control_request(folder, "status")
+            except (FileNotFoundError, ConnectionRefusedError):
+                current = None
+            if current is not None and current.get("account_reload") is not True:
+                raise ValueError(
+                    m_i18n.tr("VPN supervisor needs updating before changing accounts. Restart your computer, then try again.")
+                )
+            if current is not None and current.get("standard_account") is not True:
+                raise ValueError(
+                    m_i18n.tr("VPN supervisor uses a different account file. Turn VPN off and on in /vpn, then retry the change.")
+                )
+            m_vpn_macos_room.mac_vpn_save_link(link)
+            try:
+                m_vpn_macos_daemon.mac_control_request(folder, "reload")
+            except (FileNotFoundError, ConnectionRefusedError):
+                pass
         verb = "setup" if action == "on" and not m_vpn_macos_room.mac_vpn_enabled(m_store.load_config()) else action
         status = m_vpn_macos_room.mac_vpn_room_action(verb)
         status["unprotected"] = vpn_unprotected(m_store.load_config(), status.get("actual") == "ready")
@@ -586,10 +606,26 @@ def start_vpn_job(ctx: ChatCommandContext, action: str) -> None:
     start_install_job(ctx, "vpn", work)
     ctx.wizard.update(
         vpn_action=action,
+        vpn_link_attempt=link is not None,
         from_cmd="/vpn",
         prompt=m_i18n.tr("Checking agent VPN… Closing this menu does not stop a request already started."),
         options=[(m_i18n.words_in("team.back", m_store.room_language(ctx.config)), "cancel")],
     )
+
+
+def vpn_link_prompt(ctx: ChatCommandContext) -> None:
+    if not getattr(ctx, "tty", True):
+        ctx.feed(m_i18n.tr("VPN links require the interactive chat with hidden input."))
+        return
+    ctx.wizard.update(
+        step="vpn_link",
+        secret=True,
+        from_cmd="/vpn",
+        prompt=m_i18n.tr(
+            "Paste your private vless:// link, then Enter. Input is hidden. Esc cancels. Saving replaces the shared VPN account and stops protected agents."
+        ),
+    )
+    ctx.feed(m_text.paint(ctx.wizard["prompt"], "38;5;252"))
 
 
 def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
@@ -600,13 +636,16 @@ def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
         return
     error = result.get("error")
     if error is not None:
+        link_attempt = ctx.wizard.get("vpn_link_attempt")
         ctx.wizard.clear()
         if isinstance(error, m_vpn_config.VpnSecretError):
-            say_(
-                m_i18n.tr(
-                    "VPN account is missing or invalid: ~/.config/collab-vpn/agents.json. Add a valid private account file, then try again."
+            if link_attempt:
+                say_(
+                    m_i18n.tr(
+                        "VPN link was rejected. Use VLESS / WebSocket / security none or tls / IPv4 or an ASCII domain / a valid port, and a private writable configuration folder."
+                    )
                 )
-            )
+            vpn_link_prompt(ctx)
         else:
             say_(m_i18n.tr("Could not change agent VPN: {error}", error=m_text.clean_field(str(error), 200)))
         return
@@ -629,6 +668,7 @@ def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
             options.append((m_i18n.tr("Turn agent VPN on"), "on"))
         if status.get("room_enabled") and actual != "off":
             options.append((m_i18n.tr("Turn agent VPN off (stops protected agents)"), "off"))
+        options.append((m_i18n.tr("Change VPN (stops protected agents)"), "change"))
         ctx.wizard.update(
             step="vpn_pick",
             from_cmd="/vpn",
@@ -707,6 +747,11 @@ def install_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
 def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
     """/add, /remove, /mute, /name, /exit and the others: every answer is chosen in the menu;
     only what has to be written — a name, a path as the last resort — is typed."""
+    if ctx.wizard.get("step") == "vpn_link":
+        ctx.wizard.clear()
+        if line:
+            start_vpn_job(ctx, "on", link=line)
+        return
     rp = m_store.room().paths
     say_ = lambda text: (said.append(text), ctx.feed(m_text.paint(text, "38;5;252")))[1]
     if line in ("/exit", "/quit"):
@@ -968,7 +1013,9 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         return
     if ctx.wizard.get("step") == "vpn_pick":
         ctx.wizard.clear()
-        if line in ("on", "off"):
+        if line == "change":
+            vpn_link_prompt(ctx)
+        elif line in ("on", "off"):
             start_vpn_job(ctx, line)
         return
     if line == "/telegram":

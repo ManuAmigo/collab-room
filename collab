@@ -262,7 +262,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.31"
+VERSION = "0.1.32"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:
@@ -1307,6 +1307,27 @@ LANGS = ("en", "ru")
 LANG_NAMES = {"en": "English", "ru": "Русский"}
 
 CATALOG: dict[str, dict[str, Any]] = {
+    "t.ab86c4ef03": {
+        "en": "VPN supervisor uses a different account file. Turn VPN off and on in /vpn, then retry the change.",
+        "ru": "Служба VPN использует другой файл учётки. Выключите и включите VPN в /vpn, затем повторите смену.",
+    },
+    "t.7c5d2722a1": {
+        "en": "VPN supervisor needs updating before changing accounts. Restart your computer, then try again.",
+        "ru": "Перед сменой учётки нужно обновить службу VPN. Перезагрузите компьютер и повторите попытку.",
+    },
+    "t.85ce4782d8": {
+        "en": "VPN links require the interactive chat with hidden input.",
+        "ru": "Для вставки ссылки VPN откройте интерактивный чат со скрытым вводом.",
+    },
+    "t.0e4787f4fc": {"en": "Change VPN (stops protected agents)", "ru": "Сменить VPN (защищённые агенты остановятся)"},
+    "t.7a129292d0": {
+        "en": "Paste your private vless:// link, then Enter. Input is hidden. Esc cancels. Saving replaces the shared VPN account and stops protected agents.",
+        "ru": "Вставьте приватную ссылку vless:// и нажмите Enter. Ввод скрыт. Esc — отмена. Сохранение заменит общую учётку VPN и остановит защищённых агентов.",
+    },
+    "t.98ebd721d4": {
+        "en": "VPN link was rejected. Use VLESS / WebSocket / security none or tls / IPv4 or an ASCII domain / a valid port, and a private writable configuration folder.",
+        "ru": "Ссылка VPN отклонена. Нужны VLESS / WebSocket / security none или tls / IPv4 или ASCII-домен / допустимый порт и приватная папка настроек с доступом на запись.",
+    },
     "t.6d928ed03e": {
         "en": "Message {id} was not sent to Telegram (HTTP {code}); later messages continue. Full text: collab show {id}.",
         "ru": "Письмо {id} не отправлено в Telegram (HTTP {code}); следующие письма отправляются. Полный текст: collab show {id}.",
@@ -6869,10 +6890,11 @@ are validated by the platform-specific launcher.
 
 
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import ipaddress
 import json
 import os
+import re
 from pathlib import Path
 import stat
 from urllib.parse import parse_qsl, urlsplit
@@ -7003,6 +7025,9 @@ class VpnAccount:
     credentials: VpnCredentials = field(repr=False)
     peer: str
     expires: int | None
+    port: int = 80
+    tls_server_name: str | None = field(default=None, repr=False)
+    ws_host: str = field(default="", repr=False)
 
 
 def vpn_account(path: Path, now: float) -> VpnAccount:
@@ -7022,32 +7047,71 @@ def vpn_account(path: Path, now: float) -> VpnAccount:
         links = document["links"]
         if not isinstance(links, list) or len(links) != 1 or not isinstance(links[0], str) or len(links[0]) > 8192:
             raise ValueError()
-        uri = urlsplit(links[0])
-        pairs = parse_qsl(uri.query, keep_blank_values=True, strict_parsing=True)
+        account = vpn_link(links[0])
+        if account.credentials.uuid != identifier:
+            raise ValueError()
+        return replace(account, expires=expiry)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise VpnSecretError("VPN account profile rejected") from None
+
+
+def vpn_link(link: str) -> VpnAccount:
+    """Parse the supported transport without retaining or reporting the original link."""
+    try:
+        if not isinstance(link, str) or not 1 <= len(link) <= 8192 or any(ord(c) < 33 or ord(c) > 126 for c in link):
+            raise ValueError()
+        if re.search(r"%(?![0-9A-Fa-f]{2})", link):
+            raise ValueError()
+        uri = urlsplit(link)
+        identifier = uri.username
+        pairs = parse_qsl(uri.query, keep_blank_values=True, strict_parsing=True, errors="strict")
         query = dict(pairs)
         if (
             uri.scheme != "vless"
-            or uri.username != identifier
             or uri.password is not None
-            or uri.port != 80
+            or uri.port is None
+            or not 1 <= uri.port <= 65535
             or uri.path not in ("", "/")
             or len(query) != len(pairs)
             or query.get("type") != "ws"
-            or query.get("security", "none") != "none"
+            or query.get("security", "none") not in ("none", "tls")
             or query.get("encryption", "none") != "none"
             or query.get("headerType", "none") not in ("", "none")
-            or any(query.get(key) for key in ("host", "sni", "flow"))
+            or query.get("flow")
+            or (query.get("security", "none") != "tls" and query.get("sni"))
             or set(query) - {"type", "security", "path", "encryption", "headerType", "host", "sni", "flow"}
         ):
             raise ValueError()
         hostname = uri.hostname
         if not isinstance(hostname, str):
             raise ValueError()
-        peer = vpn_routed_ipv4(hostname)
+        peer = vpn_server_name(hostname)
         credentials = vpn_credentials_from_document({"uuid": identifier, "ws_path": query["path"]})
-        return VpnAccount(credentials, peer, expiry)
+        tls_name = vpn_server_name(query.get("sni") or peer) if query.get("security") == "tls" else None
+        ws_host = vpn_server_name(query["host"]) if query.get("host") else ""
+        return VpnAccount(credentials, peer, None, uri.port, tls_name, ws_host)
     except (ValueError, TypeError, KeyError, AttributeError):
-        raise VpnSecretError("VPN account profile rejected") from None
+        raise VpnSecretError(
+            "Unsupported or invalid VPN link: use VLESS, WebSocket, security none or tls, IPv4 or an ASCII domain, and a valid port."
+        ) from None
+
+
+def vpn_server_name(value: str) -> str:
+    """Accept canonical IPv4 or ASCII DNS labels, never resolver shortcuts or header syntax."""
+    if not isinstance(value, str):
+        raise ValueError("invalid VPN server name")
+    if re.fullmatch(r"[0-9.]+", value):
+        return vpn_routed_ipv4(value)
+    name = value.lower()
+    labels = name.split(".")
+    if (
+        len(name) > 253
+        or len(labels) < 2
+        or any(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) is None for label in labels)
+        or labels[-1].isdigit()
+    ):
+        raise ValueError("invalid VPN server name")
+    return name
 """Network-only macOS launch policy and pinned proxy release description."""
 
 
@@ -7059,7 +7123,7 @@ import json
 import secrets
 import re
 import tarfile
-from typing import Mapping, Tuple
+from typing import Any, Mapping, Tuple
 
 
 
@@ -7116,12 +7180,37 @@ def mac_vpn_profile(endpoint: MacVpnEndpoint) -> str:
     )
 
 
-def mac_vpn_config(account: VpnAccount, endpoint: MacVpnEndpoint) -> VpnPrivateConfig:
-    # Numeric transport peer and domain-preserving CONNECT avoid a local DNS resolver.
-    peer = vpn_routed_ipv4(account.peer)
+def mac_vpn_config(
+    account: VpnAccount, endpoint: MacVpnEndpoint, resolved_peer: str | None = None
+) -> VpnPrivateConfig:
+    # Only the VPN server is resolved at startup; agent CONNECT targets stay domains.
+    server = vpn_server_name(account.peer)
+    peer = vpn_routed_ipv4(resolved_peer if resolved_peer is not None else server)
+    if type(account.port) is not int or not 1 <= account.port <= 65535:
+        raise ValueError("invalid VPN server port")
     credentials = vpn_credentials_from_document(
         {"uuid": account.credentials.uuid, "ws_path": account.credentials.ws_path}
     )
+    outbound: dict[str, Any] = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": peer,
+        "server_port": account.port,
+        "uuid": credentials.uuid,
+        "transport": {"type": "ws", "path": credentials.ws_path},
+    }
+    host = vpn_server_name(account.ws_host) if account.ws_host else server
+    if account.ws_host or server != peer:
+        default_port = 443 if account.tls_server_name is not None else 80
+        if not account.ws_host and account.port != default_port:
+            host = f"{host}:{account.port}"
+        outbound["transport"]["headers"] = {"Host": host}
+    if account.tls_server_name is not None:
+        outbound["tls"] = {
+            "enabled": True,
+            "server_name": vpn_server_name(account.tls_server_name),
+            "insecure": False,
+        }
     document = {
         "log": {"disabled": True},
         "inbounds": [
@@ -7132,16 +7221,7 @@ def mac_vpn_config(account: VpnAccount, endpoint: MacVpnEndpoint) -> VpnPrivateC
                 "users": [{"username": endpoint.username, "password": endpoint.password}],
             }
         ],
-        "outbounds": [
-            {
-                "type": "vless",
-                "tag": "proxy",
-                "server": peer,
-                "server_port": 80,
-                "uuid": credentials.uuid,
-                "transport": {"type": "ws", "path": credentials.ws_path},
-            }
-        ],
+        "outbounds": [outbound],
         "route": {"final": "proxy"},
     }
     return VpnPrivateConfig(json.dumps(document, separators=(",", ":")).encode())
@@ -7343,6 +7423,8 @@ def mac_proxy_transition(state: MacProxyState, event: str, generation: int) -> M
 
 from dataclasses import dataclass
 import ipaddress
+import json
+import sys
 from pathlib import Path
 import socket
 import subprocess
@@ -7389,6 +7471,37 @@ def mac_proxy_listeners(port: int) -> frozenset[int]:
     return frozenset(owners)
 
 
+def mac_vpn_resolve_peer(server: str) -> str:
+    """Bound bootstrap DNS in a disposable child; never give it an agent target or credentials."""
+    try:
+        server = vpn_server_name(server)
+        try:
+            return vpn_routed_ipv4(server)
+        except ValueError:
+            pass
+        code = (
+            "import json,socket,sys;"
+            "print(json.dumps(sorted({r[4][0] for r in socket.getaddrinfo(sys.argv[1],None,socket.AF_INET,socket.SOCK_STREAM)})))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", code, server],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            timeout=3,
+        )
+        if result.returncode != 0 or len(result.stdout) > 4096:
+            raise ValueError()
+        answers = json.loads(result.stdout)
+        if not isinstance(answers, list) or not 1 <= len(answers) <= 16:
+            raise ValueError()
+        addresses = [vpn_routed_ipv4(answer) for answer in answers]
+        return addresses[0]
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        raise MacProxyError("VPN server bootstrap DNS failed") from None
+
+
 class MacProxyProcess:
     def __init__(self) -> None:
         self.process: subprocess.Popen[bytes] | None = None
@@ -7400,7 +7513,8 @@ class MacProxyProcess:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
             reservation.bind(("127.0.0.1", 0))
             endpoint = MacVpnEndpoint(reservation.getsockname()[1])
-        payload = mac_vpn_config(account, endpoint).payload
+        peer = mac_vpn_resolve_peer(account.peer)
+        payload = mac_vpn_config(account, endpoint, peer).payload
         process = subprocess.Popen(
             [str(binary), "run", "-c", "/dev/stdin"],
             stdin=subprocess.PIPE,
@@ -7600,8 +7714,17 @@ def mac_control_request(folder: Path, action: str) -> dict[str, Any]:
 
 
 class MacProxySupervisor:
-    def __init__(self, runtime: MacProxyProcess, binary: Path, account: VpnAccount) -> None:
+    def __init__(
+        self,
+        runtime: MacProxyProcess,
+        binary: Path,
+        account: VpnAccount,
+        account_path: Path | None = None,
+    ) -> None:
         self.runtime, self.binary, self.account = runtime, binary, account
+        self.standard_account = (
+            account_path is not None and account_path.resolve() == (Path.home() / ".config/collab-vpn/agents.json").resolve()
+        )
         self.state = MacProxyState()
         self.leases: list[socket.socket] = []
         self.pending_stops: list[socket.socket] = []
@@ -7690,6 +7813,9 @@ class MacProxySupervisor:
         identity = self.runtime.identity
         return {
             "supervisor_pid": os.getpid(),
+            "account_reload": True,
+            "standard_account": self.standard_account,
+            "off_exits": True,
             "actual": self.state.actual,
             "desired": self.state.desired,
             "generation": self.state.generation,
@@ -7737,7 +7863,7 @@ def mac_proxy_daemon(folder: Path, binary: Path, account_path: Path) -> None:
 
 def mac_proxy_daemon_locked(folder: Path, binary: Path, account_path: Path) -> None:
     account = vpn_account(account_path, time.time())
-    supervisor = MacProxySupervisor(MacProxyProcess(), binary, account)
+    supervisor = MacProxySupervisor(MacProxyProcess(), binary, account, account_path)
     address = folder / "control.sock"
     if len(os.fsencode(address)) >= 104:
         raise ValueError("proxy control socket path too long")
@@ -7763,7 +7889,9 @@ def mac_proxy_daemon_locked(folder: Path, binary: Path, account_path: Path) -> N
                 for connection in ready:
                     if connection is server:
                         client, _ = server.accept()
-                        mac_proxy_control_client(supervisor, client)
+                        if mac_proxy_control_client(supervisor, client, account_path):
+                            stop.set()
+                            break
                     elif connection in supervisor.leases:
                         supervisor.leases.remove(connection)
                         try:
@@ -7842,14 +7970,21 @@ def mac_proxy_cleanup(
         os.close(directory)
 
 
-def mac_proxy_control_client(supervisor: MacProxySupervisor, connection: socket.socket) -> None:
+def mac_proxy_control_client(supervisor: MacProxySupervisor, connection: socket.socket, account_path: Path | None = None) -> bool:
     retained = False
+    stopped = False
     try:
         connection.settimeout(3)
         request = mac_control_read(connection, tick=supervisor.tick)
-        if set(request) != {"action"} or request["action"] not in ("on", "off", "status", "lease"):
+        if set(request) != {"action"} or request["action"] not in ("on", "off", "status", "lease", "reload"):
             raise ValueError("proxy control request rejected")
         action = request["action"]
+        if action == "reload":
+            if account_path is None:
+                raise ValueError("proxy account reload unavailable")
+            account = vpn_account(account_path, time.time())
+            supervisor.apply("off")
+            supervisor.account = account
         if action in ("on", "off"):
             supervisor.apply(action)
         if action == "lease":
@@ -7857,11 +7992,13 @@ def mac_proxy_control_client(supervisor: MacProxySupervisor, connection: socket.
             retained = True
         else:
             mac_control_send(connection, supervisor.status())
+            stopped = action == "off" and supervisor.state.actual == "off"
     except (OSError, ValueError, subprocess.SubprocessError):
         pass  # Failed control clients never acquire an agent lease.
     finally:
         if not retained:
             connection.close()
+    return stopped
 """Exec the CLI in its own pane, with a separate parent-bound lease monitor."""
 
 
@@ -8077,6 +8214,10 @@ def mac_vpn_agent_run(folder: Path, kind: str, command: Tuple[str, ...]) -> None
 
 
 from pathlib import Path
+import os
+import fcntl
+import stat
+import json
 import platform
 import shlex
 import subprocess
@@ -8172,12 +8313,89 @@ def mac_vpn_room_action(action: str) -> dict[str, Any]:
         vpn_account(account, time.time())
         binary = mac_vpn_install(folder, platform.machine())
         mac_vpn_ensure(folder, binary, account)
-    status = mac_control_request(folder, "on" if action == "setup" else action)
+    try:
+        status = mac_control_request(folder, "on" if action == "setup" else action)
+    except (FileNotFoundError, ConnectionRefusedError):
+        if action != "off" or (folder / "unconfirmed.json").exists():
+            raise
+        status = {"actual": "off"}
+    if action == "off" and status.get("off_exits") is True:
+        mac_vpn_wait_stopped(folder)
     if action == "setup":
         if status.get("actual") != "ready":
             raise ValueError("proxy did not become ready")
         mac_vpn_record_setup()
     return {**status, "room_enabled": enabled or action == "setup", "restart_required": action == "setup"}
+
+
+def mac_vpn_save_link(link: str) -> None:
+    """Keep credentials outside the room; held directory descriptors refuse symlink parents."""
+    account = vpn_link(link)
+    home = Path.home().resolve()
+    directory = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for name in (".config", "collab-vpn"):
+            try:
+                os.mkdir(name, 0o700, dir_fd=directory)
+            except FileExistsError:
+                pass
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        path = home / ".config" / "collab-vpn" / "agents.json"
+        checked, name = vpn_private_parent(path)
+        try:
+            held, reopened = os.fstat(directory), os.fstat(checked)
+            if (held.st_dev, held.st_ino) != (reopened.st_dev, reopened.st_ino):
+                raise ValueError("private directory changed")
+            document = {
+                "status": "active",
+                "expire": None,
+                "proxies": {"vless": {"id": account.credentials.uuid}},
+                "links": [link],
+            }
+            mac_proxy_write(checked, name, json.dumps(document).encode(), 0o600)
+        finally:
+            os.close(checked)
+    except (OSError, ValueError):
+        raise VpnSecretError("Could not save private VPN account.") from None
+    finally:
+        os.close(directory)
+
+
+def mac_vpn_wait_stopped(folder: Path) -> None:
+    """The daemon releases its lock only after socket and blocked-marker cleanup."""
+    directory, name = vpn_private_parent(folder / "supervisor.lock")
+    lock = None
+    try:
+        lock = os.open(name, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
+        info = os.fstat(lock)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise ValueError("proxy lock rejected")
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError("VPN supervisor stop unconfirmed") from None
+                time.sleep(0.05)
+        for entry in ("control.sock", "unconfirmed.json"):
+            try:
+                os.stat(entry, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise ValueError("VPN supervisor cleanup unconfirmed")
+    finally:
+        if lock is not None:
+            os.close(lock)
+        os.close(directory)
 """Bind native Claude hooks to a recorded process birth without a tmux capability."""
 
 
@@ -22119,7 +22337,7 @@ def chat_render(ctx: ChatMenuContext) -> None:
     head = input_head(
         ctx.config, ctx.args.as_, ctx.ui.selected, max(10, w - 1 - 12)
     )  # twelve columns at least for the text
-    sys.stdout.write(input_row(head, ctx.buf, ctx.ui.pos, h, w))
+    sys.stdout.write(input_row(head, ["*"] * len(ctx.buf) if ctx.wizard.get("secret") else ctx.buf, ctx.ui.pos, h, w))
     items = ctx.menu_items()
     if items:
         ctx.ui.menu_index %= len(items)
@@ -22315,6 +22533,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, cast
 import time
+
 
 
 
@@ -22883,10 +23102,29 @@ def vpn_unprotected(config: dict[str, Any], ready: bool) -> int:
     return count
 
 
-def start_vpn_job(ctx: ChatCommandContext, action: str) -> None:
+def start_vpn_job(ctx: ChatCommandContext, action: str, link: str | None = None) -> None:
     def work(cancel: Any, progress: Any) -> dict[str, Any]:
         if cancel():
             return {}
+        if link is not None:
+            folder = mac_vpn_folder()
+            try:
+                current = mac_control_request(folder, "status")
+            except (FileNotFoundError, ConnectionRefusedError):
+                current = None
+            if current is not None and current.get("account_reload") is not True:
+                raise ValueError(
+                    tr("VPN supervisor needs updating before changing accounts. Restart your computer, then try again.")
+                )
+            if current is not None and current.get("standard_account") is not True:
+                raise ValueError(
+                    tr("VPN supervisor uses a different account file. Turn VPN off and on in /vpn, then retry the change.")
+                )
+            mac_vpn_save_link(link)
+            try:
+                mac_control_request(folder, "reload")
+            except (FileNotFoundError, ConnectionRefusedError):
+                pass
         verb = "setup" if action == "on" and not mac_vpn_enabled(load_config()) else action
         status = mac_vpn_room_action(verb)
         status["unprotected"] = vpn_unprotected(load_config(), status.get("actual") == "ready")
@@ -22895,10 +23133,26 @@ def start_vpn_job(ctx: ChatCommandContext, action: str) -> None:
     start_install_job(ctx, "vpn", work)
     ctx.wizard.update(
         vpn_action=action,
+        vpn_link_attempt=link is not None,
         from_cmd="/vpn",
         prompt=tr("Checking agent VPN… Closing this menu does not stop a request already started."),
         options=[(words_in("team.back", room_language(ctx.config)), "cancel")],
     )
+
+
+def vpn_link_prompt(ctx: ChatCommandContext) -> None:
+    if not getattr(ctx, "tty", True):
+        ctx.feed(tr("VPN links require the interactive chat with hidden input."))
+        return
+    ctx.wizard.update(
+        step="vpn_link",
+        secret=True,
+        from_cmd="/vpn",
+        prompt=tr(
+            "Paste your private vless:// link, then Enter. Input is hidden. Esc cancels. Saving replaces the shared VPN account and stops protected agents."
+        ),
+    )
+    ctx.feed(paint(ctx.wizard["prompt"], "38;5;252"))
 
 
 def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
@@ -22909,13 +23163,16 @@ def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
         return
     error = result.get("error")
     if error is not None:
+        link_attempt = ctx.wizard.get("vpn_link_attempt")
         ctx.wizard.clear()
         if isinstance(error, VpnSecretError):
-            say_(
-                tr(
-                    "VPN account is missing or invalid: ~/.config/collab-vpn/agents.json. Add a valid private account file, then try again."
+            if link_attempt:
+                say_(
+                    tr(
+                        "VPN link was rejected. Use VLESS / WebSocket / security none or tls / IPv4 or an ASCII domain / a valid port, and a private writable configuration folder."
+                    )
                 )
-            )
+            vpn_link_prompt(ctx)
         else:
             say_(tr("Could not change agent VPN: {error}", error=clean_field(str(error), 200)))
         return
@@ -22938,6 +23195,7 @@ def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
             options.append((tr("Turn agent VPN on"), "on"))
         if status.get("room_enabled") and actual != "off":
             options.append((tr("Turn agent VPN off (stops protected agents)"), "off"))
+        options.append((tr("Change VPN (stops protected agents)"), "change"))
         ctx.wizard.update(
             step="vpn_pick",
             from_cmd="/vpn",
@@ -23016,6 +23274,11 @@ def install_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
 def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
     """/add, /remove, /mute, /name, /exit and the others: every answer is chosen in the menu;
     only what has to be written — a name, a path as the last resort — is typed."""
+    if ctx.wizard.get("step") == "vpn_link":
+        ctx.wizard.clear()
+        if line:
+            start_vpn_job(ctx, "on", link=line)
+        return
     rp = room().paths
     say_ = lambda text: (said.append(text), ctx.feed(paint(text, "38;5;252")))[1]
     if line in ("/exit", "/quit"):
@@ -23277,7 +23540,9 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         return
     if ctx.wizard.get("step") == "vpn_pick":
         ctx.wizard.clear()
-        if line in ("on", "off"):
+        if line == "change":
+            vpn_link_prompt(ctx)
+        elif line in ("on", "off"):
             start_vpn_job(ctx, line)
         return
     if line == "/telegram":
@@ -24093,7 +24358,7 @@ def chat_ask_exit(ctx: ChatCommandContext) -> None:
     if ctx.wizard.get("step") == "exit_confirm":
         raise EOFError  # Ctrl+C twice: close
     prev = {k: v for k, v in ctx.wizard.items()}
-    draft = list(ctx.buffer())
+    draft = [] if ctx.wizard.get("secret") else list(ctx.buffer())
     ctx.buffer().clear()
     ctx.ui.pos = 0
     ctx.wizard.clear()
@@ -24162,6 +24427,9 @@ def menu_order(counts: dict[str, int]) -> list[str]:
 
 def chat_handle(ctx: ChatCommandContext, line: str) -> None:
     # A command by either of its names — /добавить or /add — goes on as one: its English name.
+    if ctx.wizard.get("secret"):
+        ctx.add_wizard(line)
+        return
     line = command(line.strip())
     if not line and not ctx.wizard:
         return
@@ -24375,6 +24643,8 @@ def chat_menu_items(ctx: ChatCommandContext) -> list[tuple[str, str, str]]:
     """What the vertical menu offers right now: (shown text, what Enter does, hint).
     Commands after «/»; then the next step is a choice too — names after
     /mute, /unmute, /remove, /name — and the options of an open /add or /remove question."""
+    if ctx.wizard.get("secret"):
+        return []
     value = "".join(ctx.buffer())
     if "\n" in value:
         return []

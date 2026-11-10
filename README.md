@@ -322,8 +322,26 @@ Agents are never touched.
 
 A room can run its Codex and Claude Code agents through a local sing-box proxy.
 In the chat menu, choose `/vpn` to see its state or turn it on or off. The first
-enable performs setup; a missing or invalid account file is reported in the chat.
-Turning it off stops protected agents in all enabled rooms of the same user.
+enable performs setup. If no valid account is available, it asks for a private
+`vless://…` link in a hidden input field. Get the individual VLESS link from your
+VPN provider or your account's Marzban subscription page; paste it here, never into
+a room message. This version accepts WebSocket (`type=ws`), `security=none` or `security=tls`, a numeric
+IPv4 or an ASCII server domain, a port from 1 to 65535, and a URL-encoded path.
+Both `security=none` and `security=tls` are supported; TLS verifies the certificate
+using `sni` (or the server name when omitted). The optional `host` selects the
+WebSocket Host header. Only the VPN server's domain is resolved locally at each
+proxy start, with a three-second limit; its IPv4 address is pinned for that proxy
+generation. Agent destination names continue through the proxy. IPv6-only servers,
+Reality, insecure TLS overrides and other transports or extra parameters are refused.
+**Change VPN** replaces the shared account and stops protected agents; use `/restart`
+afterwards. The link is saved atomically with private permissions at
+`~/.config/collab-vpn/agents.json`; existing supported Marzban JSON files still work.
+Do not share that file or link. Check `/vpn` or `collab vpn status` after setup;
+only a running state confirms the proxy transport check. This does not prove CLI login.
+Turning it off stops protected agents in all enabled rooms of the same user and
+shuts down the VPN service after confirmed cleanup; turning it on starts a new service.
+An older service may require signing out of macOS or restarting the computer once
+before changing accounts; the existing account file is preserved on this refusal.
 The menu also shows running Codex/Claude agents without confirmed VPN and asks you
 to restart them with `/restart`. Checks and setup run in the background, so the chat
 stays usable while they wait; closing the menu does not cancel a request already started.

@@ -107,7 +107,7 @@ def chat_render(ctx: ChatMenuContext) -> None:
     head = m_chat_base.input_head(
         ctx.config, ctx.args.as_, ctx.ui.selected, max(10, w - 1 - 12)
     )  # twelve columns at least for the text
-    sys.stdout.write(m_chat_base.input_row(head, ctx.buf, ctx.ui.pos, h, w))
+    sys.stdout.write(m_chat_base.input_row(head, ["*"] * len(ctx.buf) if ctx.wizard.get("secret") else ctx.buf, ctx.ui.pos, h, w))
     items = ctx.menu_items()
     if items:
         ctx.ui.menu_index %= len(items)

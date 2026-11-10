@@ -2,6 +2,12 @@
 
 What each release brings. Newest first. · Что приносит каждый выпуск, новые сверху.
 
+## 0.1.32
+
+- Configure agent VPN in `/vpn` by pasting a private `vless://` link into hidden input. Links are validated and saved atomically with private permissions; supported Marzban account files keep working. · Настройте VPN агентов в `/vpn`, вставив приватную ссылку `vless://` в скрытое поле. Ссылка проверяется и сохраняется атомарно с приватными правами; поддерживаемые файлы учёток Marzban продолжают работать.
+- VLESS WebSocket links support server domains, TLS with certificate verification and SNI, and a custom WebSocket Host. Only the VPN server is resolved locally at proxy startup; agent destination names stay inside the proxy. Unsupported transports and insecure TLS overrides are refused. · Ссылки VLESS WebSocket поддерживают домены сервера, TLS с проверкой сертификата и SNI, а также отдельный WebSocket Host. Локально при запуске прокси разрешается только имя VPN-сервера; имена адресатов агентов остаются внутри прокси. Неподдерживаемые транспорты и отключение проверки TLS отклоняются.
+- Turning VPN off stops protected agents and shuts down the VPN service after confirmed cleanup; turning it on starts a new service. Changing accounts refuses an incompatible or differently configured service before replacing the private file. · Выключение VPN останавливает защищённых агентов и завершает службу VPN после подтверждённой очистки; включение запускает новую службу. Смена учётки отклоняет несовместимую службу или другой файл её настроек до замены приватного файла.
+
 ## 0.1.31
 
 - Telegram previews long messages while keeping their full text in the room. Permanent delivery refusals no longer block later messages; messages from the off period are skipped on re-enable. · Telegram показывает предпросмотр длинных писем, сохраняя полный текст в комнате. Постоянные отказы доставки больше не блокируют следующие письма; письма за время отключения пропускаются при включении.

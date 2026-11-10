@@ -79,7 +79,7 @@ def chat_ask_exit(ctx: m_chat_wizard.ChatCommandContext) -> None:
     if ctx.wizard.get("step") == "exit_confirm":
         raise EOFError  # Ctrl+C twice: close
     prev = {k: v for k, v in ctx.wizard.items()}
-    draft = list(ctx.buffer())
+    draft = [] if ctx.wizard.get("secret") else list(ctx.buffer())
     ctx.buffer().clear()
     ctx.ui.pos = 0
     ctx.wizard.clear()
@@ -148,6 +148,9 @@ def menu_order(counts: dict[str, int]) -> list[str]:
 
 def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
     # A command by either of its names — /добавить or /add — goes on as one: its English name.
+    if ctx.wizard.get("secret"):
+        ctx.add_wizard(line)
+        return
     line = m_i18n.command(line.strip())
     if not line and not ctx.wizard:
         return
@@ -361,6 +364,8 @@ def chat_menu_items(ctx: m_chat_wizard.ChatCommandContext) -> list[tuple[str, st
     """What the vertical menu offers right now: (shown text, what Enter does, hint).
     Commands after «/»; then the next step is a choice too — names after
     /mute, /unmute, /remove, /name — and the options of an open /add or /remove question."""
+    if ctx.wizard.get("secret"):
+        return []
     value = "".join(ctx.buffer())
     if "\n" in value:
         return []

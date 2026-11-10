@@ -66,6 +66,42 @@ class MacVpnPolicyTests(unittest.TestCase):
         self.assertEqual(data["outbounds"][0]["server"], account.peer)
         self.assertEqual(data["inbounds"][0]["listen"], "127.0.0.1")
 
+    def test_tls_keeps_certificate_verification_and_ws_host(self):
+        account = mod.vpn_link(
+            "vless://11111111-1111-4111-8111-111111111111@8.8.4.4:443?type=ws&security=tls&path=%2Fws&sni=cert.example.org&host=ws.example.org"
+        )
+        config = json.loads(mod.mac_vpn_config(account, mod.MacVpnEndpoint(54321)).payload)
+        outbound = config["outbounds"][0]
+        self.assertEqual(outbound["server_port"], 443)
+        self.assertEqual(outbound["tls"], {"enabled": True, "server_name": "cert.example.org", "insecure": False})
+        self.assertEqual(outbound["transport"]["headers"], {"Host": "ws.example.org"})
+        self.assertNotIn("dns", config)
+
+    def test_domain_keeps_ws_host_after_numeric_bootstrap(self):
+        account = mod.vpn_link(
+            "vless://11111111-1111-4111-8111-111111111111@vpn.example.org:8443?type=ws&security=tls&path=%2Fws"
+        )
+        config = json.loads(mod.mac_vpn_config(account, mod.MacVpnEndpoint(54321), "8.8.4.4").payload)
+        outbound = config["outbounds"][0]
+        self.assertEqual(outbound["server"], "8.8.4.4")
+        self.assertEqual(outbound["server_port"], 8443)
+        self.assertEqual(outbound["tls"]["server_name"], "vpn.example.org")
+        self.assertEqual(outbound["transport"]["headers"], {"Host": "vpn.example.org:8443"})
+
+    def test_ws_authority_default_port_follows_tls_scheme(self):
+        for security, port, expected in (
+            ("none", 443, "vpn.example.org:443"),
+            ("tls", 80, "vpn.example.org:80"),
+            ("none", 80, "vpn.example.org"),
+            ("tls", 443, "vpn.example.org"),
+        ):
+            with self.subTest(security=security, port=port):
+                account = mod.vpn_link(
+                    f"vless://11111111-1111-4111-8111-111111111111@vpn.example.org:{port}?type=ws&security={security}&path=%2Fws"
+                )
+                data = json.loads(mod.mac_vpn_config(account, mod.MacVpnEndpoint(54321), "8.8.4.4").payload)
+                self.assertEqual(data["outbounds"][0]["transport"]["headers"]["Host"], expected)
+
     def test_proxy_configuration_requires_private_generation_credentials(self):
         account = mod.VpnAccount(mod.VpnCredentials(str(uuid.uuid4()), "/private-ws"), "8.8.4.4", None)
         first, second = mod.MacVpnEndpoint(54321), mod.MacVpnEndpoint(54321)

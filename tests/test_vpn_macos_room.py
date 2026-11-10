@@ -194,6 +194,17 @@ class MacVpnRoomActionTests(unittest.TestCase):
         self.ensure.assert_not_called()
         self.control.assert_called_once_with(self.folder, "off")
 
+    def test_repeated_off_is_idempotent_but_keeps_unconfirmed_cleanup_red(self):
+        self.config["macos_vpn"] = True
+        self.control.side_effect = FileNotFoundError()
+        self.assertEqual(self.mod.mac_vpn_room_action("off")["actual"], "off")
+        self.assertEqual(self.mod.mac_vpn_room_action("off")["actual"], "off")
+        (self.folder / "unconfirmed.json").write_text("{}")
+        with self.assertRaises(FileNotFoundError):
+            self.mod.mac_vpn_room_action("off")
+        self.install.assert_not_called()
+        self.ensure.assert_not_called()
+
     def test_status_does_not_start_missing_daemon(self):
         self.control.side_effect = FileNotFoundError()
         self.assertEqual(self.mod.mac_vpn_room_action("status")["actual"], "off")

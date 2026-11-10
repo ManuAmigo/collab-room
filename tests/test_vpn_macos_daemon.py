@@ -241,3 +241,94 @@ class MacProxySupervisorTests(unittest.TestCase):
                 mod.mac_proxy_cleanup(supervisor, folder, address, (info.st_dev, info.st_ino), {15: None})
             self.assertFalse((folder / "unconfirmed.json").exists())
             self.assertFalse(address.exists())
+
+    def test_reload_revokes_leases_before_replacing_account(self):
+        import json
+        import tempfile
+
+        self.supervisor.apply("on")
+        stopped = self.lease()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / "account.json"
+            identifier = "11111111-1111-4111-8111-111111111111"
+            path.write_text(
+                json.dumps(
+                    {
+                        "status": "active",
+                        "expire": None,
+                        "proxies": {"vless": {"id": identifier}},
+                        "links": ["vless://" + identifier + "@1.1.1.1:80?type=ws&path=%2Fws"],
+                    }
+                )
+            )
+            path.chmod(0o600)
+            client, peer = socket.socketpair()
+            with peer:
+                mod.mac_control_send(peer, {"action": "reload"})
+                mod.mac_proxy_control_client(self.supervisor, client, path)
+                self.assertEqual(mod.mac_control_read(peer)["actual"], "off")
+            self.assertTrue(stopped.is_set())
+            self.assertEqual(self.supervisor.account.peer, "1.1.1.1")
+            self.supervisor.apply("on")
+            self.assertEqual(self.runtime.start.call_args.args[1].peer, "1.1.1.1")
+
+    def test_off_requests_daemon_exit_only_after_confirmed_agent_stop(self):
+        self.supervisor.apply("on")
+        stopped = self.lease()
+        client, peer = socket.socketpair()
+        with peer:
+            mod.mac_control_send(peer, {"action": "off"})
+            should_exit = mod.mac_proxy_control_client(self.supervisor, client)
+            self.assertEqual(mod.mac_control_read(peer)["actual"], "off")
+        self.assertTrue(stopped.is_set())
+        self.assertTrue(should_exit)
+
+    def test_socket_off_removes_daemon_and_releases_singleton_for_next_start(self):
+        import tempfile
+        import time
+        from types import SimpleNamespace
+        from _seam import seam
+
+        errors = []
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory).resolve()
+
+            def run():
+                try:
+                    mod.mac_proxy_daemon(folder, Path("/unused/binary"), Path("/unused/account"))
+                except Exception as error:
+                    errors.append(error)
+
+            with (
+                seam(mod, "vpn_config.vpn_account", lambda *_: self.account),
+                seam(mod, "vpn_macos_service.MacProxyProcess", lambda: self.runtime),
+                seam(mod, "vpn_macos_daemon.signal.signal", lambda *_: None),
+                seam(mod, "vpn_macos_daemon.threading", SimpleNamespace(Event=lambda: stop)),
+            ):
+                for _ in range(2):
+                    stop.clear()
+                    thread = threading.Thread(target=run, daemon=True)
+                    thread.start()
+                    deadline = time.monotonic() + 3
+                    while not (folder / "control.sock").exists() and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    status = mod.mac_control_request(folder, "off")
+                    self.assertEqual(status["actual"], "off")
+                    self.assertTrue(status["off_exits"])
+                    mod.mac_vpn_wait_stopped(folder)
+                    thread.join(1)
+                    self.assertFalse(thread.is_alive())
+                    self.assertFalse((folder / "control.sock").exists())
+                    self.assertFalse((folder / "unconfirmed.json").exists())
+            self.assertEqual(errors, [])
+
+    def test_status_identifies_standard_account_without_disclosing_custom_path(self):
+        standard = Path.home() / ".config/collab-vpn/agents.json"
+        self.assertTrue(
+            mod.MacProxySupervisor(self.runtime, Path("/unused"), self.account, standard).status()["standard_account"]
+        )
+        other = mod.MacProxySupervisor(self.runtime, Path("/unused"), self.account, Path("/private/custom-secret.json"))
+        self.assertFalse(other.status()["standard_account"])
+        self.assertNotIn("custom-secret", str(other.status()))

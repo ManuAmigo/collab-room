@@ -13,6 +13,27 @@ LANGS = ("en", "ru")
 LANG_NAMES = {"en": "English", "ru": "Русский"}
 
 CATALOG: dict[str, dict[str, Any]] = {
+    "t.ab86c4ef03": {
+        "en": "VPN supervisor uses a different account file. Turn VPN off and on in /vpn, then retry the change.",
+        "ru": "Служба VPN использует другой файл учётки. Выключите и включите VPN в /vpn, затем повторите смену.",
+    },
+    "t.7c5d2722a1": {
+        "en": "VPN supervisor needs updating before changing accounts. Restart your computer, then try again.",
+        "ru": "Перед сменой учётки нужно обновить службу VPN. Перезагрузите компьютер и повторите попытку.",
+    },
+    "t.85ce4782d8": {
+        "en": "VPN links require the interactive chat with hidden input.",
+        "ru": "Для вставки ссылки VPN откройте интерактивный чат со скрытым вводом.",
+    },
+    "t.0e4787f4fc": {"en": "Change VPN (stops protected agents)", "ru": "Сменить VPN (защищённые агенты остановятся)"},
+    "t.7a129292d0": {
+        "en": "Paste your private vless:// link, then Enter. Input is hidden. Esc cancels. Saving replaces the shared VPN account and stops protected agents.",
+        "ru": "Вставьте приватную ссылку vless:// и нажмите Enter. Ввод скрыт. Esc — отмена. Сохранение заменит общую учётку VPN и остановит защищённых агентов.",
+    },
+    "t.98ebd721d4": {
+        "en": "VPN link was rejected. Use VLESS / WebSocket / security none or tls / IPv4 or an ASCII domain / a valid port, and a private writable configuration folder.",
+        "ru": "Ссылка VPN отклонена. Нужны VLESS / WebSocket / security none или tls / IPv4 или ASCII-домен / допустимый порт и приватная папка настроек с доступом на запись.",
+    },
     "t.6d928ed03e": {
         "en": "Message {id} was not sent to Telegram (HTTP {code}); later messages continue. Full text: collab show {id}.",
         "ru": "Письмо {id} не отправлено в Telegram (HTTP {code}); следующие письма отправляются. Полный текст: collab show {id}.",

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ipaddress
+import json
+import sys
 from pathlib import Path
 import socket
 import subprocess
@@ -50,6 +52,37 @@ def mac_proxy_listeners(port: int) -> frozenset[int]:
     return frozenset(owners)
 
 
+def mac_vpn_resolve_peer(server: str) -> str:
+    """Bound bootstrap DNS in a disposable child; never give it an agent target or credentials."""
+    try:
+        server = m_vpn_config.vpn_server_name(server)
+        try:
+            return m_vpn_config.vpn_routed_ipv4(server)
+        except ValueError:
+            pass
+        code = (
+            "import json,socket,sys;"
+            "print(json.dumps(sorted({r[4][0] for r in socket.getaddrinfo(sys.argv[1],None,socket.AF_INET,socket.SOCK_STREAM)})))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-c", code, server],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            timeout=3,
+        )
+        if result.returncode != 0 or len(result.stdout) > 4096:
+            raise ValueError()
+        answers = json.loads(result.stdout)
+        if not isinstance(answers, list) or not 1 <= len(answers) <= 16:
+            raise ValueError()
+        addresses = [m_vpn_config.vpn_routed_ipv4(answer) for answer in answers]
+        return addresses[0]
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        raise MacProxyError("VPN server bootstrap DNS failed") from None
+
+
 class MacProxyProcess:
     def __init__(self) -> None:
         self.process: subprocess.Popen[bytes] | None = None
@@ -61,7 +94,8 @@ class MacProxyProcess:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
             reservation.bind(("127.0.0.1", 0))
             endpoint = m_vpn_macos.MacVpnEndpoint(reservation.getsockname()[1])
-        payload = m_vpn_macos.mac_vpn_config(account, endpoint).payload
+        peer = mac_vpn_resolve_peer(account.peer)
+        payload = m_vpn_macos.mac_vpn_config(account, endpoint, peer).payload
         process = subprocess.Popen(
             [str(binary), "run", "-c", "/dev/stdin"],
             stdin=subprocess.PIPE,

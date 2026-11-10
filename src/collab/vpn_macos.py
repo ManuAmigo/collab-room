@@ -9,7 +9,7 @@ import json
 import secrets
 import re
 import tarfile
-from typing import Mapping, Tuple
+from typing import Any, Mapping, Tuple
 
 import collab.vpn_config as m_vpn_config
 
@@ -66,12 +66,37 @@ def mac_vpn_profile(endpoint: MacVpnEndpoint) -> str:
     )
 
 
-def mac_vpn_config(account: m_vpn_config.VpnAccount, endpoint: MacVpnEndpoint) -> m_vpn_config.VpnPrivateConfig:
-    # Numeric transport peer and domain-preserving CONNECT avoid a local DNS resolver.
-    peer = m_vpn_config.vpn_routed_ipv4(account.peer)
+def mac_vpn_config(
+    account: m_vpn_config.VpnAccount, endpoint: MacVpnEndpoint, resolved_peer: str | None = None
+) -> m_vpn_config.VpnPrivateConfig:
+    # Only the VPN server is resolved at startup; agent CONNECT targets stay domains.
+    server = m_vpn_config.vpn_server_name(account.peer)
+    peer = m_vpn_config.vpn_routed_ipv4(resolved_peer if resolved_peer is not None else server)
+    if type(account.port) is not int or not 1 <= account.port <= 65535:
+        raise ValueError("invalid VPN server port")
     credentials = m_vpn_config.vpn_credentials_from_document(
         {"uuid": account.credentials.uuid, "ws_path": account.credentials.ws_path}
     )
+    outbound: dict[str, Any] = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": peer,
+        "server_port": account.port,
+        "uuid": credentials.uuid,
+        "transport": {"type": "ws", "path": credentials.ws_path},
+    }
+    host = m_vpn_config.vpn_server_name(account.ws_host) if account.ws_host else server
+    if account.ws_host or server != peer:
+        default_port = 443 if account.tls_server_name is not None else 80
+        if not account.ws_host and account.port != default_port:
+            host = f"{host}:{account.port}"
+        outbound["transport"]["headers"] = {"Host": host}
+    if account.tls_server_name is not None:
+        outbound["tls"] = {
+            "enabled": True,
+            "server_name": m_vpn_config.vpn_server_name(account.tls_server_name),
+            "insecure": False,
+        }
     document = {
         "log": {"disabled": True},
         "inbounds": [
@@ -82,16 +107,7 @@ def mac_vpn_config(account: m_vpn_config.VpnAccount, endpoint: MacVpnEndpoint) -
                 "users": [{"username": endpoint.username, "password": endpoint.password}],
             }
         ],
-        "outbounds": [
-            {
-                "type": "vless",
-                "tag": "proxy",
-                "server": peer,
-                "server_port": 80,
-                "uuid": credentials.uuid,
-                "transport": {"type": "ws", "path": credentials.ws_path},
-            }
-        ],
+        "outbounds": [outbound],
         "route": {"final": "proxy"},
     }
     return m_vpn_config.VpnPrivateConfig(json.dumps(document, separators=(",", ":")).encode())

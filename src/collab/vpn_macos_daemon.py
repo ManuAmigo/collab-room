@@ -104,8 +104,17 @@ def mac_control_request(folder: Path, action: str) -> dict[str, Any]:
 
 
 class MacProxySupervisor:
-    def __init__(self, runtime: m_vpn_macos_service.MacProxyProcess, binary: Path, account: m_vpn_config.VpnAccount) -> None:
+    def __init__(
+        self,
+        runtime: m_vpn_macos_service.MacProxyProcess,
+        binary: Path,
+        account: m_vpn_config.VpnAccount,
+        account_path: Path | None = None,
+    ) -> None:
         self.runtime, self.binary, self.account = runtime, binary, account
+        self.standard_account = (
+            account_path is not None and account_path.resolve() == (Path.home() / ".config/collab-vpn/agents.json").resolve()
+        )
         self.state = m_vpn_macos_state.MacProxyState()
         self.leases: list[socket.socket] = []
         self.pending_stops: list[socket.socket] = []
@@ -194,6 +203,9 @@ class MacProxySupervisor:
         identity = self.runtime.identity
         return {
             "supervisor_pid": os.getpid(),
+            "account_reload": True,
+            "standard_account": self.standard_account,
+            "off_exits": True,
             "actual": self.state.actual,
             "desired": self.state.desired,
             "generation": self.state.generation,
@@ -241,7 +253,7 @@ def mac_proxy_daemon(folder: Path, binary: Path, account_path: Path) -> None:
 
 def mac_proxy_daemon_locked(folder: Path, binary: Path, account_path: Path) -> None:
     account = m_vpn_config.vpn_account(account_path, time.time())
-    supervisor = MacProxySupervisor(m_vpn_macos_service.MacProxyProcess(), binary, account)
+    supervisor = MacProxySupervisor(m_vpn_macos_service.MacProxyProcess(), binary, account, account_path)
     address = folder / "control.sock"
     if len(os.fsencode(address)) >= 104:
         raise ValueError("proxy control socket path too long")
@@ -267,7 +279,9 @@ def mac_proxy_daemon_locked(folder: Path, binary: Path, account_path: Path) -> N
                 for connection in ready:
                     if connection is server:
                         client, _ = server.accept()
-                        mac_proxy_control_client(supervisor, client)
+                        if mac_proxy_control_client(supervisor, client, account_path):
+                            stop.set()
+                            break
                     elif connection in supervisor.leases:
                         supervisor.leases.remove(connection)
                         try:
@@ -346,14 +360,21 @@ def mac_proxy_cleanup(
         os.close(directory)
 
 
-def mac_proxy_control_client(supervisor: MacProxySupervisor, connection: socket.socket) -> None:
+def mac_proxy_control_client(supervisor: MacProxySupervisor, connection: socket.socket, account_path: Path | None = None) -> bool:
     retained = False
+    stopped = False
     try:
         connection.settimeout(3)
         request = mac_control_read(connection, tick=supervisor.tick)
-        if set(request) != {"action"} or request["action"] not in ("on", "off", "status", "lease"):
+        if set(request) != {"action"} or request["action"] not in ("on", "off", "status", "lease", "reload"):
             raise ValueError("proxy control request rejected")
         action = request["action"]
+        if action == "reload":
+            if account_path is None:
+                raise ValueError("proxy account reload unavailable")
+            account = m_vpn_config.vpn_account(account_path, time.time())
+            supervisor.apply("off")
+            supervisor.account = account
         if action in ("on", "off"):
             supervisor.apply(action)
         if action == "lease":
@@ -361,8 +382,10 @@ def mac_proxy_control_client(supervisor: MacProxySupervisor, connection: socket.
             retained = True
         else:
             mac_control_send(connection, supervisor.status())
+            stopped = action == "off" and supervisor.state.actual == "off"
     except (OSError, ValueError, subprocess.SubprocessError):
         pass  # Failed control clients never acquire an agent lease.
     finally:
         if not retained:
             connection.close()
+    return stopped

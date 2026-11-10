@@ -24,6 +24,7 @@ class MacProxyProcessTests(unittest.TestCase):
             PIPE=-1,
             DEVNULL=-3,
             TimeoutExpired=mod.subprocess.TimeoutExpired,
+            SubprocessError=mod.subprocess.SubprocessError,
             run=mock.Mock(),
         )
         self.enterContext(seam(mod, "vpn_macos_service.subprocess", self.processes))
@@ -104,3 +105,65 @@ class MacProxyProcessTests(unittest.TestCase):
             self.runtime.stop()
         self.assertIs(self.runtime.process, self.child)
         self.assertIsNotNone(self.runtime.identity)
+
+    def test_only_vpn_server_is_resolved_then_numeric_peer_is_pinned(self):
+        import json
+
+        self.account = mod.vpn_link(
+            "vless://11111111-1111-4111-8111-111111111111@vpn.example.org:443?type=ws&security=tls&path=%2Fprivate&sni=cert.example.org&host=ws.example.org"
+        )
+        self.processes.run.return_value = SimpleNamespace(returncode=0, stdout=b'["8.8.4.4"]')
+        self.runtime.start(Path("/private/sing-box"), self.account, 4)
+        argv, options = self.processes.run.call_args
+        self.assertEqual(argv[0][-1], "vpn.example.org")
+        self.assertEqual(argv[0][1:3], ["-I", "-S"])
+        self.assertEqual(options["timeout"], 3)
+        self.assertEqual(options["stderr"], self.processes.DEVNULL)
+        self.assertNotIn("cert.example.org", str(argv))
+        self.assertNotIn("11111111", str(argv))
+        self.assertNotIn("private", str(argv))
+        payload = json.loads(self.child.stdin.write.call_args.args[0])
+        outbound = payload["outbounds"][0]
+        self.assertEqual(outbound["server"], "8.8.4.4")
+        self.assertEqual(outbound["tls"]["server_name"], "cert.example.org")
+        self.assertEqual(outbound["transport"]["headers"]["Host"], "ws.example.org")
+        self.assertNotIn("dns", payload)
+        self.processes.run.assert_called_once()
+
+    def test_bootstrap_dns_refuses_bad_answers_and_timeout_before_proxy_start(self):
+        self.account = mod.vpn_link(
+            "vless://11111111-1111-4111-8111-111111111111@vpn.example.org:443?type=ws&security=tls&path=%2Fws"
+        )
+        for answer in (b"[]", b'["127.0.0.1"]', b'["8.8.4.4","169.254.169.254"]', b'["::1"]', b"{}", b"not json"):
+            with self.subTest(answer=answer):
+                self.processes.run.return_value = SimpleNamespace(returncode=0, stdout=answer)
+                with self.assertRaisesRegex(mod.MacProxyError, "bootstrap DNS"):
+                    self.runtime.start(Path("/private/sing-box"), self.account, 1)
+                self.assertIsNone(self.runtime.process)
+                self.processes.Popen.assert_not_called()
+        self.processes.run.side_effect = self.processes.TimeoutExpired("private-value", 3)
+        with self.assertRaises(mod.MacProxyError) as failure:
+            self.runtime.start(Path("/private/sing-box"), self.account, 1)
+        self.assertNotIn("private-value", str(failure.exception))
+        self.processes.Popen.assert_not_called()
+
+    def test_numeric_server_never_runs_bootstrap_dns(self):
+        self.runtime.start(Path("/private/sing-box"), self.account, 1)
+        self.processes.run.assert_not_called()
+
+    def test_dns_child_does_not_hide_answers_beyond_validation_limit(self):
+        import subprocess
+
+        addresses = [f"198.51.100.{n}" for n in range(1, 18)]
+
+        def run(argv, **options):
+            # Execute the actual DNS child program with only the system lookup replaced.
+            prefix = "import socket;socket.getaddrinfo=lambda *_: [(2,1,6,None,(ip,0)) for ip in " + repr(addresses) + "];"
+            result = subprocess.run([*argv[:4], prefix + argv[4], *argv[5:]], **options)
+            self.assertEqual(result.returncode, 0, "DNS fixture child must execute successfully")
+            return result
+
+        self.processes.run.side_effect = run
+        with self.assertRaisesRegex(mod.MacProxyError, "bootstrap DNS"):
+            mod.mac_vpn_resolve_peer("vpn.example.org")
+        self.processes.Popen.assert_not_called()

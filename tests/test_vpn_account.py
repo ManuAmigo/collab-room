@@ -58,3 +58,90 @@ class VpnAccountExpiryTests(unittest.TestCase):
             with self.subTest(status=status), self.assertRaises(mod.VpnSecretError):
                 self.document["status"] = status
                 self.profile()
+
+    def test_link_rejects_controls_without_exposing_credentials(self):
+        self.document["links"][0] = self.document["links"][0].replace("vless://", "vless://\n")
+        with self.assertRaises(mod.VpnSecretError) as failure:
+            self.profile()
+        self.assertNotIn("11111111", str(failure.exception))
+
+    def test_supported_link_and_sanitized_refusals(self):
+        link = self.document["links"][0]
+        self.assertEqual(mod.vpn_link(link + "#My%20VPN").peer, "8.8.4.4")
+        for bad in (
+            link.replace("none", "reality", 1),
+            link.replace("type=ws", "type=tcp"),
+            link.replace("8.8.4.4", "-bad.example.org"),
+            link.replace(":80?", ":65536?"),
+            link + "&type=ws",
+            link + "&unexpected=yes",
+            link.replace("vless://", "https://"),
+            link.replace("8.8.4.4", "[broken"),
+            link + "\n",
+            link.replace("%2Ffixture", "%ZZ"),
+        ):
+            with self.subTest(kind=bad[-8:]), self.assertRaises(mod.VpnSecretError) as failure:
+                mod.vpn_link(bad)
+            self.assertNotIn("11111111", str(failure.exception))
+            self.assertNotIn("fixture", str(failure.exception))
+
+    def test_save_is_private_atomic_and_refuses_symlinks(self):
+        from _seam import seam
+
+        home = self.root / "home"
+        home.mkdir(mode=0o700)
+        link = self.document["links"][0]
+        with seam(mod, "vpn_macos_room.Path.home", lambda: home):
+            mod.mac_vpn_save_link(link)
+            path = home / ".config/collab-vpn/agents.json"
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(mod.vpn_account(path, 100).peer, "8.8.4.4")
+            before = path.stat().st_ino
+            mod.mac_vpn_save_link(link.replace("8.8.4.4", "1.1.1.1"))
+            self.assertNotEqual(path.stat().st_ino, before)
+            self.assertEqual(mod.vpn_account(path, 100).peer, "1.1.1.1")
+            original = path.read_bytes()
+            with self.assertRaises(mod.VpnSecretError):
+                mod.mac_vpn_save_link("bad")
+            self.assertEqual(path.read_bytes(), original)
+            path.unlink()
+            path.symlink_to(self.path)
+            with self.assertRaises(mod.VpnSecretError):
+                mod.mac_vpn_save_link(link)
+            self.assertTrue(path.is_symlink())
+            self.assertFalse(self.path.exists())
+            path.unlink()
+            path.parent.chmod(0o755)
+            with self.assertRaises(mod.VpnSecretError):
+                mod.mac_vpn_save_link(link)
+            self.assertFalse(path.exists())
+
+    def test_domain_tls_with_sni_and_ws_host_preserves_profile_without_dns(self):
+        link = self.document["links"][0].replace("8.8.4.4:80", "vpn.example.org:443").replace("security=none", "security=tls")
+        self.document["links"] = [link + "&sni=cert.example.org&host=ws.example.org"]
+        account = self.profile()
+        self.assertEqual(account.peer, "vpn.example.org")
+        self.assertEqual(account.port, 443)
+        self.assertEqual(account.tls_server_name, "cert.example.org")
+        self.assertEqual(account.ws_host, "ws.example.org")
+        self.assertIsNone(account.expires)
+
+    def test_tls_defaults_and_unsupported_options_are_explicit(self):
+        link = self.document["links"][0].replace("8.8.4.4:80", "vpn.example.org:8443").replace("security=none", "security=tls")
+        account = mod.vpn_link(link)
+        self.assertEqual(account.tls_server_name, "vpn.example.org")
+        self.assertEqual(account.port, 8443)
+        for bad in (
+            link.replace("security=tls", "security=reality"),
+            link + "&allowInsecure=1",
+            link + "&sni=bad%0d%0aHeader%3Avalue",
+            link + "&host=bad%20host.example.org",
+            link.replace("vpn.example.org", "localhost"),
+            link.replace("vpn.example.org", "127.1"),
+            link.replace("vpn.example.org", "[::1]"),
+            link.replace("type=ws", "type=grpc"),
+        ):
+            with self.subTest(kind=bad[-12:]), self.assertRaises(mod.VpnSecretError) as failure:
+                mod.vpn_link(bad)
+            self.assertNotIn("11111111", str(failure.exception))
