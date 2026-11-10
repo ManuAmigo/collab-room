@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import ast
 import contextlib
 import errno
 import hashlib
@@ -14,7 +15,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 import collab.boot as m_boot
 import collab.text as m_text
 import collab.i18n as m_i18n
@@ -23,6 +24,7 @@ import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
 import collab.screen as m_screen
+import collab.usage as m_usage
 
 
 # A Codex the room starts answers in that room without asking («adding Codex must be
@@ -145,6 +147,96 @@ def current_name() -> str:
     a developer's chat from a working copy was told «older» for good, beside any install."""
     inst = m_boot.paths()
     return installed_name() if (inst.safe_copies / "command").resolve() in Path(m_boot.SELF).resolve().parents else copy_name()
+
+
+AGENT_CONTRACT_NODES = {
+    "RULES_HEADER",
+    "set_agent_rule",
+    "rule_python",
+    "IDENTITY_FLAG",
+    "repeated_identity",
+    "rule_shape_differs",
+    "guard_room_state",
+    "codex_room_rule",
+    "codex_rule_refusal",
+    "agent_command",
+    "codex_knows_no_daemon",
+    "CODEX_COMMAND",
+    "COPY_GATE",
+}
+AGENT_CONTRACT_CACHE: dict[tuple[Any, ...], str] = {}
+
+
+def agent_contract(path: Path) -> str:
+    """Compare the start-time permission contract, without importing or executing an old copy.
+
+    Screen, delivery and other build changes do not change the rules a running agent loaded.
+    Missing/unreadable contracts stay unknown, rather than being declared current.
+    """
+    try:
+        info = path.stat()
+        if not path.is_file() or info.st_size > 16_000_000:
+            return ""
+        key = (str(path.resolve()), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        if key in AGENT_CONTRACT_CACHE:
+            return AGENT_CONTRACT_CACHE[key]
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        nodes: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = node.name
+                if name == "main":
+                    for part in node.body:
+                        if isinstance(part, ast.If) and any(
+                            isinstance(value, ast.Constant) and value.value == r"collab-[0-9a-f]{16}"
+                            for value in ast.walk(part.test)
+                        ):
+                            nodes["COPY_GATE"] = ast.dump(part, include_attributes=False)
+                if name not in AGENT_CONTRACT_NODES:
+                    continue
+                if (
+                    node.body
+                    and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)
+                ):
+                    node.body = node.body[1:]
+                nodes[name] = ast.dump(node, include_attributes=False)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in AGENT_CONTRACT_NODES:
+                        nodes[target.id] = ast.dump(node, include_attributes=False)
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "PRESETS"
+                and isinstance(node.value, ast.Dict)
+            ):
+                for kind, preset in zip(node.value.keys, node.value.values):
+                    if isinstance(kind, ast.Constant) and kind.value == "codex" and isinstance(preset, ast.Dict):
+                        for field, value in zip(preset.keys, preset.values):
+                            if isinstance(field, ast.Constant) and field.value == "command":
+                                nodes["CODEX_COMMAND"] = ast.dump(value, include_attributes=False)
+        signature = (
+            hashlib.sha256(json.dumps(nodes, sort_keys=True).encode()).hexdigest() if set(nodes) == AGENT_CONTRACT_NODES else ""
+        )
+        if len(AGENT_CONTRACT_CACHE) >= 32:
+            AGENT_CONTRACT_CACHE.clear()
+        AGENT_CONTRACT_CACHE[key] = signature
+        return signature
+    except (OSError, ValueError, SyntaxError, UnicodeError):
+        return ""
+
+
+def agent_integration_changed(cli: str) -> bool:
+    inst = m_boot.paths()
+    current = (
+        installed_collab()
+        if (inst.safe_copies / "command").resolve() in Path(m_boot.SELF).resolve().parents
+        else Path(m_boot.SELF)
+    )
+    old, new = agent_contract(Path(cli)), agent_contract(current)
+    return not old or not new or old != new
 
 
 def codex_workplaces() -> list[tuple[str, str]]:
@@ -286,6 +378,7 @@ def set_agent_rule(room_dir: str, pid: str, cli: str) -> None:
                 + ', decision="allow")\n'
                 for command, flag in (
                     ("say", "--from"),
+                    ("take", "--from"),
                     ("ack", "--for"),
                     ("inbox", "--for"),
                     ("propose", "--from"),
@@ -1324,3 +1417,261 @@ def cmd_install(args: argparse.Namespace) -> None:
     print(f"Done. Next, in your project folder: {start_cmd}" if ok else "Some steps did not complete — see ✗ above.")
     if not ok:
         raise SystemExit(1)
+
+
+def kimi_hook_fragment(interpreter: str = "", cli: str = "") -> str:
+    """Two quoting layers: argv -> POSIX shell command -> TOML basic string."""
+    command = "exec " + shlex.join([interpreter or sys.executable, cli or m_boot.SELF, "usage", "kimi-start"])
+    return (
+        '\n# collab-room:kimi-usage:begin v1\n[[hooks]]\nevent = "SessionStart"\n'
+        'matcher = "^(startup|resume)$"\ncommand = '
+        + json.dumps(command, ensure_ascii=False)
+        + "\ntimeout = 5\n# collab-room:kimi-usage:end v1\n"
+    )
+
+
+def _kimi_adoption_read(path: Path, limit: int) -> tuple[os.stat_result, bytes] | None:
+    fd = m_usage.open_under(Path("/"), path)
+    if fd is None:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if info.st_uid != os.getuid() or info.st_nlink != 1 or (limit and info.st_size > limit):
+                return None
+            if not limit:
+                return info, b""
+            data = source.read(limit + 1)
+            return (info, data) if len(data) <= limit else None
+    except OSError:
+        return None
+
+
+def kimi_hook_fragment_present(path: Path, interpreter: str = "", cli: str = "") -> bool:
+    """Check only the owned hook bytes; no other configuration is returned or changed."""
+    path = path.absolute()
+    if any(part in (".", "..") for part in path.parts) or path.name != "config.toml":
+        return False
+    read = _kimi_adoption_read(path, 1 << 20)
+    if read is None:
+        return False
+    info, original = read
+    block = kimi_hook_fragment(interpreter, cli).encode()
+    return not info.st_mode & 0o022 and original.count(block) == 1 and original.count(b"# collab-room:kimi-usage:") == 2
+
+
+def _kimi_adoption_writers(path: Path) -> set[str] | None:
+    try:
+        opened = subprocess.run(["lsof", "-Fpf", "--", str(path)], capture_output=True, text=True, timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if opened.returncode not in (0, 1) or len(opened.stdout) > 1_000_000:
+        return None
+    writers: set[str] = set()
+    pid = ""
+    for row in opened.stdout.splitlines():
+        if row.startswith("p"):
+            pid = row[1:]
+        elif row.startswith("f") and pid and row[1:].endswith(("w", "u")):
+            writers.add(pid)
+    return writers
+
+
+def kimi_adoption_preflight(p: dict[str, Any], sid: str = "", poststop: bool = False) -> dict[str, Any]:
+    """A write-free snapshot for a later owner-approved managed resume, never a launch or binding."""
+    gates = dict.fromkeys(("participant", "session_id", "metadata", "process", "writer", "hook", "checkpoint"), "UNKNOWN")
+    reasons: dict[str, str] = {}
+    snapshot: dict[str, Any] = {}
+
+    def report() -> dict[str, Any]:
+        return {
+            "dry_run": True,
+            "ready": all(status == "PASS" for status in gates.values()),
+            "gates": gates,
+            "reasons": reasons,
+            "snapshot": snapshot,
+            "checkpoint_policy": {
+                "append": "refresh the offset before execute; ordinary telemetry append is allowed",
+                "quota": "rescan the event stream at the refreshed checkpoint",
+            },
+        }
+
+    pid = str(p.get("pane_pid") or "")
+    target = str(p.get("target") or "")
+    folder = os.path.realpath(str(p.get("folder") or ""))
+    if (
+        not p.get("id")
+        or m_screen.agent_kind(p) != "kimi"
+        or p.get("started_by_room") is not True
+        or not p.get("join_code")
+        or not pid.isdigit()
+        or not target
+        or not folder
+        or m_usage.kimi_binding(p)
+    ):
+        gates["participant"] = "FAIL"
+        reasons["participant"] = "expected a room-managed, currently unbound Kimi participant"
+        return report()
+    gates["participant"] = "PASS"
+
+    if poststop:
+        status = m_usage.kimi_process_status(pid)
+        if status != "gone":
+            gates["process"] = "FAIL"
+            reasons["process"] = "the old process is still alive" if status == "alive" else "old process state is unknown"
+        else:
+            gates["process"] = "PASS"
+            snapshot["process"] = {"pid": pid, "gone": True}
+    else:
+        identity = m_usage.kimi_process_start(pid)
+        rules = m_screen.screen_rules(p)
+        shot = m_screen.look(rules, target)
+        state, _ = m_screen.screen_state(rules, target, shot)
+        guard = m_screen.pane_guard(p, target, idle=True, shot=shot) if identity else ""
+        background = m_screen.screen_count(target, rules["background"], shot, rules) if rules.get("background") else 0
+        queued = bool(rules.get("queued") and re.search(rules["queued"], shot.stdout, re.MULTILINE))
+        if identity and not guard and not shot.scrolled and state == "idle" and not background and not queued:
+            gates["process"] = "PASS"
+            snapshot["process"] = {"pid": pid, "start": identity}
+        else:
+            gates["process"] = "FAIL"
+            reasons["process"] = guard or f"strict idle is required; screen={state}, background={background}, queued={queued}"
+
+    config = m_usage.kimi_home().parent / "config.toml"
+    if kimi_hook_fragment_present(config):
+        gates["hook"] = "PASS"
+    else:
+        gates["hook"] = "FAIL"
+        reasons["hook"] = "the exact collab hook fragment is a separate prerequisite; config was not changed"
+
+    if not sid:
+        reasons["session_id"] = "owner-confirmed exact session ID is absent"
+        return report()
+    if not m_usage.KIMI_PART.fullmatch(sid):
+        gates["session_id"] = "FAIL"
+        reasons["session_id"] = "invalid exact session ID"
+        return report()
+    gates["session_id"] = "PASS"
+    session = m_usage.kimi_home() / m_usage.kimi_workdir_key(folder) / sid
+    wire = session / "agents" / "main" / "wire.jsonl"
+    read = _kimi_adoption_read(session / "state.json", 65_536)
+    metadata: dict[str, Any] = {}
+    if read is not None:
+        try:
+            parsed = json.loads(read[1])
+            metadata = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            pass
+    agents = cast(dict[str, Any], metadata.get("agents")) if isinstance(metadata.get("agents"), dict) else {}
+    if (
+        metadata.get("id") != sid
+        or os.path.realpath(str(metadata.get("cwd") or "")) != folder
+        or metadata.get("archived") is not False
+        or not isinstance(metadata.get("version"), int)
+        or isinstance(metadata.get("version"), bool)
+        or metadata.get("version", 0) <= 0
+        or not isinstance(agents.get("main"), dict)
+    ):
+        gates["metadata"] = "FAIL"
+        reasons["metadata"] = "state.json id/cwd/version/archive/main does not match the participant"
+        return report()
+    gates["metadata"] = "PASS"
+
+    read = _kimi_adoption_read(wire, 0)
+    if read is None:
+        gates["checkpoint"] = "FAIL"
+        reasons["checkpoint"] = "agents/main/wire.jsonl is missing or unsafe"
+        return report()
+    info = read[0]
+    gates["checkpoint"] = "PASS"
+    snapshot["wire"] = {"dev": info.st_dev, "ino": info.st_ino, "off": info.st_size}
+    writers = _kimi_adoption_writers(wire)
+    if writers is None or not writers:
+        reasons["writer"] = "no current writer was observed; absence of an fd is not proof"
+    elif not poststop and writers == {pid}:
+        gates["writer"] = "PASS"
+    else:
+        gates["writer"] = "FAIL"
+        reasons["writer"] = "another writer is attached to the exact session wire"
+    snapshot["writer_pids"] = sorted(writers or [])
+    return report()
+
+
+def set_kimi_hook(path: Path, remove: bool = False, interpreter: str = "", cli: str = "") -> bool:
+    """Only an explicitly chosen existing config. No auto-discovery or owner-profile writes.
+    Keep foreign bytes; changed/partial owned blocks are refused, never guessed away."""
+    import fcntl
+    import stat
+    import tomllib
+
+    path = path.absolute()
+    if any(part in (".", "..") for part in path.parts) or path.name != "config.toml":
+        raise ValueError("expected an explicit config.toml without traversal")
+    block = kimi_hook_fragment(interpreter, cli).encode()
+    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    config_fd, temporary = -1, ""
+    try:
+        for part in path.parent.parts[1:]:
+            inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = inner
+        config_fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        fcntl.flock(config_fd, fcntl.LOCK_EX)
+        info = os.fstat(config_fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022 or info.st_size > 1 << 20:
+            raise ValueError("config must be an owned, bounded ordinary file, not writable by others")
+        original = os.read(config_fd, (1 << 20) + 1)
+        if len(original) > 1 << 20:
+            raise ValueError("config is too large")
+        try:
+            before = tomllib.loads(original.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+            raise ValueError("invalid TOML config") from None
+        marker = b"# collab-room:kimi-usage:"
+        if marker in original and (original.count(block) != 1 or original.count(marker) != 2):
+            raise ValueError("owned hook was edited or is ambiguous; refusing to replace it")
+        if remove:
+            if block not in original:
+                return False
+            updated = original.replace(block, b"", 1)
+        else:
+            if block in original:
+                return False
+            updated = original + block
+        after = tomllib.loads(updated.decode("utf-8"))
+        # Appending an array table must not change existing tables or hooks' parsed meaning.
+        old_hooks, new_hooks = before.pop("hooks", []), after.pop("hooks", [])
+        expected = tomllib.loads(block.decode())["hooks"][0]
+        if not isinstance(old_hooks, list) or not isinstance(new_hooks, list):
+            raise ValueError("hooks must be an array")
+        expected_hooks = old_hooks[:-1] if remove else [*old_hooks, expected]
+        if remove and (not old_hooks or old_hooks[-1] != expected):
+            # A foreign hook appended later is allowed; remove only the exact parsed owned rule.
+            expected_hooks = list(old_hooks)
+            expected_hooks.remove(expected)
+        if before != after or new_hooks != expected_hooks:
+            raise ValueError("hook update would change unrelated settings")
+        temporary = ".collab-kimi-hook-" + secrets.token_hex(12)
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        with os.fdopen(fd, "wb") as out:
+            out.write(updated)
+            out.flush()
+            os.fchmod(out.fileno(), stat.S_IMODE(info.st_mode))
+            os.fsync(out.fileno())
+        current = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+        if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+        ):
+            raise ValueError("config changed while preparing hook update")
+        os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+        temporary = ""
+        return True
+    finally:
+        if temporary:
+            os.unlink(temporary, dir_fd=directory)
+        if config_fd >= 0:
+            os.close(config_fd)
+        os.close(directory)

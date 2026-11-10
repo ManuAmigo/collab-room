@@ -76,7 +76,8 @@ empty input opens the same question. A second Ctrl+C while it is open closes cha
 - A plain `<CLI> ack --room <room> --for <your-id> --id <message-id>` means read,
   not complete. When no answer is needed, use the same command with `--no-reply`.
   Never close an unanswered question or unfinished task that way.
-- Before editing shared files, post `Taking: <task/files>` and respect existing claims.
+- Before editing shared files, run `<CLI> take --room <room> --from <your-id> '<task/files>'` (it posts
+  `Taking: …` waking no one) and respect existing claims.
 - After a change, report commit hash, files, exact checks/output, a demonstrated
   negative case, limits of the proof and actual push/deploy/restart state.
 

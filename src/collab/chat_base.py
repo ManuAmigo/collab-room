@@ -158,7 +158,7 @@ class ChatState:
     unseen: int = 0
     older: Any = None
     redraw_input: Callable[[], None] = lambda: None
-    selected: str = "all"
+    selected: str | None = "all"
     cfg_mtime: float = 0.0
     popup: int = 0
     pos: int = 0
@@ -170,7 +170,12 @@ class ChatState:
     ticks: int = 0  # the states line drawn so many times: the blink of a Ready agent's background work
 
 
-def status_bar_rows(cells: list[tuple[str, str, str, str, str, int]], parts: list[str], size: os.terminal_size) -> list[str]:
+def status_bar_rows(
+    cells: list[tuple[str, str, str, str, str, int]],
+    parts: list[str],
+    size: os.terminal_size,
+    activity: list[str] | None = None,
+) -> list[str]:
     """Lay out the status cells for this terminal, without reading or changing chat state."""
     # Only five used to fit on a 15-inch screen, the sixth hidden, with no clear way to see it.
     # The cells share the whole width equally; inside, «to the edges»:
@@ -207,7 +212,12 @@ def status_bar_rows(cells: list[tuple[str, str, str, str, str, int]], parts: lis
     rows_ = [" ".join(parts + rendered[:per])] + [
         " " * lead + " ".join(rendered[i : i + per]) for i in range(per, n, max(1, per))
     ]
-    return rows_
+    # Activity has its own rows; input-readiness cells keep their model, clock and order.
+    available_rows = max(1, size.lines - 10 - len(rows_))
+    activity_rows = list(activity or [])[:available_rows]
+    if activity and len(activity) > available_rows and activity_rows:
+        activity_rows[-1] = m_text.shorten_cols(activity_rows[-1] + " …", size.columns)
+    return activity_rows + rows_
 
 
 def feed_frame(text: str, h: int, w: int) -> str:
@@ -343,7 +353,45 @@ def forget_dm_window(owner: str) -> None:
 def dm_window_alive(owner: str) -> bool:
     rec = dm_window(owner)
     out = m_tmuxio.tmux("display-message", "-p", "-t", rec.get("pane", ""), "#{pane_pid}", check=False) if rec else None
-    return bool(out) and out.returncode == 0 and out.stdout.strip() == rec["pid"]
+    if not out or out.returncode != 0 or out.stdout.strip() != rec["pid"]:
+        return False
+    try:
+        os.kill(int(rec["pid"]), 0)
+    except PermissionError:
+        return True
+    except (ProcessLookupError, ValueError):
+        return False
+    return True
+
+
+def dm_window_available(owner: str) -> bool:
+    rec = dm_window(owner)
+    own = os.environ.get("TMUX_PANE", "")
+    if not rec or not own:
+        return False
+    panel = m_tmuxio.tmux(
+        "display-message",
+        "-p",
+        "-t",
+        rec["pane"],
+        "#{pane_pid}\t#{window_id}\t#{window_active}\t#{window_zoomed_flag}",
+        check=False,
+    )
+    chat = m_tmuxio.tmux("display-message", "-p", "-t", own, "#{window_id}\t#{session_attached}", check=False)
+    if panel.returncode != 0 or chat.returncode != 0:
+        return False
+    fields = panel.stdout.strip().split("\t")
+    chat_fields = chat.stdout.strip().split("\t")
+    return (
+        len(fields) == 4
+        and len(chat_fields) == 2
+        and fields[0] == rec["pid"]
+        and fields[1] == chat_fields[0]
+        and fields[2] == "1"
+        and fields[3] == "0"
+        and chat_fields[1].isdigit()
+        and int(chat_fields[1]) > 0
+    )
 
 
 def dm_talk(messages: list[dict[str, Any]], owner: str, pid: str) -> list[dict[str, Any]]:

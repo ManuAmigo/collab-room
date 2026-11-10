@@ -43,11 +43,39 @@ to the newest release tag and runs install from it, beside the room (see [Update
 **Developers.** `collab install --dev` links the command directly to the clone's file; edits then
 affect later launches. Processes already running keep the code they loaded.
 
+## Kimi Code CLI
+
+Install [Kimi Code CLI](https://moonshotai.github.io/kimi-code/en/guides/getting-started) separately,
+then run `kimi` in your project to sign in and trust the folder. With `kimi` on PATH, `/add` offers
+Kimi alongside the other installed agents. You can also use `collab add kimi --folder /path/to/project`.
+The room starts its own Kimi window and asks it to reply to a connection check before showing it connected.
+If Kimi asks to trust a folder or approve a command, open its terminal through `/open` and answer there.
+By default the room keeps Kimi’s configured permissions and adds no approval bypass flags or global settings.
+For one explicitly opted-in agent, `collab add kimi --yolo` proposes Ask When Needed mode, which the person applies in the chat: routine project commands and edits run automatically, not only room replies. Risky-action guards stay as that user configured them, including a guard previously disabled. In particular, `rm -rf` of a directory inside the project may run without approval. The choice is stored for this participant’s later launches and `/stop` reopening; it does not change an existing process or the user’s TOML. Other agent kinds reject the flag.
+
+Screen detection is verified with Kimi Code CLI 2.4.1. Messages wait while it works or has a draft,
+and are pasted into its empty editor with acceptance checked after Enter. Long messages arrive as a
+pointer to `collab inbox`. Kimi receives ready reply commands, including a quoted here-document;
+no separate skill or plugin installation is needed. The current footer supplies the model and native
+background task count, including a count shortened by a narrow window; quoted history is not used.
+A partial editor or a footer without its context row is not trusted as a source.
+
+`/restart` can continue a room-managed Kimi conversation only when its exact session and
+usage cursor were confirmed by the managed launch hook. It preserves that cursor across the new
+process and verifies the resumed session again. A missing or unsafe binding/cursor is a refusal;
+the room does not select the latest session or silently start a new conversation. The restart
+confirmation stops the current process, so save unfinished work first. Existing unbound Kimi
+processes cannot gain a proven session merely by installing the hook.
+
+Usage collection is limited to the verified native format and confirmed main session; reported
+CLI token data remains partial. Automatic context trimming and Telegram approval buttons are
+not supported for Kimi yet. A room reopened after `/stop` starts a fresh Kimi conversation. Older Python-based `kimi-cli` terminal layouts are not covered by this preset.
+
 ## Codex permission rules
 
 Install asks once whether Codex agents started by a room may answer in that room without asking
 you for each message. With your consent, each new room-started Codex gets rules that allow only
-`collab say`, `ack` and `inbox`, restricted to its own room and participant id.
+`collab say`, `take`, `ack` and `inbox` (and the lead's `propose` and `goal`), restricted to its own room and participant id.
 
 - The rules run a separate copy of collab under `~/.local/share/collab-room/`, named by its
   content, not your editable clone. The command uses an absolute interpreter path with `-I -S`;

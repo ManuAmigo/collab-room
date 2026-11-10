@@ -181,9 +181,9 @@ BUILTIN: dict[str, dict[str, Any]] = {"claude": {"context_trim": None}, "codex":
 # Only kinds whose window takes a /compact or /clear: a Codex's /clear starts a new chat its connection check
 # no longer finds.
 TRIM_KINDS = ("claude",)
-# A model's name goes into the agent's command line: letters, digits, dots and dashes only — no «#», which
+# A model's name goes into the agent's command line: letters, digits, dots, slashes and dashes — no «#», which
 # tmux would read as a format.
-MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,47}")
+MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,47}")
 TOPIC_LIMIT = 80
 # What the team may do without the person; anything else external waits for them. None by default.
 WITHOUT_PERSON = {
@@ -251,7 +251,7 @@ def setting_problem(key: str, value: object, config: dict[str, Any], pid: str = 
         return "topic can't contain control or invisible characters" if m_text.visible(value) != value or "\n" in value else ""
     if key == "use_model":
         ok = isinstance(value, str) and MODEL_NAME.fullmatch(value)
-        return "" if ok else "use_model must be a model's name: letters, digits, dots and dashes"
+        return "" if ok else "use_model must be a model's name: letters, digits, dots, slashes and dashes"
     if key == "context_trim":
         return (
             ""
@@ -561,7 +561,7 @@ def scenario_of(name: object, kinds: list[str] | None = None) -> dict[str, Any] 
     if name in SCENARIOS:
         return SCENARIOS[name]
     if name.startswith(OWN_PREFIX) and OWN_NAME.fullmatch(name[len(OWN_PREFIX) :]):
-        scenario, _ = read_own_scenario(own_scenario_path(name[len(OWN_PREFIX) :]), kinds or ["claude", "codex"])
+        scenario, _ = read_own_scenario(own_scenario_path(name[len(OWN_PREFIX) :]), kinds or ["claude", "codex", "kimi"])
         return scenario
     return None
 
@@ -712,7 +712,7 @@ def compacted_path() -> Path:
     return room().paths.state_dir / "compacted.json"
 
 
-def brief(pid: str, config: dict[str, Any], version: int = 0, propose: str = "") -> str:
+def brief(pid: str, config: dict[str, Any], version: int = 0, propose: str = "", take: str = "") -> str:
     """An agent's assignment, made from the room's settings alone — never from what was said before: who it is
     here, its topic, whom it reports to, the lead, the result file, what is not done without the person.
     "" when the room sets nothing for it: a room without settings works as before."""
@@ -769,6 +769,8 @@ def brief(pid: str, config: dict[str, Any], version: int = 0, propose: str = "")
         lines.append(t("brief.without.some", what="; ".join(t(f"without.{a}") for a in allowed)))
     else:
         lines.append(t("brief.without.none"))
+    # «Taking» goes by its command, which marks it as a note that wakes no one: not a rule to remember.
+    lines.append(t("brief.take", cmd=take or f"collab take --from {pid}"))
     lines.append(t("brief.language"))
     lines.append(t("brief.frame"))
     # Live, a reviewer told its topic and no task began reviewing the folder on its own.
@@ -795,6 +797,9 @@ def load_config() -> dict[str, Any]:
         fail(m_i18n.tr("no {name}; run `collab init` first", name=rp.config_path.name))
     # Read from the checked file itself: a link put in its place is not followed.
     data = read_config_raw()
+    # A retired container intent must never turn into an ordinary host launch.
+    if os.path.lexists(rp.state_dir / "vpn.json"):
+        fail(m_i18n.tr("Container VPN is frozen; remove legacy container settings before starting the room."))
 
     # The settings live under ~/.collab-room/rooms/…, not in the project: an error that does not say
     # where sent the person looking for a .collab.json that is not there.
@@ -809,12 +814,17 @@ def load_config() -> dict[str, Any]:
     # the target the same way. The room writes only plain names.
     if not isinstance(data.get("session", "collab-room"), str) or not WORD.fullmatch(data.get("session", "collab-room")):
         bad("session must be 1 to 64 letters, digits, _ and -")
+    if type(data.get("macos_vpn", False)) is not bool:
+        bad(m_i18n.tr("macos_vpn must be a boolean"))
     limit = data.get("talk_limit", 0)
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
         bad("talk_limit must be a whole number, 0 or more (0: the room never pauses for agents' talk)")
     gather = data.get("gather_seconds", 0)
     if not isinstance(gather, int) or isinstance(gather, bool) or gather < 0:
         bad("gather_seconds must be a whole number, 0 or more (0: agents' messages are typed at once)")
+    opened = data.get("open_minutes", 30)
+    if not isinstance(opened, int) or isinstance(opened, bool) or opened < 1:
+        bad("open_minutes must be a whole number, 1 or more (minutes a message to an agent may stay unanswered)")
     trim_rule = 'context_trim must be {"at": tokens, "do": "compact" or "clear"}'
     if "context_trim" in data and data["context_trim"] is not False and not trim_valid(data["context_trim"]):
         bad(f"{trim_rule}, or false (never)")
@@ -831,6 +841,8 @@ def load_config() -> dict[str, Any]:
         if pid in m_text.SPECIAL:
             bad(f"participant id {pid!r} is reserved")
         ids.append(pid)
+        if "container" in p:
+            bad(m_i18n.tr("Container VPN is frozen; remove legacy container settings before starting the room."))
         command = p.get("command", [])
         if not isinstance(command, list) or not all(isinstance(x, str) for x in cast("list[object]", command)):
             bad(f"command for {pid} must be an array of strings")
@@ -921,7 +933,7 @@ def read_state_text(path: Path, errors: str = "replace") -> str:
     A link is an OSError(ELOOP); no file, FileNotFoundError."""
     fd, name = state_dir(path, strict=False, create=False)
     try:
-        f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     finally:
         os.close(fd)
     with os.fdopen(f, "rb") as fh:
@@ -1510,6 +1522,8 @@ def proposal_problem(data: dict[str, Any], prop: dict[str, Any], kinds: list[str
         for key in SETTINGS:
             if key in a and (why := setting_problem(key, a[key], data)):
                 return why
+        if "yolo" in a and (not isinstance(a["yolo"], bool) or (a["yolo"] and a.get("kind") != "kimi")):
+            return "Ask When Needed is a Kimi-only boolean setting"
     if team is not None and (scenario_of(team, kinds) is None or team_of(data).get("scenario")):
         return "a team only from the ready ones, and only to a room without one"
     if len(changes) > PROPOSAL_CHANGES or len(adds) > PROPOSAL_ADDS:
@@ -1530,6 +1544,7 @@ def proposal_words(data: dict[str, Any], prop: dict[str, Any], whole: bool = Fal
         what = [str(a[k]) for k in ("role", "topic", "use_model") if a.get(k)]
         what += [f"memory {memory_words(a['context_trim'])}"] if "context_trim" in a else []
         what += [f"reports to {whom(str(a['reports_to']), data)}"] if a.get("reports_to") else []
+        what += ["Ask When Needed: routine project commands and edits run automatically"] if a.get("yolo") else []
         what += [f"in {m_text.tilde(str(a['folder']))}"] if a.get("folder") else []
         parts.append(f"+ {a.get('label')} ({a.get('kind')}{', ' + ' · '.join(what) if what else ''})")
     team = prop.get("team")

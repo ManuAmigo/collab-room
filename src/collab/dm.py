@@ -15,6 +15,7 @@ import collab.tmuxio as m_tmuxio
 import collab.log as m_log
 import collab.agents as m_agents
 import collab.chat_base as m_chat_base
+import collab.chat_handoff as m_chat_handoff
 
 
 @m_store.room_locked
@@ -135,18 +136,42 @@ def cmd_dm(args: argparse.Namespace) -> None:
         m_store.fail(m_i18n.tr("the /dm panel needs a terminal: open it with /dm in the chat"))
     fd = sys.stdin.fileno()
     saved = termios.tcgetattr(fd)
-    buf: list[str] = []
+    restore: dict[str, Any] = {}
+    token = getattr(args, "handoff_token", None)
+    if token is not None:
+        pane = os.environ.get("TMUX_PANE", "")
+        request = m_chat_handoff.read_request(owner, pane, "dm-request")
+        if request is None:
+            raise m_chat_handoff.HandoffError("DM recovery request is missing")
+        ack = m_chat_handoff.read_dm_ack(request, pane)
+        if ack is None:
+            raise m_chat_handoff.HandoffError("DM recovery acknowledgement is missing")
+        seat = m_chat_handoff.Seat(str(rp.root), owner, pane, ack["source_pid"], request["generation"])
+        store = m_chat_handoff.HandoffStore(rp.state_dir / "handoff")
+        payload = store.claim(token, seat)
+        if payload.dm is None:
+            raise m_chat_handoff.HandoffError("DM recovery payload is missing")
+        restore = {"request": request, "seat": seat, "store": store, "payload": payload}
+    buf: list[str] = list(restore["payload"].text) if restore else []
     pending, in_paste, last = "", False, None
     sys.stdout.write("\033[?2004h\033[?25l")
     below = [3]  # rows under the chat's rule, as the chat says: the rule and the input stand level with its
     # History («scroll up in the right chat»), as in the chat: one message per ↑/↓, Esc —
     # the newest. top: the first line on show while reading back, None — the newest; frame: the last
     # frame's message starts, its lines and its height, for the keys to step by.
-    top: list[Any] = [None]
+    top: list[Any] = [restore["payload"].dm.top if restore else None]
     frame: list[Any] = [[], 0, 1]
     titled: list[Any] = [None]  # whose name the top border shows
     journal: dict[str, Any] = {}  # the messages as last read, and the journal's stamp then
     laid: dict[str, Any] = {}  # the active tab's talk as last laid out, and what it was made of
+    prepared: dict[str, Any] = {}
+    recovered: dict[str, Any] = {}
+    if restore:
+        dm = restore["payload"].dm
+        known = set(m_store.ids_of(config))
+        tabs = [tab for tab in dm.tabs if tab in known]
+        active = dm.active if dm.active in tabs else ""
+        m_chat_base.set_dm_tabs(owner, tabs, active)
 
     def chat_pane() -> str:
         rp = m_store.room().paths
@@ -291,6 +316,35 @@ def cmd_dm(args: argparse.Namespace) -> None:
         tty_.setraw(fd)
         while True:
             state = m_chat_base.dm_tabs(owner)
+            pane = os.environ.get("TMUX_PANE", "")
+            request = m_chat_handoff.read_request(owner, pane, "dm-request")
+            if request is not None and not restore and not prepared and not pending and not in_paste:
+                seat = m_chat_handoff.Seat(str(rp.root), owner, pane, os.getpid(), request["generation"])
+                store = m_chat_handoff.HandoffStore(rp.state_dir / "handoff")
+                focused = m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_active}", check=False).stdout.strip() == "1"
+                dm = m_chat_handoff.DmPayload(
+                    "".join(buf), len(buf), top[0], tuple(state["tabs"]), state["active"], focused, top[0] or 0
+                )
+                payload = m_chat_handoff.HandoffPayload(dm.text, dm.cursor, state["active"] or None, dm)
+                token = store.save_claimed(seat, payload)
+                m_chat_handoff.write_dm_ack(request, token, os.getpid(), state["tabs"], state["active"], focused)
+                prepared = {
+                    "request": request,
+                    "seat": seat,
+                    "store": store,
+                    "token": token,
+                    "deadline": time.monotonic() + 2,
+                }
+            if prepared:
+                ready = m_chat_handoff.read_ready(prepared["request"])
+                if ready is not None or time.monotonic() >= prepared["deadline"]:
+                    prepared["store"].discard(prepared["token"], prepared["seat"])
+                    if ready is None:
+                        m_chat_handoff.write_ready(prepared["request"], "failed", pane)
+                    kinds = ("ready", "dm-ack", "dm-request") if ready is not None else ("dm-ack", "dm-request")
+                    for kind in kinds:
+                        m_chat_handoff.delete_control(m_chat_handoff.control_path(kind, owner, pane))
+                    prepared = {}
             chat = chat_pane()
             seen = (
                 m_tmuxio.tmux("display-message", "-p", "-t", chat, "#{pane_id}\t#{@collab_below}", check=False) if chat else None
@@ -315,7 +369,21 @@ def cmd_dm(args: argparse.Namespace) -> None:
             if snapshot != last:
                 last = snapshot
                 draw()
+            if restore:
+                restore["store"].complete(token, restore["seat"])
+                if restore["payload"].dm.focus:
+                    m_tmuxio.tmux("select-pane", "-t", pane, check=False)
+                else:
+                    m_tmuxio.tmux("select-pane", "-t", chat, check=False)
+                recovered = restore["request"]
+                restore = {}
+            if recovered and m_chat_handoff.read_ready(recovered) is not None:
+                for kind in ("ready", "dm-ack", "dm-request"):
+                    m_chat_handoff.delete_control(m_chat_handoff.control_path(kind, owner, pane))
+                recovered = {}
             if not select.select([fd], [], [], args.interval)[0]:
+                continue
+            if prepared:
                 continue
             pending += os.read(fd, 4096).decode("utf-8", "ignore")
             events, pending, in_paste = dm_keys(pending, in_paste)

@@ -31,10 +31,36 @@ Before typing, the room also checks the saved process id of the agent's pane, to
 that now runs another program. For older or external agent windows without that id, it refuses a
 bare shell. These checks do not prove that the agent is ready.
 
-**Codex.** One extra Enter is allowed when the input still holds the folded paste
-(`[Pasted Content N chars]`), that fold is the last input line, the screen shows no question or
-work in progress, and the pane still runs the same process. This retry happens once; input still
-left unsent after it is treated as a draft and blocks further typing.
+**After Enter.** A message is marked delivered only once the agent's input is seen empty after
+an Enter, or the message shows above the input. The room presses Enter again, on a later check,
+if the input still holds exactly the typed text:
+
+- the whole of it;
+- Codex's fold `[Pasted Content N chars]`, with N equal to the text's length in characters;
+- Claude's fold `[Pasted text #k]` — the very fold seen there when the room typed the text (a
+  later paste has another k), with nothing after it but the text's end;
+- a Claude input box grown to its full height (in a narrow or low window) that shows the text's end —
+  only once the room has given that text an Enter, its start seen before it.
+
+It presses only when no question is on the screen and the pane still runs the same process, both
+judged on the same look as the input; up to three Enters in all. Anything else in the input, or
+the three Enters spent: nothing more is pressed or cleared, even if the input later reads as ours
+again, and the people are told after two minutes. If someone clears the input, the message is not marked and is typed again later. A
+different text of exactly the same length in a Codex fold reads as ours, and in a full-height
+Claude box a change to the hidden part above its first row is not seen; both risks are accepted.
+Each attempt and its result are written to `.collab/deliver-log.jsonl`. Records carry a schema version,
+run and attempt IDs, participant, message IDs, message/service kind, stage and reason, wall time with
+fractions, process-monotonic elapsed time, Enter number and acceptance method (`empty`, `token`,
+`queue` or `unverified`). Paste and Enter results include their return code. An unchanged wait reason
+is written once, with a separate interval end; a batch keeps all its message IDs in one attempt.
+The journal never records message text, commands, tokens, folds, screen contents or stderr, and adds
+no tmux reads. It stays bounded by discarding the older half; rotation or a write failure marks later
+records `complete: false`, so an observation window is not mistaken for a complete sample. Logging
+failures never block delivery.
+A text left in an input is kept in the room's state folder (`left.json`), so a restarted
+deliverer (every `collab update` restarts it) goes on with it — presses it or sees it taken —
+instead of taking it for a draft and typing the message again. Its attempt ID survives the restart;
+monotonic elapsed values from different runs are never compared. A damaged record there is skipped.
 
 **Long messages** are replaced by an instruction to read the full message with `collab inbox`; the
 size threshold depends on the agent.

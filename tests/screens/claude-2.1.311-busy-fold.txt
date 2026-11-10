@@ -1,0 +1,15 @@
+
+❯ Run exactly this one command now: python3 -u                                 
+  /tmp/probe/stream.py probe-1 . Wait for it to  
+  finish. Then reply only BASE-probe-1. No other tools.            
+                                                                               
+⏺ Running python3 -u /tmp/probe/stream.py…                 
+  ⎿  $ python3 -u /tmp/probe/stream.py probe-1  
+
+✳ Fermenting… (2s · ↓ 13 tokens)
+  ⎿  Tip: Use /theme to change the color theme                                  
+
+────────────────────────────────────────────────────────────────────────────────
+❯ [Pasted text #5]                                                 
+────────────────────────────────────────────────────────────────────────────────
+  paste again to expand

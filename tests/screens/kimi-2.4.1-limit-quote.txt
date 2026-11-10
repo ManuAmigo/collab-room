@@ -1,0 +1,11 @@
+ ❯ Explain an error
+
+ ● Example from history:
+
+   Error: [provider.api_error] 429 You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends.
+
+ ╭────────────────────────────────────╮
+ │ >                                  │
+ ╰────────────────────────────────────╯
+ Ask When Needed  probe  /tmp/project
+                 context: 1% (501/256k)

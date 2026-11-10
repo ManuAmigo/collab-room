@@ -23,6 +23,8 @@ import collab.screen as m_screen
 import collab.installer as m_installer
 import collab.deliver as m_deliver
 import collab.agents as m_agents
+import collab.vpn_macos_room as m_vpn_macos_room
+import collab.vpn_macos_process as m_vpn_macos_process
 
 
 def default_team() -> dict[str, Any]:
@@ -130,7 +132,7 @@ def cmd_home(args: argparse.Namespace) -> None:
     cmd_start(args)
 
 
-def start_deliverer(session: str) -> None:
+def start_deliverer(session: str, *, required: bool = False) -> None:
     """The deliverer lives in the room's own hidden window: no second terminal to keep open, and
     it ends with the room. If the window is there, its program is replaced (respawn) — what was
     delivered is on disk, so nothing is typed twice. --idle-ok: a new room has only the person;
@@ -165,11 +167,13 @@ def start_deliverer(session: str) -> None:
                 ),
                 file=sys.stderr,
             )
+        if required:
+            m_store.fail(m_i18n.tr("Delivery runs outside this room's window; it was not restarted."))
         return
     # `=deliver`, not `deliver`: tmux takes a window whose name only begins with it — an agent called
     # «Delivery» was respawned here with the deliverer.
     if m_tmuxio.tmux("list-panes", "-t", f"={session}:=deliver", check=False).returncode == 0:
-        m_tmuxio.tmux(
+        result = m_tmuxio.tmux(
             "respawn-window",
             "-k",
             "-t",
@@ -181,7 +185,7 @@ def start_deliverer(session: str) -> None:
             check=False,
         )
     else:
-        m_tmuxio.tmux(
+        result = m_tmuxio.tmux(
             "new-window",
             "-d",
             "-t",
@@ -194,6 +198,9 @@ def start_deliverer(session: str) -> None:
             m_tmuxio.in_dir(str(rp.root), cmd),
             check=False,
         )
+
+    if required and result.returncode != 0:
+        m_store.fail(m_i18n.tr("Delivery could not be restarted."))
 
 
 def start_telegram(session: str) -> None:
@@ -318,7 +325,7 @@ def set_paused(paused: bool) -> None:
     if not paused and rp.held_path.exists():
         # Each line on its own, the file gone only after: a «42» in it once lost every message after
         # it, the file already deleted.
-        for line in rp.held_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in rp.held_path.read_text(encoding="utf-8", errors="replace").split("\n"):
             try:
                 h = json.loads(line)
             except ValueError:
@@ -329,16 +336,22 @@ def set_paused(paused: bool) -> None:
                 and isinstance(h.get("to"), list)
                 and all(isinstance(t, str) for t in h["to"])
             ):
+                given = h.get("re", "") if isinstance(h.get("re"), str) else ""
+                notice = any(h.get(k) is True for k in ("quiet", "silent", "service"))
+                # Asked now, of the log as it is: what it answers is the same as for a say not held.
+                re_id, _ = m_deliver.implied_re(h["from"], h["to"], given, notice, m_store.load_config())
                 m_log.append_message(
                     h["from"],
                     h["to"],
                     h["text"],
-                    h.get("re", "") if isinstance(h.get("re"), str) else "",
+                    re_id,
+                    re_auto=re_id != given,
                     quiet=h.get("quiet") is True,
                     silent=h.get("silent") is True,
                     service=h.get("service") is True,
                     urgent=h.get("urgent") is True,
                 )
+                m_deliver.answer_read(h["from"], re_id)
         rp.held_path.unlink()
     if not paused:
         m_deliver.talk_reset()  # the person let the talk go on: counted anew, or the next word paused again
@@ -647,6 +660,11 @@ def refresh_codex_rules() -> None:
     if not rp.config_path.is_file():
         return
     data = m_store.read_config_raw()
+    try:
+        vpn_enabled = m_vpn_macos_room.mac_vpn_enabled(data)
+    except ValueError:
+        m_store.fail(m_i18n.tr("macos_vpn must be a boolean"))
+        return
     changed = False
     for q in data.get("participants", []):
         if q.get("kind") == "codex" and q.get("started_by_room") and q.get("cli"):
@@ -654,6 +672,10 @@ def refresh_codex_rules() -> None:
                 # Running, it keeps the copy its rule names: a new rule reaches it only at its next
                 # start, and new hints meanwhile matched no rule — every answer asked the person
                 # The chat says it runs an old version; /restart gives it the new.
+                continue
+            if vpn_enabled:
+                q.pop("cli", None)
+                changed = True
                 continue
             cli = m_installer.codex_room_rule(q["id"], q.get("folder") or str(rp.root))
             if cli != q["cli"]:
@@ -689,6 +711,8 @@ def open_room_windows(
             cmd = m_store.current_chat_command(p["command"])
             cmd[0] = shutil.which(cmd[0]) or cmd[0]
             program = " ".join(shlex.quote(x) for x in cmd)
+            if not m_store.is_chat_command(p["command"]):
+                program = m_vpn_macos_room.mac_vpn_wrap(m_screen.agent_kind(p), program, config)
         run_cmd = [m_tmuxio.in_dir(cwd, program)]
         if i == 0:
             out = m_tmuxio.tmux(
@@ -744,6 +768,9 @@ def open_room_windows(
             )
         pane = out.stdout.strip()
         panes[p["id"]] = pane
+        if m_vpn_macos_room.mac_vpn_enabled(config) and p.get("command") and not m_store.is_chat_command(p["command"]):
+            pane_pid = m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_pid}", check=False).stdout.strip()
+            m_vpn_macos_process.mac_vpn_record_process(p["id"], pane_pid)
         # -T is a tmux format: an agent's own name «#(…)» ran a command at start on tmux 3.4.
         m_tmuxio.tmux("select-pane", "-t", pane, "-T", m_tmuxio.tmux_text(p.get("label", p["id"])), check=False)
         if i == 0:
@@ -775,22 +802,28 @@ def old_chat(config: dict[str, Any]) -> None:
         [shown, *subprocess.run(["pgrep", "-P", shown], capture_output=True, text=True).stdout.split()] if shown.isdigit() else []
     )
     version = ""
+    build = ""
     for pid in pids:
         words = subprocess.run(["ps", "-ww", "-o", "command=", "-p", pid], capture_output=True, text=True).stdout.split()
         for i, word in enumerate(words[:-1]):
             if re.fullmatch(r"collab(-[0-9a-f]{16})?", Path(word).name) and words[i + 1] == "chat":
                 with contextlib.suppress(OSError):
-                    found = re.search(rb'^VERSION = "([0-9.]+)"$', Path(word).read_bytes()[: 1 << 20], re.M)
+                    data = Path(word).read_bytes()
+                    found = re.search(rb'^VERSION = "([0-9.]+)"$', data[: 1 << 20], re.M)
                     version = found.group(1).decode() if found else ""
-    if not version or version == m_boot.VERSION:
+                    build = m_installer.copy_name(data) if found else ""
+    if not version or build == m_installer.copy_name():
         return
-    print(
-        m_i18n.tr(
-            "The room's chat is open on collab {old}; this is {new} — its menu lacks what came since.",
-            old=version,
-            new=m_boot.VERSION,
+    if version == m_boot.VERSION:
+        print(m_i18n.tr("The room's chat runs a different build of collab {v}; reopen it to use this build.", v=version))
+    else:
+        print(
+            m_i18n.tr(
+                "The room's chat is open on collab {old}; this is {new} — its menu lacks what came since.",
+                old=version,
+                new=m_boot.VERSION,
+            )
         )
-    )
     if sys.stdin.isatty() and m_term.confirm(
         m_i18n.tr("Restart the chat on collab {new}? Its history stays.", new=m_boot.VERSION)
     ):
@@ -821,10 +854,47 @@ def stray_chat(config: dict[str, Any]) -> None:
     )
 
 
+def start_delivery_only(args: argparse.Namespace) -> None:
+    """Refresh delivery only in a running session already marked as this room's."""
+    rp = m_store.room().paths
+    if not rp.config_path.is_file() or rp.base == rp.root:
+        m_store.fail(m_i18n.tr("Delivery-only start requires an existing room; open it normally first."))
+    config = m_store.load_config()
+    session = getattr(args, "session", None) or config.get("session", "collab-room")
+    if not m_store.WORD.fullmatch(session):
+        m_store.fail(m_i18n.tr("--session must be 1 to 64 letters, digits, _ and -"))
+    if m_tmuxio.tmux("has-session", "-t", f"={session}", check=False).returncode != 0:
+        m_store.fail(m_i18n.tr("The room is not running; delivery was not restarted."))
+    if m_tmuxio.session_room(session) != os.path.realpath(str(rp.root)):
+        m_store.fail(m_i18n.tr("This session is not marked as this room's; delivery was not restarted."))
+    if deliverer_outside(session):
+        m_store.fail(m_i18n.tr("Delivery runs outside this room's window; it was not restarted."))
+    current = m_tmuxio.tmux("display-message", "-p", "-t", f"={session}:", "#{window_id}", check=False)
+    original = current.stdout.strip() if current.returncode == 0 else ""
+    if not re.fullmatch(r"@[0-9]+", original):
+        original = ""
+    try:
+        start_deliverer(session, required=True)
+    finally:
+        if original:
+            selected = m_tmuxio.tmux("display-message", "-p", "-t", f"={session}:", "#{window_id}", check=False)
+            delivery = m_tmuxio.tmux("display-message", "-p", "-t", f"={session}:=deliver", "#{window_id}", check=False)
+            if (
+                selected.returncode == 0
+                and delivery.returncode == 0
+                and selected.stdout.strip() != original
+                and selected.stdout.strip() == delivery.stdout.strip()
+            ):
+                m_tmuxio.tmux("select-window", "-t", f"={session}:{original}", check=False)
+
+
 def cmd_start(args: argparse.Namespace) -> None:
     rp = m_store.room().paths
     if shutil.which(m_tmuxio.TMUX) is None:
         m_store.fail(m_i18n.tr("tmux is required: {p0}, and run `collab start` again", p0=m_tmuxio.tmux_install_hint()))
+    if getattr(args, "delivery_only", False):
+        start_delivery_only(args)
+        return
     venv = m_tmuxio.leave_venv()
     if venv:
         print(m_i18n.tr("The active venv {p0} is left out of the room: its windows run without it.", p0=m_text.tilde(venv)))

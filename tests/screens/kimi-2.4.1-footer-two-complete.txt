@@ -1,0 +1,50 @@
+ 
+ ╭────────────────────────────────────╮
+ │                                    │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!    │
+ │  ▐█████▌  Send /help for help info…│
+ │                                    │
+ │  Directory: /private/tmp/kimi-yolo…│
+ │  Session:   session_7cd22c26-f062-…│
+ │  Model:     probe                  │
+ │  Version:   2.4.1                  │
+ │                                    │
+ ╰────────────────────────────────────╯
+ 
+   No session yet — one will be created
+ on your first message.                
+ 
+ ❯ service-cycle-request               
+ 
+ ● Ran a command · $ sl… · 7 more lines
+   task_id: bash-y0jzpt0x …
+ 
+ ● Ran a command · $ sl… · 7 more lines
+   task_id: bash-dobyfo60 …
+ 
+ ● bash task started in background     
+   (isolated background status probe)  
+ 
+ ● bash task started in background     
+   (second isolated background status  
+   probe)                              
+ 
+ ● SERVICE_CYCLE_COMPLETE              
+ 
+ ● bash task completed in background   
+   (isolated background status probe · 
+   exit 0)                             
+ 
+ ● SERVICE_CYCLE_COMPLETE              
+ 
+ ● bash task completed in background   
+   (second isolated background status  
+   probe · exit 0)                     
+ 
+ ● SERVICE_CYCLE_COMPLETE              
+ 
+ ╭────────────────────────────────────╮
+ │ >                                  │
+ ╰────────────────────────────────────╯
+ Ask When Needed  probe  …/tmp/kimi-yo…
+                 context: 1% (501/256k)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 import argparse
 import json
-import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -16,6 +16,10 @@ import collab.log as m_log
 import collab.screen as m_screen
 import collab.deliver as m_deliver
 import collab.telegram as m_telegram
+import collab.vpn_macos_room as m_vpn_macos_room
+import collab.vpn_macos_process as m_vpn_macos_process
+import collab.vpn_config as m_vpn_config
+import collab.usage as m_usage
 import collab.agents as m_agents
 import collab.lifecycle as m_lifecycle
 import collab.chat_base as m_chat_base
@@ -192,9 +196,12 @@ def when_words(cfg: dict[str, Any], who: str, key: str) -> str:
     if who == "room":
         return m_i18n.tr("The agents get it with their next assignment.")
     if key == "use_model":
+        participant = next((p for p in cfg["participants"] if p["id"] == who), {})
+        if m_screen.agent_kind(participant) == "kimi":
+            return m_i18n.words_in("kimi.model_launch", m_store.room_language(cfg))
         # Not /model: Claude saves it as the person's own default for every new session.
         return m_i18n.tr(
-            "A model takes effect when the program starts: /restart {p0} — its conversation goes on.",
+            "A model takes effect when the program starts: /restart {p0} checks whether its conversation can resume.",
             p0=m_store.label_of(cfg, who),
         )
     if key == "context_trim":
@@ -507,6 +514,196 @@ def chat_run_wizard_step(ctx: ChatCommandContext, line: str) -> None:
             ctx.feed("\n" * (rows - blank - 1))
 
 
+def add_folder_step(ctx: ChatCommandContext, kind: str) -> None:
+    rp = m_store.room().paths
+    folders = []
+    for folder in [str(rp.root), *m_agents.room_folders(ctx.config), *m_boot.recent_folders()]:
+        if folder not in folders:
+            folders.append(folder)
+    folders = folders[:10]
+    ctx.wizard.update(
+        step="folder_pick",
+        kind=kind,
+        folders=folders,
+        options=[(m_text.tilde(folder), str(i)) for i, folder in enumerate(folders, 1)]
+        + [(m_i18n.tr("Browse folders…"), "browse"), (m_i18n.tr("Enter path manually…"), "other")],
+        prompt=m_i18n.tr("Project folder"),
+    )
+
+
+def add_install_confirm(ctx: ChatCommandContext, kind: str) -> None:
+    lang = m_store.room_language(ctx.config)
+    label = m_screen.PRESETS[kind]["label"]
+    ctx.wizard.update(
+        step="install_confirm",
+        kind=kind,
+        options=[(m_i18n.words_in("add.install", lang, label=label), "install"), (m_i18n.tr("Cancel"), "cancel")],
+        prompt=m_i18n.words_in("add.install.prompt", lang, label=label),
+    )
+
+
+def start_install_job(ctx: ChatCommandContext, kind: str, work: Any) -> None:
+    cancel = threading.Event()
+    result: dict[str, Any] = {"value": None, "error": None, "progress": ""}
+    ctx.wizard.update(
+        step="install_running", kind=kind, cancel=cancel, install_result=result, options=[(m_i18n.tr("Cancel"), "cancel")]
+    )
+
+    def run() -> None:
+        try:
+            result["value"] = work(cancel.is_set, lambda text: result.__setitem__("progress", text))
+        except (Exception, SystemExit) as exc:
+            result["error"] = exc
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def vpn_unprotected(config: dict[str, Any], ready: bool) -> int:
+    count = 0
+    for participant in m_deliver.agents_of(config):
+        if m_screen.agent_kind(participant) not in ("codex", "claude") or not m_agents.agent_window_alive(participant):
+            continue
+        protected = False
+        if ready and config.get("macos_vpn") is True:
+            try:
+                expected = m_vpn_macos_process.mac_vpn_process_fields(config, str(participant.get("pane_pid") or ""))
+                protected = participant.get("vpn_process") == expected["vpn_process"]
+            except (OSError, ValueError, TypeError):
+                pass
+        count += not protected
+    return count
+
+
+def start_vpn_job(ctx: ChatCommandContext, action: str) -> None:
+    def work(cancel: Any, progress: Any) -> dict[str, Any]:
+        if cancel():
+            return {}
+        verb = "setup" if action == "on" and not m_vpn_macos_room.mac_vpn_enabled(m_store.load_config()) else action
+        status = m_vpn_macos_room.mac_vpn_room_action(verb)
+        status["unprotected"] = vpn_unprotected(m_store.load_config(), status.get("actual") == "ready")
+        return status
+
+    start_install_job(ctx, "vpn", work)
+    ctx.wizard.update(
+        vpn_action=action,
+        from_cmd="/vpn",
+        prompt=m_i18n.tr("Checking agent VPN… Closing this menu does not stop a request already started."),
+        options=[(m_i18n.words_in("team.back", m_store.room_language(ctx.config)), "cancel")],
+    )
+
+
+def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
+    result = ctx.wizard["install_result"]
+    if line in ("", "cancel"):
+        ctx.wizard["cancel"].set()
+        ctx.wizard.clear()
+        return
+    error = result.get("error")
+    if error is not None:
+        ctx.wizard.clear()
+        if isinstance(error, m_vpn_config.VpnSecretError):
+            say_(
+                m_i18n.tr(
+                    "VPN account is missing or invalid: ~/.config/collab-vpn/agents.json. Add a valid private account file, then try again."
+                )
+            )
+        else:
+            say_(m_i18n.tr("Could not change agent VPN: {error}", error=m_text.clean_field(str(error), 200)))
+        return
+    if result.get("value") is None:
+        return
+    action, status = ctx.wizard["vpn_action"], result["value"]
+    ctx.wizard.clear()
+    actual = status.get("actual") if status.get("room_enabled") else "off"
+    if action == "status":
+        if actual == "ready":
+            state = m_i18n.tr("running")
+        elif actual == "off":
+            state = m_i18n.tr("off")
+        elif actual in ("starting", "probing"):
+            state = m_i18n.tr("starting")
+        else:
+            state = m_i18n.tr("failed")
+        options = []
+        if actual != "ready":
+            options.append((m_i18n.tr("Turn agent VPN on"), "on"))
+        if status.get("room_enabled") and actual != "off":
+            options.append((m_i18n.tr("Turn agent VPN off (stops protected agents)"), "off"))
+        ctx.wizard.update(
+            step="vpn_pick",
+            from_cmd="/vpn",
+            prompt=m_i18n.tr(
+                "Agent VPN: {state}. {n} running Codex/Claude agents still without confirmed VPN — use /restart. Shared across enabled rooms.",
+                state=state,
+                n=status["unprotected"],
+            ),
+            options=options + [(m_i18n.words_in("team.back", m_store.room_language(m_store.load_config())), "back")],
+        )
+    elif actual == "ready":
+        say_(
+            m_i18n.tr(
+                "Agent VPN is running. {n} running Codex/Claude agents are still without confirmed VPN — restart them with /restart.",
+                n=status["unprotected"],
+            )
+        )
+    elif actual == "off":
+        say_(m_i18n.tr("Agent VPN is off. Protected agents are stopped."))
+    else:
+        say_(m_i18n.tr("Agent VPN did not become ready. Protected agents remain blocked."))
+
+
+def pump_install_job(ctx: ChatCommandContext) -> bool:
+    if ctx.wizard.get("step") != "install_running":
+        return False
+    result = ctx.wizard["install_result"]
+    if result.get("error") is None and result.get("value") is None:
+        return False
+    chat_run_wizard_step(ctx, "pump")
+    return True
+
+
+def install_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
+    if ctx.wizard.get("kind") == "vpn":
+        vpn_running_step(ctx, line, say_)
+        return
+    result = ctx.wizard["install_result"]
+    if line in ("", "cancel"):
+        ctx.wizard["cancel"].set()
+        result["cancel_requested"] = True
+    error = result.get("error")
+    if error is not None:
+        kind = ctx.wizard["kind"]
+        if result.get("cancel_requested"):
+            ctx.wizard.clear()
+            say_(m_i18n.tr("Canceled."))
+            return
+        detail = str(error.code) if isinstance(error, SystemExit) else str(error)
+        if kind == "proposal":
+            ctx.wizard.clear()
+            say_(m_i18n.tr("! Not applied: {p0}.", p0=m_text.clean_field(detail, 200)))
+            return
+        add_install_confirm(ctx, kind)
+        lang = m_store.room_language(ctx.config)
+        say_(m_i18n.words_in("add.install.retry", lang, exc=m_text.clean_field(detail, 300)))
+        return
+    if result.get("value") is None:
+        say_(result.get("progress") or m_i18n.words_in("add.running", m_store.room_language(ctx.config)))
+        return
+    if result.get("cancel_requested"):
+        ctx.wizard.clear()
+        say_(m_i18n.tr("Canceled."))
+        return
+    kind = ctx.wizard["kind"]
+    if kind == "proposal":
+        for text in result["value"]:
+            say_(text)
+        ctx.wizard.clear()
+        ctx.refresh_people()
+        return
+    add_folder_step(ctx, kind)
+    say_(m_i18n.tr("Project folder."))
+
+
 def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
     """/add, /remove, /mute, /name, /exit and the others: every answer is chosen in the menu;
     only what has to be written — a name, a path as the last resort — is typed."""
@@ -695,7 +892,9 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         ctx.wizard.clear()
         cfg = m_store.load_config()
         mine = [
-            q["id"] for q in cfg["participants"] if q.get("started_by_room") and m_screen.agent_kind(q) in ("claude", "codex")
+            q["id"]
+            for q in cfg["participants"]
+            if q.get("started_by_room") and m_screen.agent_kind(q) in ("claude", "codex", "kimi")
         ]
         if not mine:
             say_(m_i18n.tr("No agent the room started. Add one with /add."))
@@ -703,7 +902,7 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         ctx.wizard.update(
             step="restart_pick",
             from_cmd="/restart",
-            prompt=m_i18n.tr("Restart whom? The conversation continues"),
+            prompt=m_i18n.tr("Restart whom?"),
             options=[(m_store.label_of(cfg, x), x) for x in mine],
         )
         return
@@ -762,6 +961,15 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
             from_cmd="/stop",
         )
         say_(m_i18n.tr("Stop the room? ") + m_lifecycle.describe_stop(closing, staying))
+        return
+    if line == "/vpn":
+        ctx.wizard.clear()
+        start_vpn_job(ctx, "status")
+        return
+    if ctx.wizard.get("step") == "vpn_pick":
+        ctx.wizard.clear()
+        if line in ("on", "off"):
+            start_vpn_job(ctx, line)
         return
     if line == "/telegram":
         on = m_telegram.load().get("state") == "on"
@@ -877,17 +1085,12 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
                 m_log.append_message(m_text.ROOM, [m["from"]], m_i18n.tr("Your proposal is declined."), mid)
             say_(m_i18n.tr("Declined."))
             return
-        try:
-            lines = m_agents.apply_proposal(mid, ctx.args.as_, digest)
-        except Exception as exc:  # noqa: BLE001 — a record anyone could write: said, and the chat stays
-            say_(m_i18n.tr("! Not applied: {p0}.", p0=m_text.clean_field(str(exc), 200)))
-            return
-        except SystemExit as exc:
-            say_(m_i18n.tr("! Not applied: {p0}.", p0=m_text.clean_field(str(exc.code), 200)))
-            return
-        for text in lines:
-            say_(text)
-        ctx.refresh_people()
+        start_install_job(
+            ctx,
+            "proposal",
+            lambda cancel, progress: m_agents.apply_proposal(mid, ctx.args.as_, digest, cancel=cancel, progress=progress),
+        )
+        say_(m_i18n.words_in("add.running", m_store.room_language(ctx.config)))
         return
     lang = m_store.room_language(ctx.config)
     if ctx.wizard.get("step") == "scenario_pick":
@@ -1019,10 +1222,7 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         # Only agents the room starts itself: a session already running somewhere
         # lives in its own folder, its status never reached the room.
         ctx.wizard.clear()
-        kinds = [k for k in m_screen.PRESETS if shutil.which(m_screen.PRESETS[k]["command"][0])]
-        if not kinds:
-            say_(m_i18n.tr("No Claude Code or Codex installation found."))
-            return
+        kinds = list(m_screen.PRESETS)
         ctx.wizard.update(
             step="kind",
             kinds=kinds,
@@ -1051,6 +1251,9 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         else:
             say_(m_i18n.tr("You stay {p0}. /name changes it any time.", p0=m_store.label_of(ctx.config, ctx.args.as_)))
         ctx.wizard.update(then)  # the welcome, when this is the first visit — after the name is set
+        return
+    if ctx.wizard.get("step") == "install_running":
+        install_running_step(ctx, line, say_)
         return
     if line == "" and ctx.wizard.get("step") != "folder":  # in «folder» an empty Enter asks again
         ctx.wizard.clear()
@@ -1110,12 +1313,39 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
             ctx.open_dm(line)
         return
     if step_ == "restart_pick":
-        cfg = m_store.load_config()  # an agent added a moment ago is not in this chat's list yet
-        if line not in m_store.ids_of(cfg):
+        cfg = m_store.load_config()
+        q = next(
+            (
+                p
+                for p in cfg["participants"]
+                if p["id"] == line and p.get("started_by_room") and m_screen.agent_kind(p) in ("codex", "claude", "kimi")
+            ),
+            None,
+        )
+        if q is None:
             return
+        found = (
+            str(m_usage.kimi_resume_binding(q).get("session_id") or "")
+            if m_screen.agent_kind(q) == "kimi"
+            else m_screen.agent_session(q)
+        )
+        ctx.wizard.clear()
+        if not found:
+            say_(
+                m_i18n.tr(
+                    "{p0}: its conversation could not be confirmed. The running program was left unchanged.",
+                    p0=m_store.label_of(cfg, line),
+                )
+            )
+            return
+        identity = tuple(
+            q.get(key) for key in ("kind", "started_by_room", "target", "pane_pid", "folder", "join_code", "joined_at")
+        )
         ctx.wizard.update(
             step="restart_confirm",
             pid=line,
+            sid=found,
+            resume_identity=identity,
             options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes, restart"), "y")],
             prompt=m_i18n.tr("Restart {p0}?", p0=m_store.label_of(cfg, line)),
         )
@@ -1127,55 +1357,50 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         )
         return
     if step_ == "restart_confirm":
-        pid = ctx.wizard["pid"]
+        pid, found = ctx.wizard["pid"], str(ctx.wizard.get("sid") or "")
+        identity = ctx.wizard.get("resume_identity")
         ctx.wizard.clear()
         if line != "y":
             say_(m_i18n.tr("Canceled."))
             return
         cfg = m_store.load_config()
-        q = next((x for x in cfg["participants"] if x["id"] == pid), None)
-        if q is None:
-            say_(m_i18n.tr("It is no longer in the room."))
-            return
-        found = m_screen.agent_session(q)  # read once, here: restart_agent takes it, not a second search
-        if not found:
-            ctx.wizard.update(
-                step="restart_fresh",
-                pid=pid,
-                options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes, a new conversation"), "y")],
-                prompt=m_i18n.tr("{p0}'s conversation was not found. Start a new one?", p0=m_store.label_of(cfg, pid)),
+        q = next((p for p in cfg["participants"] if p["id"] == pid), None)
+        current_identity = (
+            tuple(q.get(key) for key in ("kind", "started_by_room", "target", "pane_pid", "folder", "join_code", "joined_at"))
+            if q
+            else None
+        )
+        current = ""
+        if found and identity == current_identity and q:
+            current = (
+                str(m_usage.kimi_resume_binding(q).get("session_id") or "")
+                if m_screen.agent_kind(q) == "kimi"
+                else m_screen.agent_session(q)
             )
+        if not q or not current or current != found:
             say_(
                 m_i18n.tr(
-                    "{p0}'s conversation was not found. Start it with a new conversation? What it knew stays only in its files.",
+                    "{p0}: its conversation could not be confirmed. The running program was left unchanged.",
                     p0=m_store.label_of(cfg, pid),
                 )
             )
             return
-        line, step_ = "go", "restart_go"
-    else:
-        found = ""
-    if step_ == "restart_fresh":
-        pid = ctx.wizard["pid"]
-        ctx.wizard.clear()
-        if line != "y":
-            say_(m_i18n.tr("Canceled."))
-            return
-        step_ = "restart_new"
-    if step_ in ("restart_go", "restart_new"):
-        cfg = m_store.load_config()
-        q = next((x for x in cfg["participants"] if x["id"] == pid), None)
-        if q is None:
-            say_(m_i18n.tr("It is no longer in the room."))
-            return
         try:
-            m_agents.restart_agent(cfg.get("session", "collab-room"), q, fresh=step_ == "restart_new", sid=found)
+            m_agents.restart_agent(cfg.get("session", "collab-room"), q, sid=found)
         except (m_store.OperationFailed, SystemExit) as exc:
             ctx.feed(m_text.paint(m_i18n.tr("! Could not restart: {exc}", exc=exc), "1;38;5;196"))
             return
-        how = m_i18n.tr("with a new conversation") if step_ == "restart_new" else m_i18n.tr("with its conversation")
-        say_(m_i18n.tr("Restarting {p0} {how}. Waiting for a connection check reply.", p0=m_store.label_of(cfg, pid), how=how))
+        say_(
+            m_i18n.tr(
+                "Restarting {p0} {how}. Waiting for a connection check reply.",
+                p0=m_store.label_of(cfg, pid),
+                how=m_i18n.tr("with its conversation"),
+            )
+        )
         ctx.refresh_people()
+        return
+    if step_ in ("restart_fresh", "restart_new", "restart_go"):
+        ctx.wizard.clear()  # stale UI state never authorizes replacing a conversation
         return
     if step_ == "mute_pick":
         verb = ctx.wizard["verb"]
@@ -1357,20 +1582,33 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         if not line.isdigit() or not 1 <= int(line) <= len(ctx.wizard["kinds"]):
             say_(m_i18n.tr("Enter a number from the list."))
             return
-        folders = []
-        for f in [str(rp.root), *m_agents.room_folders(ctx.config), *m_boot.recent_folders()]:
-            if f not in folders:
-                folders.append(f)
-        folders = folders[:10]
-        ctx.wizard.update(
-            step="folder_pick",
-            kind=ctx.wizard["kinds"][int(line) - 1],
-            folders=folders,
-            options=[(m_text.tilde(f), str(i)) for i, f in enumerate(folders, 1)]
-            + [(m_i18n.tr("Browse folders…"), "browse"), (m_i18n.tr("Enter path manually…"), "other")],
-            prompt=m_i18n.tr("Project folder"),
+        kind = ctx.wizard["kinds"][int(line) - 1]
+        try:
+            existing = m_agents.existing_agent_cli(kind)
+        except m_agents.AgentCliError as exc:
+            say_(m_i18n.tr("! {exc}", exc=m_text.clean_field(str(exc), 300)))
+            return
+        if existing:
+            add_folder_step(ctx, kind)
+            say_(m_i18n.tr("Project folder."))
+            return
+        add_install_confirm(ctx, kind)
+        say_(ctx.wizard["prompt"])
+        return
+    if step_ == "install_confirm":
+        if line == "cancel":
+            ctx.wizard.clear()
+            say_(m_i18n.tr("Canceled."))
+            return
+        if line != "install":
+            return
+        kind = ctx.wizard["kind"]
+        start_install_job(
+            ctx,
+            kind,
+            lambda cancel, progress: m_agents.ensure_agent_cli(kind, progress=progress, cancel=cancel),
         )
-        say_(m_i18n.tr("Project folder."))
+        say_(m_i18n.words_in("add.running", lang))
         return
     if step_ == "browse":
         cur = Path(ctx.wizard["cwd"])

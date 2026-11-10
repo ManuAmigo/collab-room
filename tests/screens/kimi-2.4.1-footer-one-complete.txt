@@ -1,0 +1,40 @@
+ 
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                    │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                    │
+ │  ▐█████▌  Send /help for help information.                                                                         │
+ │                                                                                                                    │
+ │  Directory: /private/tmp/kimi-yolo.9pu14ziz/project                                                                │
+ │  Session:   session_fa6add12-2f6e-4579-937e-96474896cf59                                                           │
+ │  Model:     probe                                                                                                  │
+ │  Version:   2.4.1                                                                                                  │
+ │                                                                                                                    │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ 
+ ✦ Kimi K3.1 Pro is ready - use the model in a fresh session for the best results
+   Standard: Plus/Moderato and above; Highspeed: Pro/Allegretto and above
+ 
+   No session yet — one will be created on your first message.                                                         
+ 
+ ❯ service-cycle-request                                                                                               
+ 
+ ● Ran a command · $ sleep 20 · 7 more lines
+   task_id: bash-lankxb0u …
+ 
+ ● bash task started in background (isolated background status probe)                                                  
+ 
+ ● SERVICE_CYCLE_COMPLETE                                                                                              
+ 
+ ● bash task completed in background (isolated background status probe · exit 0)                                       
+ 
+ ● SERVICE_CYCLE_COMPLETE                                                                                              
+ 
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                                  │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Ask When Needed  probe  …/tmp/kimi-yolo.9pu14ziz/project                                                 ctrl+o expand
+                                                                                                 context: 1% (286/256k)
+
+
+
+

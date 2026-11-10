@@ -1,0 +1,30 @@
+ https://example.invalid/redacted
+   [redacted]
+
+ ❯ Redacted user turn 1
+   [redacted]
+   [redacted]
+   Error: [provider.api_error] 429 You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan:
+ https://example.invalid/redacted
+   [redacted]
+
+ ❯ Redacted user turn 2
+   [redacted]
+   [redacted]
+   Error: [provider.api_error] 429 You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan:
+ https://example.invalid/redacted
+   [redacted]
+
+ ❯ Redacted user turn 3
+   [redacted]
+   [redacted]
+   [redacted]
+   Error: [provider.api_error] 429 You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan:
+ https://example.invalid/redacted
+   [redacted]
+
+ ╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ >                                                                                                                                                                                                                   │
+ ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ Ask When Needed probe /tmp/project
+ context: 0% (0/256k)

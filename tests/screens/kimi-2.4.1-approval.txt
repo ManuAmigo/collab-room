@@ -1,0 +1,36 @@
+ │  ▐█████▌  Send /help for help information.                                                     │
+ │                                                                                                │
+ │  Directory: /tmp/project                                                   │
+ │  Session:   session_example                                       │
+ │  Model:     probe                                                                              │
+ │  Version:   2.4.1                                                                              │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Kimi K3.1 Pro is ready - use the model in a fresh session for the best results
+   Standard: Plus/Moderato and above; Highspeed: Pro/Allegretto and above
+
+   No session yet — one will be created on your first message.
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+
+ ❯ Run the local probe command
+
+ ● Running a command · $ printf probe
+   Press Ctrl+B to run in background
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: /tmp/project
+   $ printf probe
+     Local integration probe
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+ probe  /tmp/project                                              ctrl+o expand
+                                                                              context: 1% (69/256k)

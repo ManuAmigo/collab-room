@@ -1,13 +1,21 @@
 from __future__ import annotations
 import argparse
+import contextlib
+import select
 import os
+import re
+import hashlib
 import json
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
+from urllib import request as urllib_request
 import uuid
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 import collab.boot as m_boot
@@ -18,7 +26,11 @@ import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
 import collab.screen as m_screen
+import collab.usage as m_usage
 import collab.installer as m_installer
+import collab.vpn_macos_launch as m_vpn_macos_launch
+import collab.vpn_macos_room as m_vpn_macos_room
+import collab.vpn_macos_process as m_vpn_macos_process
 
 
 def border_title(text: str) -> None:
@@ -64,12 +76,454 @@ def codex_knows_no_daemon(program: str, sub: list[str]) -> bool:
     return _NO_DAEMON[key]
 
 
-def agent_command(kind: str, resume: list[str] | None = None, model: str = "") -> str:
-    """The same preset arguments for /add, relaunch and /restart, including resume, and the model its
-    settings give it (both programs take --model; none — the program's own choice)."""
+class AgentCliError(RuntimeError):
+    pass
+
+
+AGENT_CLI_SOURCES = {
+    "claude": ("https://claude.ai/install.sh", "bash"),
+    "codex": ("https://chatgpt.com/codex/install.sh", "sh"),
+    "kimi": ("https://code.kimi.com/kimi-code/install.sh", "bash"),
+}
+AGENT_CLI_LAUNCHERS = {
+    "claude": ((".local", "bin", "claude"),),
+    "codex": (
+        (".local", "bin", "codex"),
+        (".codex", "packages", "standalone", "current", "bin", "codex"),
+        (".codex", "packages", "standalone", "current", "codex"),
+    ),
+    "kimi": ((".kimi-code", "bin", "kimi"),),
+}
+AGENT_CLI_VERIFY_TIMEOUT = 15
+AGENT_CLI_INSTALL_TIMEOUT = 600
+AGENT_CLI_DOWNLOAD_TIMEOUT = 60
+AGENT_CLI_SCRIPT_LIMIT = 2_000_000
+
+
+def agent_user_home() -> Path:
+    return Path.home()
+
+
+def agent_install_root(kind: str) -> Path:
+    return agent_user_home() / ".local" / "share" / "collab-room" / "agent-cli" / kind / uuid.uuid4().hex
+
+
+def verify_agent_cli(path: Path) -> None:
+    try:
+        result = subprocess.run(
+            [str(path), "--version"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=AGENT_CLI_VERIFY_TIMEOUT
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AgentCliError(f"existing {path.name} is not working; it will not be replaced: {exc}") from exc
+    if result.returncode != 0:
+        detail = m_text.visible((result.stderr or result.stdout).strip()[:300])
+        raise AgentCliError(f"existing {path.name} is not working; it will not be replaced: {detail}")
+
+
+def use_agent_cli(path: Path) -> str:
+    verify_agent_cli(path)
+    path = path.expanduser().absolute()
+    if shutil.which(path.name) != str(path):
+        os.environ["PATH"] = str(path.parent) + os.pathsep + os.environ.get("PATH", "")
+    return str(path)
+
+
+def managed_agent_candidates(kind: str) -> list[Path]:
+    base = agent_user_home() / ".local" / "share" / "collab-room" / "agent-cli" / kind
+    if not base.is_dir() or base.is_symlink():
+        return []
+    roots = []
+    for root in base.iterdir():
+        if not root.is_dir() or root.is_symlink():
+            continue
+        path = installed_agent_path(kind, root)
+        if os.path.lexists(path):
+            roots.append((root.stat().st_mtime_ns, path))
+    return [path for _, path in sorted(roots, reverse=True)]
+
+
+def existing_agent_cli(kind: str) -> str:
+    command = m_screen.PRESETS[kind]["command"][0]
+    found = shutil.which(command)
+    if found:
+        return use_agent_cli(Path(found))
+    for launcher in AGENT_CLI_LAUNCHERS[kind]:
+        path = agent_user_home().joinpath(*launcher)
+        if os.path.lexists(path):
+            return use_agent_cli(path)
+    for path in managed_agent_candidates(kind):
+        return use_agent_cli(path)
+    return ""
+
+
+def sanitized_installer_path() -> str:
+    dirs = []
+    for folder in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        if not folder or folder in dirs:
+            continue
+        if any(os.path.lexists(Path(folder) / command) for command in AGENT_CLI_SOURCES):
+            continue
+        dirs.append(folder)
+    return os.pathsep.join(dirs) or os.defpath
+
+
+def installer_environment(kind: str, root: Path) -> dict[str, str]:
+    home = root / "home"
+    tmp = root / "tmp"
+    env = {
+        "HOME": str(home),
+        "TMPDIR": str(tmp),
+        "XDG_CONFIG_HOME": str(root / "xdg" / "config"),
+        "XDG_CACHE_HOME": str(root / "xdg" / "cache"),
+        "XDG_DATA_HOME": str(root / "xdg" / "data"),
+        "PATH": sanitized_installer_path(),
+        "SHELL": "/bin/bash",
+        "TERM": "dumb",
+    }
+    if kind == "codex":
+        env.update(
+            {
+                "CODEX_HOME": str(home / ".codex"),
+                "CODEX_INSTALL_DIR": str(root / "bin"),
+                "CODEX_NON_INTERACTIVE": "1",
+            }
+        )
+        env["PATH"] = str(root / "bin") + os.pathsep + env["PATH"]
+    elif kind == "kimi":
+        env.update({"KIMI_INSTALL_DIR": str(root / "install"), "KIMI_NO_MODIFY_PATH": "1"})
+    for path in (home, tmp, root / "xdg" / "config", root / "xdg" / "cache", root / "xdg" / "data"):
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return env
+
+
+AGENT_DOWNLOAD_BOOTSTRAP = """
+import importlib.machinery
+import importlib.util
+import os
+import sys
+from pathlib import Path
+program, kind, root, source = sys.argv[1:]
+if os.path.basename(program) in ("agents.py", "boot.py"):
+    sys.path.insert(0, os.path.dirname(os.path.dirname(program)))
+    from collab.agents import agent_download_worker
+else:
+    loader = importlib.machinery.SourceFileLoader("_collab_agent_download", program)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    agent_download_worker = module.agent_download_worker
+agent_download_worker(kind, Path(root), source)
+"""
+
+
+def agent_download_worker(kind: str, root: Path, source: str) -> None:
+    try:
+        response = urllib_request.urlopen(source, timeout=20)
+        try:
+            content = bytearray()
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                content.extend(chunk)
+                if len(content) > AGENT_CLI_SCRIPT_LIMIT:
+                    raise AgentCliError(f"the official {kind} installer is too large")
+        finally:
+            try:
+                response.close()
+            except (AttributeError, OSError, ValueError):
+                pass
+        (root / "installer.sh").write_bytes(content)
+    except AgentCliError as exc:
+        result = ("agent", str(exc))
+    except (OSError, ValueError) as exc:
+        result = ("download", str(exc))
+    except BaseException as exc:
+        result = ("internal", f"{type(exc).__name__}: {exc}")
+    else:
+        result = ("ok", "")
+    print(json.dumps(result), flush=True)
+
+
+def download_agent_script(kind: str, root: Path, cancel: Any = None) -> Path:
+    source, _ = AGENT_CLI_SOURCES[kind]
+    deadline = time.monotonic() + AGENT_CLI_DOWNLOAD_TIMEOUT
+
+    def parse_result(line: bytes) -> tuple[str, str]:
+        try:
+            result = json.loads(line)
+            if not isinstance(result, list) or len(result) != 2:
+                raise ValueError("invalid downloader result")
+            status, detail = result
+            if status not in ("ok", "agent", "download", "internal") or not isinstance(detail, str):
+                raise ValueError("invalid downloader result")
+            return status, detail
+        except (ValueError, TypeError) as exc:
+            raise AgentCliError(f"could not download the official {kind} installer: invalid downloader response") from exc
+
+    try:
+        process = start_installer_process(
+            [sys.executable, "-I", "-S", "-c", AGENT_DOWNLOAD_BOOTSTRAP, m_boot.PROGRAM_FILE, kind, str(root), source],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise AgentCliError(f"could not start the official {kind} installer download: {exc}") from exc
+    stdout = process.stdout
+    stderr = process.stderr
+    assert stdout is not None and stderr is not None
+    os.set_blocking(stdout.fileno(), False)
+    os.set_blocking(stderr.fileno(), False)
+    buffered = bytearray()
+    eof = False
+
+    def drain_stdout() -> None:
+        nonlocal eof
+        while True:
+            try:
+                chunk = os.read(stdout.fileno(), 65536)
+            except BlockingIOError:
+                return
+            if not chunk:
+                eof = True
+                return
+            buffered.extend(chunk)
+            if len(buffered) > 65536:
+                raise AgentCliError(f"could not download the official {kind} installer: invalid downloader response")
+
+    def stderr_detail() -> str:
+        content = bytearray()
+        while True:
+            try:
+                chunk = os.read(stderr.fileno(), 65536)
+            except BlockingIOError:
+                break
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > 65536:
+                del content[:-65536]
+        return content.decode("utf-8", "replace").strip()
+
+    try:
+        while True:
+            if cancel and cancel():
+                raise AgentCliError("installation canceled")
+            if time.monotonic() >= deadline:
+                raise AgentCliError(f"{kind} download timed out")
+            if select.select([stdout], [], [], 0.05)[0]:
+                drain_stdout()
+            if b"\n" in buffered:
+                line, _, _ = buffered.partition(b"\n")
+                result = parse_result(bytes(line))
+                break
+            if eof or installer_status(process) is not None:
+                drain_stdout()
+                if b"\n" in buffered:
+                    line, _, _ = buffered.partition(b"\n")
+                    result = parse_result(bytes(line))
+                    break
+                if buffered:
+                    result = parse_result(bytes(buffered))
+                    break
+                if installer_status(process) is None:
+                    raise AgentCliError(
+                        f"could not download the official {kind} installer: downloader closed output without a result"
+                    )
+                detail = stderr_detail()
+                raise AgentCliError(
+                    f"could not download the official {kind} installer: downloader exited with status {installer_status(process)}: {m_text.visible(detail[-500:])}"
+                )
+        if cancel and cancel():
+            raise AgentCliError("installation canceled")
+        if time.monotonic() >= deadline:
+            raise AgentCliError(f"{kind} download timed out")
+        status, detail = result
+        if status == "agent":
+            raise AgentCliError(detail)
+        if status != "ok":
+            raise AgentCliError(f"could not download the official {kind} installer: {detail}")
+        return root / "installer.sh"
+    finally:
+        stop_installer(process)
+        stdout.close()
+        stderr.close()
+
+
+AGENT_PROCESS_ANCHOR = """
+import json,os,signal,subprocess,sys
+status = int(sys.argv[1])
+signal.signal(signal.SIGTERM, lambda *_: None)
+signal.signal(signal.SIGINT, lambda *_: None)
+signal.signal(signal.SIGHUP, lambda *_: None)
+try:
+    child = subprocess.Popen(json.loads(sys.argv[2]), close_fds=True)
+except OSError as error:
+    os.write(status, ("E"+str(error.errno)+"\\n").encode())
+    os.close(status)
+    while True: signal.pause()
+for descriptor in (0,1,2):
+    try: os.close(descriptor)
+    except OSError: pass
+code = child.wait()
+os.write(status, (str(code)+"\\n").encode())
+os.close(status)
+while True: signal.pause()
+"""
+
+
+def start_installer_process(command: list[str], **options: Any) -> subprocess.Popen[Any]:
+    # A live, directly owned leader reserves the group even after the command exits.
+    read_anchor_status, write_anchor_status = os.pipe()
+    try:
+        process: Any = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", AGENT_PROCESS_ANCHOR, str(write_anchor_status), json.dumps(command)],
+            pass_fds=(write_anchor_status,),
+            start_new_session=True,
+            **options,
+        )
+    except BaseException:
+        os.close(read_anchor_status)
+        raise
+    finally:
+        os.close(write_anchor_status)
+    os.set_blocking(read_anchor_status, False)
+    process._collab_status_fd = read_anchor_status
+    process._collab_status_bytes = b""
+    process._collab_command_status = None
+    return process
+
+
+def installer_status(process: Any) -> int | None:
+    if process._collab_command_status is not None:
+        return process._collab_command_status
+    try:
+        chunk = os.read(process._collab_status_fd, 32)
+    except BlockingIOError:
+        return None
+    if not chunk:
+        raise AgentCliError("command anchor closed without a result")
+    process._collab_status_bytes += chunk
+    data = process._collab_status_bytes
+    if len(data) > 16:
+        raise AgentCliError("command anchor result rejected")
+    if b"\n" not in data:
+        return None
+    if re.fullmatch(rb"E[0-9]{1,3}\n", data):
+        error = int(data[1:])
+        raise OSError(error, os.strerror(error))
+    if not re.fullmatch(rb"-?[0-9]{1,3}\n", data):
+        raise AgentCliError("command anchor result rejected")
+    process._collab_command_status = int(data)
+    return process._collab_command_status
+
+
+def stop_installer(process: Any) -> None:
+    if process.returncode is not None:
+        return  # An already reaped PID must never authorize a group signal.
+    try:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                states = m_vpn_macos_launch.mac_group_states(process.pid)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                break  # Inspection is best effort; the final signal is mandatory.
+            if not any(pid != process.pid and not state.startswith("Z") for pid, state in states.items()):
+                break
+            time.sleep(0.02)
+    finally:
+        try:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        finally:
+            try:
+                process.wait()
+            finally:
+                descriptor = getattr(process, "_collab_status_fd", None)
+                if descriptor is not None:
+                    os.close(descriptor)
+                    process._collab_status_fd = None
+
+
+def run_agent_installer(kind: str, root: Path, cancel: Any = None) -> None:
+    script = download_agent_script(kind, root, cancel)
+    _, shell = AGENT_CLI_SOURCES[kind]
+    env = installer_environment(kind, root)
+    stdout = root / "installer.out"
+    stderr = root / "installer.err"
+    with stdout.open("w", encoding="utf-8") as out, stderr.open("w", encoding="utf-8") as err:
+        try:
+            process = start_installer_process(
+                [shell, str(script)],
+                cwd=root,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                text=True,
+            )
+        except OSError as exc:
+            raise AgentCliError(f"could not start the official {kind} installer: {exc}") from exc
+        deadline = time.monotonic() + AGENT_CLI_INSTALL_TIMEOUT
+        status = None
+        try:
+            while (status := installer_status(process)) is None:
+                if cancel and cancel():
+                    raise AgentCliError("installation canceled")
+                if time.monotonic() >= deadline:
+                    raise AgentCliError(f"{kind} installation timed out")
+                time.sleep(0.05)
+        except (AgentCliError, KeyboardInterrupt) as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise AgentCliError("installation canceled") from exc
+            raise
+        finally:
+            stop_installer(process)
+    if status != 0:
+        detail = stderr.read_bytes()[-4000:].decode("utf-8", "replace").strip()
+        raise AgentCliError(f"the official {kind} installer failed: {m_text.visible(detail[-500:])}")
+
+
+def installed_agent_path(kind: str, root: Path) -> Path:
+    if kind == "claude":
+        return root / "home" / ".local" / "bin" / "claude"
+    if kind == "codex":
+        return root / "bin" / "codex"
+    return root / "install" / "bin" / "kimi"
+
+
+def ensure_agent_cli(kind: str, progress: Any = None, cancel: Any = None) -> str:
+    """Find a working CLI or install only a missing one in an isolated root, never in the owner's profile."""
+    existing = existing_agent_cli(kind)
+    if existing:
+        return existing
+    root = agent_install_root(kind)
+    m_store.private_dir(root)
+    lang = m_i18n.SPOKEN["lang"]
+    if progress:
+        progress(m_i18n.words_in("add.download", lang, kind=kind))
+    run_agent_installer(kind, root, cancel)
+    if progress:
+        progress(m_i18n.words_in("add.verify", lang, kind=kind))
+    return use_agent_cli(installed_agent_path(kind, root))
+
+
+def agent_command(kind: str, resume: list[str] | None = None, model: str = "", yolo: bool = False) -> str:
+    """The same preset arguments for /add, relaunch and /restart, including resume, the model its
+    settings give it and, for a Kimi that explicitly opted in, Ask When Needed."""
     preset = m_screen.PRESETS[kind]["command"]
     program = shutil.which(preset[0]) or preset[0]
     chosen = ["--model", model] if model and m_store.MODEL_NAME.fullmatch(model) else []
+    if yolo and kind != "kimi":
+        raise ValueError("--yolo is only for Kimi")
     if kind == "codex":
         # Its own process, not the shared background server (the person's Codex app keeps one): through
         # it a room's Codex did not take the rule written for it just before its start, and the person
@@ -78,7 +532,7 @@ def agent_command(kind: str, resume: list[str] | None = None, model: str = "") -
         if resume:
             return shlex.join([program, resume[0], *preset[1:], *flags, *chosen, *resume[1:]])
         return shlex.join([program, *preset[1:], *flags, *chosen])
-    return shlex.join([program, *preset[1:], *chosen, *(resume or [])])
+    return shlex.join([program, *preset[1:], *chosen, *(["--yolo"] if yolo else []), *(resume or [])])
 
 
 def model_for(p: dict[str, Any]) -> str:
@@ -90,11 +544,18 @@ def model_for(p: dict[str, Any]) -> str:
 
 @m_store.room_locked
 def launch_new_agent(
-    config: dict[str, Any], kind: str, folder: str, label: str, own: dict[str, Any] | None = None, seat: str = ""
+    config: dict[str, Any],
+    kind: str,
+    folder: str,
+    label: str,
+    own: dict[str, Any] | None = None,
+    seat: str = "",
+    yolo: bool = False,
 ) -> str:
     """Start an agent in its own window of the room's tmux session and register it. `own`: the settings
     given it explicitly (store.SETTINGS) — only these are written into its seat; the rest go on by the
-    layers below. `seat`: its seat in the room's scenario, whose settings it takes."""
+    layers below. `seat`: its seat in the room's scenario, whose settings it takes. `yolo`: its explicit
+    Ask When Needed choice, preserved for later launches; only a Kimi may have one."""
     own = own or {}
     # The id and the name by the room's file as it is now, under its lock — not the chat's copy: two
     # /add at once (two chats, or /add and a join) got one id, and add_participant replaced the first
@@ -107,9 +568,14 @@ def launch_new_agent(
     pid = m_text.slug(label, m_store.ids_of(fresh), kind)
     model = str(m_store.effective(kind, {"id": pid, **({"seat": seat} if seat else {}), **own}, fresh, "use_model") or "")
     cli = (
-        m_installer.codex_room_rule(pid, folder, label) if kind == "codex" else ""
-    )  # before it starts: Codex reads rules at start
+        m_installer.codex_room_rule(pid, folder, label) if kind == "codex" and not m_vpn_macos_room.mac_vpn_enabled(fresh) else ""
+    )
+    command = m_vpn_macos_room.mac_vpn_wrap(kind, agent_command(kind, model=model, yolo=yolo), fresh)
     pane = ""
+    code = uuid.uuid4().hex[:4]
+    token = m_usage.prepare_kimi_launch(pid, code, folder, m_usage.kimi_usage_adapter(command)) if kind == "kimi" else ""
+    if token:
+        command = m_usage.kimi_launch_command(command, pid, token)
     try:
         out = m_tmuxio.tmux(
             "new-window",
@@ -124,19 +590,19 @@ def launch_new_agent(
             "-c",
             m_tmuxio.tmux_dir(folder),
             *m_tmuxio.pane_env(),
-            m_tmuxio.in_dir(folder, agent_command(kind, model=model)),
+            m_tmuxio.in_dir(folder, command),
             check=False,
         )
         if out.returncode != 0:
             raise SystemExit(out.stderr.strip() or "tmux could not open a window")
         pane, _, pane_pid = out.stdout.strip().partition(" ")
-        code = uuid.uuid4().hex[:4]
         entry = {
             "id": pid,
             "label": label,
             **{k: v for k, v in m_screen.PRESETS[kind].items() if k not in ("label", "command")},
             "target": pane,
             "pane_pid": pane_pid,
+            **m_vpn_macos_process.mac_vpn_process_fields(fresh, pane_pid),
             "delivery": "tmux",
             "joined": "pending",
             "joined_at": m_store.now(),
@@ -147,8 +613,13 @@ def launch_new_agent(
             **({"cli": cli} if cli else {}),
             **{k: v for k, v in own.items() if k in m_store.SETTINGS},
             **({"seat": seat} if seat else {}),
+            **({"yolo": True} if yolo else {}),
         }
+        if token:
+            entry["kimi_usage_generation"] = token
         add_participant(entry)
+        if token:
+            m_usage.finish_kimi_launch(entry, token)
     except BaseException:
         # Half-started is undone: a rule for an id no one holds, or an agent running in
         # a window the room does not know of. The window is the one just opened, by its fresh id.
@@ -159,7 +630,7 @@ def launch_new_agent(
                 m_installer.set_agent_rule(spelling, pid, "")
         raise
     m_screen.write_status(pid, "joining", "", "self")
-    if kind != "claude":  # a Claude tells its session itself (confirm_joins); a Codex is asked
+    if kind != "claude":
         m_log.append_message(m_text.ROOM, [pid], m_screen.ping_text(code))
     return pid
 
@@ -264,9 +735,9 @@ def clear_limit(pid: str) -> tuple[str, bool]:
     limits = m_store.read_json(rp.limits_path)
     rec = m_screen.limit_of(limits, pid)
     label = entry.get("label") or pid
-    if not rec.get("until"):
+    if not rec.get("until") and not (rec.get("quota_code") == m_screen.KIMI_QUOTA_CODE and not rec.get("over")):
         return label, False
-    rec.pop("until")
+    rec.pop("until", None)
     rec["over"] = time.time()
     limits[pid] = rec
     m_store.write_json(rp.limits_path, limits)
@@ -365,6 +836,81 @@ def agent_program(p: dict[str, Any]) -> str:
     return {"claude": "Claude Code", "codex": "Codex"}.get(m_screen.agent_kind(p), "CollabRoom")
 
 
+CODEX_VIEW_MARK = "@collab_codex_view"
+CODEX_CLIPBOARD = "@collab_codex_clipboard"
+CODEX_COPY_CONDITION = f"#{{==:#{{{CODEX_VIEW_MARK}}},1}}"
+CODEX_COPY_PREFIX = f'if-shell -F "{CODEX_COPY_CONDITION}"'
+
+
+def codex_clipboard_command() -> str:
+    custom = os.environ.get("COLLAB_CLIPBOARD")
+    try:
+        candidates = [shlex.split(custom)] if custom else [["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]]
+    except ValueError:
+        return ""
+    for command in candidates:
+        if command and shutil.which(command[0]):
+            return shlex.join(command)
+    return ""
+
+
+def codex_compound_lines(action: str) -> list[str]:
+    if "\n" in action or "\r" in action:
+        return []
+    lines, start, index, quote = [], 0, 0, ""
+    while index < len(action):
+        if quote:
+            if action[index] == "\\" and quote == '"':
+                index += 2
+                continue
+            if action[index] == quote:
+                quote = ""
+        elif action[index] in "'\"":
+            quote = action[index]
+        elif action.startswith(r"\;\;", index):
+            lines.append(action[start:index])
+            index += 4
+            start = index
+            continue
+        elif action[index] == "\\":
+            index += 2
+            continue
+        index += 1
+    if quote:
+        return []
+    lines.append(action[start:])
+    return lines if all(line.strip() for line in lines) else []
+
+
+def install_codex_copy_binding(table: str) -> None:
+    result = m_tmuxio.tmux("list-keys", "-T", m_tmuxio.tmux_text(table), "MouseDragEnd1Pane", check=False)
+    if result.returncode != 0 or len(result.stdout.splitlines()) != 1:
+        return
+    prefix = f"bind-key -T {table} MouseDragEnd1Pane "
+    line = result.stdout.rstrip("\n")
+    if not line.startswith(prefix):
+        return
+    action = line[len(prefix) :]
+    if not action or action.startswith(CODEX_COPY_PREFIX):
+        return
+    lines = codex_compound_lines(action)
+    if not lines:
+        return
+    source = (
+        f'bind-key -T {table} MouseDragEnd1Pane if-shell -F "{CODEX_COPY_CONDITION}" {{\n'
+        f' send-keys -X copy-pipe-and-cancel "#{{{CODEX_CLIPBOARD}}}"\n'
+        "} {\n" + "\n".join(lines) + "\n}\n"
+    )
+    descriptor, name = tempfile.mkstemp(prefix="collab-codex-copy-", suffix=".conf")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as config:
+            config.write(source)
+        m_tmuxio.tmux("source-file", name, check=False)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(name)
+
+
 def view_options(view: str, entry: dict[str, Any], label: str, back: str) -> list[str]:
     """The options of a view of an agent's window, as one tmux chain: the bottom line in the room's
     style — quiet grey, no list of windows, the agent's name and how to get back on
@@ -391,14 +937,43 @@ def view_options(view: str, entry: dict[str, Any], label: str, back: str) -> lis
         chain += ["set-option", "-t", f"={view}:", *option, ";"]
     if codex:
         # An alternate-screen Codex does not request mouse events; tmux's default wheel binding
-        # forwards them as input-history arrows. Only its view captures the wheel, even for a
+        # forwards them as input-history arrows. Only its view captures the mouse, even for a
         # Codex started before inline mode was added. The room keeps native terminal selection.
+        for table in ("copy-mode", "copy-mode-vi"):
+            install_codex_copy_binding(table)
         chain += [
+            "set-option",
+            "-t",
+            f"={view}:",
+            CODEX_VIEW_MARK,
+            "1",
+            ";",
+            "set-option",
+            "-t",
+            f"={view}:",
+            CODEX_CLIPBOARD,
+            codex_clipboard_command(),
+            ";",
             "set-option",
             "-t",
             f"={view}:",
             "key-table",
             CODEX_VIEW_KEYS,
+            ";",
+            "bind-key",
+            "-T",
+            CODEX_VIEW_KEYS,
+            "MouseDown1Pane",
+            "select-pane",
+            "-t",
+            "=",
+            ";",
+            "bind-key",
+            "-T",
+            CODEX_VIEW_KEYS,
+            "MouseDrag1Pane",
+            "copy-mode",
+            "-M",
             ";",
             "bind-key",
             "-T",
@@ -704,10 +1279,24 @@ def linked_worktree(folder: str) -> bool:
 def relaunch_agent(session: str, p: dict[str, Any]) -> str:
     """Start again an agent the room had started (its window is gone, e.g. after /stop), in its
     folder, as a fresh session: it joins anew through a connection check."""
+    if "container" in p:
+        m_store.fail(m_i18n.tr("Container VPN is frozen; remove legacy container settings before starting the room."))
     rp = m_store.room().paths
     kind = p.get("kind") or ("claude" if "❯" in p.get("idle", "") else "codex")
     folder = p.get("folder") or str(rp.root)
-    cli = m_installer.codex_room_rule(p["id"], folder) if kind == "codex" else ""
+    launch_config = m_store.read_config_raw()
+    cli = (
+        m_installer.codex_room_rule(p["id"], folder)
+        if kind == "codex" and not m_vpn_macos_room.mac_vpn_enabled(launch_config)
+        else ""
+    )
+    code = uuid.uuid4().hex[:4]
+    command = m_vpn_macos_room.mac_vpn_wrap(
+        kind, agent_command(kind, model=model_for(p), yolo=bool(p.get("yolo"))), launch_config
+    )
+    token = m_usage.prepare_kimi_launch(p["id"], code, folder, m_usage.kimi_usage_adapter(command)) if kind == "kimi" else ""
+    if token:
+        command = m_usage.kimi_launch_command(command, p["id"], token)
     out = m_tmuxio.tmux(
         "new-window",
         "-d",
@@ -721,17 +1310,20 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
         "-c",
         m_tmuxio.tmux_dir(folder),
         *m_tmuxio.pane_env(),
-        m_tmuxio.in_dir(folder, agent_command(kind, model=model_for(p))),
+        m_tmuxio.in_dir(folder, command),
         check=False,
     )
     if out.returncode != 0:
         m_store.fail(m_i18n.tr("{p0}: could not start it again: {p1}", p0=p["id"], p1=out.stderr.strip()))
     pane, _, pane_pid = out.stdout.strip().partition(" ")
-    code = uuid.uuid4().hex[:4]
     data = m_store.read_config_raw()
     for q in data["participants"]:
         if q["id"] == p["id"]:
             q.update(target=pane, pane_pid=pane_pid, joined="pending", joined_at=m_store.now(), join_code=code)
+            q.update(m_vpn_macos_process.mac_vpn_process_fields(data, pane_pid))
+            if token:
+                q["kimi_usage_generation"] = token
+                m_usage.finish_kimi_launch(q, token)
             q.pop("cli", None)
             q.update({"cli": cli} if cli else {})
     m_store.write_config(data)
@@ -796,7 +1388,7 @@ def team_started(config: dict[str, Any], started: list[str], failed: list[str]) 
     return "\n".join([head, *(f"  ! {m_text.visible(why)}" for why in failed)])
 
 
-def apply_proposal(mid: str, by: str, digest: str = "") -> list[str]:
+def apply_proposal(mid: str, by: str, digest: str = "", cancel: Any = None, progress: Any = None) -> list[str]:
     """The person's Enter on a proposal: its changes as one record of the history, its agents started the way /add
     starts them, its team started — what each did, in words. Checked again first: the room may have changed."""
     m = next((x for x in m_log.read_messages() if x.get("id") == mid and isinstance(x.get("proposal"), dict)), None)
@@ -820,7 +1412,10 @@ def apply_proposal(mid: str, by: str, digest: str = "") -> list[str]:
             lines.append(f"! {a['label']}: {why}")
             continue
         own = {k: a[k] for k in m_store.SETTINGS if k in a}
-        pid = launch_new_agent(m_store.load_config(), a["kind"], str(Path(folder).resolve()), a["label"], own)
+        ensure_agent_cli(a["kind"], progress=progress, cancel=cancel)
+        pid = launch_new_agent(
+            m_store.load_config(), a["kind"], str(Path(folder).resolve()), a["label"], own, yolo=bool(a.get("yolo"))
+        )
         lines.append(f"Starting {a['label']} in room window {pid}.")
     if prop.get("team"):
         started, failed = start_scenario(prop["team"], root)
@@ -840,30 +1435,241 @@ def restart_agent(session: str, p: dict[str, Any], fresh: bool = False, sid: str
     conversation (a Codex reads its rules only at start — after a new rule it went on
     asking the person for every answer, and a fresh agent lost what it was doing). The room
     remembers the new process of the window and checks the connection anew."""
+    if "container" in p:
+        m_store.fail(m_i18n.tr("Container VPN is frozen; remove legacy container settings before starting the room."))
     kind = m_screen.agent_kind(p)
-    if not p.get("started_by_room") or kind not in ("claude", "codex"):
+    if not p.get("started_by_room") or kind not in ("claude", "codex", "kimi"):
         m_store.fail(m_i18n.tr("{p0}: only an agent the room started can be restarted", p0=p["id"]))
     # Only this agent's own conversation, by its exact id — never «the latest in the folder»: five
     # Claudes work in one folder. Not found, it is said; a new one only when asked for.
     # Looked for before the room's lock: up to 50 Codex logs of 20 MB were read holding it, and
     # delivery to every agent, say and ack all waited.
-    sid = "" if fresh else (sid or m_screen.agent_session(p))
+    if kind == "kimi":
+        binding = m_usage.kimi_resume_binding(p, sid)
+        if fresh or not binding:
+            m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=p["id"]))
+        sid = binding["session_id"]
+    else:
+        sid = "" if fresh else (sid or m_screen.agent_session(p))
     if not sid and not fresh:
         m_store.fail(m_i18n.tr("{p0}: its conversation was not found", p0=p["id"]))
     return restart_in_window(session, p, kind, sid)
 
 
+def _kimi_adoption_eligible(report: dict[str, Any]) -> bool:
+    gates = report.get("gates", {})
+    required = ("participant", "session_id", "metadata", "process", "hook", "checkpoint")
+    return all(gates.get(gate) == "PASS" for gate in required) and gates.get("writer") != "FAIL"
+
+
+def adopt_kimi_session(session: str, p: dict[str, Any], sid: str, execute: bool = False) -> dict[str, Any]:
+    """Review an owner-selected existing session; only explicit consent reaches the managed restart."""
+    report = m_installer.kimi_adoption_preflight(p, sid)
+    report["adoption_eligible"] = _kimi_adoption_eligible(report)
+    report["recovery_command"] = f"kimi --session {sid}" if m_usage.KIMI_PART.fullmatch(sid) else ""
+    if not execute or not report["adoption_eligible"]:
+        report["execution"] = "dry-run" if not execute else "refused"
+        return report
+    try:
+        pane = restart_in_window(session, p, "kimi", sid, adoption=report)
+    except (m_store.OperationFailed, SystemExit) as exc:
+        report["execution"] = "failed"
+        report["error"] = str(exc)
+    else:
+        report["execution"] = "started"
+        report["pane"] = pane
+    return report
+
+
+def kimi_adoption_poststop(agent: str, token: str, old_pid: str, sid: str, dev: int, ino: int) -> bool:
+    rp = m_store.room().paths
+    proof = m_usage.obj(m_usage.kimi_state(rp.state_dir / "kimi-launches.json").get(token))
+    adoption = m_usage.obj(proof.get("adoption"))
+    resume = m_usage.obj(proof.get("resume_binding"))
+    target = str(adoption.get("target") or "")
+    old_start = str(adoption.get("old_start") or "")
+    if (
+        proof.get("id") != agent
+        or proof.get("token") != token
+        or not proof.get("generation")
+        or proof.get("generation") == resume.get("generation")
+        or resume.get("pane_pid") != old_pid
+        or resume.get("target") != target
+        or resume.get("session_id") != sid
+        or adoption.get("old_pid") != old_pid
+        or adoption.get("session_id") != sid
+        or adoption.get("dev") != dev
+        or adoption.get("ino") != ino
+        or not target
+        or not old_start
+    ):
+        m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=agent))
+    current_pid = str(os.getppid())
+    shown = m_tmuxio.tmux("display-message", "-p", "-t", target, "#{pane_pid}", check=False)
+    new_start = m_usage.kimi_process_start(current_pid)
+    if shown.returncode or shown.stdout.strip() != current_pid or current_pid == old_pid or not new_start:
+        m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=agent))
+    p = {
+        "id": agent,
+        "kind": "kimi",
+        "pane_pid": old_pid,
+        "target": target,
+        "join_code": resume.get("generation"),
+        "folder": proof.get("folder"),
+        "started_by_room": True,
+    }
+    report = m_installer.kimi_adoption_preflight(p, sid, poststop=True)
+    wire = report.get("snapshot", {}).get("wire", {})
+    if not _kimi_adoption_eligible(report) or wire.get("dev") != dev or wire.get("ino") != ino:
+        m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=agent))
+    return True
+
+
+def _kimi_adoption_guard_command(command: str, p: dict[str, Any], sid: str, latest: dict[str, Any], token: str) -> str:
+    wire = latest["snapshot"]["wire"]
+    guard = shlex.join(
+        [
+            "env",
+            "COLLAB_KIMI_ROOM=" + str(m_store.room().paths.root),
+            "COLLAB_KIMI_AGENT=" + p["id"],
+            "COLLAB_KIMI_GENERATION=" + token,
+            "KIMI_CODE_HOME=" + str(m_usage.kimi_home().parent),
+            sys.executable,
+            str(m_boot.SELF),
+            "usage",
+            "kimi-adoption-guard",
+            "--agent",
+            p["id"],
+            "--pid",
+            str(p["pane_pid"]),
+            "--session",
+            sid,
+            "--dev",
+            str(wire["dev"]),
+            "--ino",
+            str(wire["ino"]),
+            "--room",
+            str(m_store.room().paths.root),
+        ]
+    )
+    return shlex.join(["/bin/sh", "-c", guard + " && exec " + command])
+
+
 @m_store.room_locked
-def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str) -> str:
+def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str, adoption: dict[str, Any] | None = None) -> str:
     """restart_agent's part under the room's lock: the window, the room's file, the check."""
     rp = m_store.room().paths
+    if adoption is not None and kind != "kimi":
+        m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=p["id"]))
+    resume_binding: dict[str, Any] = {}
+    latest: dict[str, Any] = {}
+    adoption_cursor: dict[str, Any] = {}
+    if kind == "kimi":
+        current = next((q for q in m_store.read_config_raw().get("participants", []) if q.get("id") == p["id"]), {})
+        if adoption is not None:
+            latest = m_installer.kimi_adoption_preflight(current, sid)
+            first_snapshot = adoption.get("snapshot", {})
+            latest_snapshot = latest.get("snapshot", {})
+            first_process = first_snapshot.get("process", {})
+            latest_process = latest_snapshot.get("process", {})
+            first_wire = first_snapshot.get("wire", {})
+            latest_wire = latest_snapshot.get("wire", {})
+            same_process = first_process == latest_process and bool(latest_process)
+            same_wire = (
+                first_wire.get("dev") == latest_wire.get("dev")
+                and first_wire.get("ino") == latest_wire.get("ino")
+                and bool(latest_wire)
+            )
+            if not _kimi_adoption_eligible(adoption) or not _kimi_adoption_eligible(latest) or not same_process or not same_wire:
+                m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=p["id"]))
+            resume_binding = {
+                "generation": current.get("join_code"),
+                "pane_pid": current.get("pane_pid"),
+                "target": current.get("target"),
+                "sessions_root": str(m_usage.kimi_home()),
+                "workdir_key": m_usage.kimi_workdir_key(os.path.realpath(str(current.get("folder") or rp.root))),
+                "session_id": sid,
+                "agent_id": "main",
+                "adapter": m_usage.KIMI_NORMALIZED,
+            }
+        else:
+            resume_binding = m_usage.kimi_resume_binding(current, sid)
+        if (
+            not sid
+            or not resume_binding
+            or any(current.get(k) != p.get(k) for k in ("target", "pane_pid", "join_code", "folder", "kimi_usage_generation"))
+        ):
+            m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=p["id"]))
+        p = current
     folder = p.get("folder") or str(rp.root)
-    cli = m_installer.codex_room_rule(p["id"], folder) if kind == "codex" else ""  # the newest rule, read at its start
-    resume = (["--resume", sid] if kind == "claude" else ["resume", sid]) if sid else []
-    command = agent_command(kind, resume, model_for(p))
+    launch_config = m_store.read_config_raw()
+    cli = (
+        m_installer.codex_room_rule(p["id"], folder)
+        if kind == "codex" and not m_vpn_macos_room.mac_vpn_enabled(launch_config)
+        else ""
+    )  # the newest rule, read at its start
+    resume = (["--resume" if kind == "claude" else "--session", sid] if kind != "codex" else ["resume", sid]) if sid else []
+    command = m_vpn_macos_room.mac_vpn_wrap(
+        kind, agent_command(kind, resume, model_for(p), yolo=bool(p.get("yolo"))), launch_config
+    )
+    code = uuid.uuid4().hex[:4]
+    token = ""
+    if kind == "kimi":
+        adapter = m_usage.kimi_usage_adapter(command)
+        if adapter != resume_binding.get("adapter"):
+            m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=p["id"]))
+        if adoption is not None and p["id"] in m_usage.kimi_state(rp.state_dir / "kimi-usage-cursor.json"):
+            m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=p["id"]))
+        token = m_usage.prepare_kimi_launch(p["id"], code, folder, adapter, resume=resume_binding)
+        if adoption is not None:
+            wire = latest["snapshot"]["wire"]
+            baseline = asdict(m_usage.Cursor(m_store.now()))
+            baseline["files"] = {"wire": {"ino": wire["ino"], "off": wire["off"], "mid": 0}}
+            baseline["binding"] = hashlib.sha256(json.dumps(resume_binding, sort_keys=True).encode()).hexdigest()
+            baseline["observed"] = False
+            cursor_path = rp.state_dir / "kimi-usage-cursor.json"
+            state = m_usage.kimi_state(cursor_path)
+            state[p["id"]] = baseline
+            proofs_path = rp.state_dir / "kimi-launches.json"
+            proofs = m_usage.kimi_state(proofs_path)
+            proof = m_usage.obj(proofs.get(token))
+            proof["adoption"] = {
+                "old_pid": str(p["pane_pid"]),
+                "old_start": latest["snapshot"]["process"]["start"],
+                "target": p["target"],
+                "session_id": sid,
+                "dev": wire["dev"],
+                "ino": wire["ino"],
+            }
+            proofs[token] = proof
+            try:
+                m_store.write_json(proofs_path, proofs)
+                m_store.write_json(cursor_path, state)
+            except (OSError, SystemExit):
+                proofs = m_usage.kimi_state(proofs_path)
+                proofs.pop(token, None)
+                m_store.write_json(proofs_path, proofs)
+                raise
+            adoption_cursor = baseline
+        command = m_usage.kimi_launch_command(command, p["id"], token)
+        if adoption is not None:
+            command = _kimi_adoption_guard_command(command, p, sid, latest, token)
     pane = p.get("target", "")
     # Its own window only: «respawn-pane -k» into a number tmux gave out again would kill someone
     # else's program.
+    if adoption is not None and not agent_window_alive(p):
+        if token:
+            path = rp.state_dir / "kimi-launches.json"
+            proofs = m_usage.kimi_state(path)
+            proofs.pop(token, None)
+            m_store.write_json(path, proofs)
+        if adoption_cursor:
+            cursor_path = rp.state_dir / "kimi-usage-cursor.json"
+            state = m_usage.kimi_state(cursor_path)
+            if state.get(p["id"]) == adoption_cursor:
+                state.pop(p["id"], None)
+                m_store.write_json(cursor_path, state)
+        m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=p["id"]))
     if agent_window_alive(p):
         out = m_tmuxio.tmux(
             "respawn-pane",
@@ -895,13 +1701,27 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str) -> s
         )
         pane = out.stdout.strip()
     if out.returncode != 0:
+        if token:
+            path = rp.state_dir / "kimi-launches.json"
+            proofs = m_usage.kimi_state(path)
+            proofs.pop(token, None)
+            m_store.write_json(path, proofs)
+        if adoption_cursor:
+            cursor_path = rp.state_dir / "kimi-usage-cursor.json"
+            state = m_usage.kimi_state(cursor_path)
+            if state.get(p["id"]) == adoption_cursor:
+                state.pop(p["id"], None)
+                m_store.write_json(cursor_path, state)
         m_store.fail(m_i18n.tr("{p0}: could not restart it: {p1}", p0=p["id"], p1=out.stderr.strip()))
     pane_pid = m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_pid}", check=False).stdout.strip()
-    code = uuid.uuid4().hex[:4]
     data = m_store.read_config_raw()
     for q in data["participants"]:
         if q["id"] == p["id"]:
             q.update(target=pane, pane_pid=pane_pid, joined="pending", joined_at=m_store.now(), join_code=code)
+            q.update(m_vpn_macos_process.mac_vpn_process_fields(data, pane_pid))
+            if token:
+                q["kimi_usage_generation"] = token
+                m_usage.finish_kimi_launch(q, token)
             q.pop("cli", None)
             q.update({"cli": cli} if cli else {})
     m_store.write_config(data)

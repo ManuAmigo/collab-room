@@ -1,12 +1,17 @@
 from __future__ import annotations
 import hashlib
+import os
 import re
 import subprocess
+import sys
+import time
 from typing import Any
+import collab.screen as m_screen
 
 # An agent's program asking the person a question in its window — read whole, to be answered from Telegram by a
-# button: its words as the program shows them, every option, the one selected. Only programs and versions whose
-# dialogs were read live and whose keys were tried; anything else — no buttons, the person answers on the computer.
+# button: its words as the program shows them, every option, the one selected. Only known dialog shapes and versions;
+# action keys are a separate permission. Anything uncertain — no buttons, the person answers on the computer.
+# Kimi 2.4.1 Cache expired: the full frame and choices are parsed; no numeric callback is granted.
 #
 # Claude Code 2.1 (2.1.310 tried): the dialog sits under the last rule «────» exactly as wide as the window, its title
 # on the next line; its last line is «Esc to cancel · Tab to amend»; options «❯ 1. Yes» / «  2. …», a long one wrapped
@@ -27,23 +32,123 @@ OPTION = {
     "codex": re.compile(r"^(›| ) (\d)\. (\S.*)$"),
 }
 MAX_LINES = 60  # a dialog longer than this is not read as one: the person answers on the computer
+KIMI_VERSION = re.compile(r"2\.4\.1")
 
 
-def program_version(kind: str, program: str, pane_pid: str) -> str:
+def deadline_left(deadline: float | None) -> float | None:
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def deadline_expired(deadline: float | None) -> bool:
+    return deadline is not None and deadline - time.monotonic() <= 0
+
+
+def kimi_process_executable(pane_pid: str) -> str:
+    if sys.platform != "linux":
+        return ""
+    try:
+        path = os.readlink(f"/proc/{pane_pid}/exe")
+    except OSError:
+        return ""
+    return path if path.startswith("/") and path.rsplit("/", 1)[-1] == "kimi" else ""
+
+
+def kimi_process_identity(pane_pid: str, deadline: float | None = None) -> tuple[str, str] | None:
+    if deadline_expired(deadline):
+        return None
+    path = kimi_process_executable(pane_pid)
+    if not path or deadline_expired(deadline):
+        return None
+    try:
+        started = subprocess.run(
+            ["ps", "-ww", "-o", "lstart=", "-p", pane_pid],
+            capture_output=True,
+            text=True,
+            timeout=2 if deadline is None else max(0.001, deadline - time.monotonic()),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if deadline_expired(deadline):
+        return None
+    start = started.stdout.strip()
+    return (path, start) if started.returncode == 0 and start else None
+
+
+def kimi_process_file_matches(pane_pid: str, path: str, deadline: float | None = None) -> bool:
+    if deadline_expired(deadline):
+        return False
+    if sys.platform != "linux":
+        return True
+    try:
+        running = os.stat(f"/proc/{pane_pid}/exe")
+        executable = os.stat(path)
+    except OSError:
+        return False
+    if deadline_expired(deadline):
+        return False
+    return (running.st_dev, running.st_ino) == (executable.st_dev, executable.st_ino)
+
+
+def program_version(kind: str, program: str, pane_pid: str, deadline: float | None = None) -> str:
     """The version of the program running in an agent's window — not of the one installed now: Claude Code names its
-    process by its version; a Codex runs its own release's helper, the version in its path. "" — not known."""
+    process by its version; a Codex runs its own release's helper, the version in its path; Kimi's own launcher answers.
+    "" — not known."""
     if kind == "claude":
         return program if CLAUDE_VERSION.fullmatch(program) else ""
-    if kind != "codex" or not pane_pid.isdigit():
+    if kind == "kimi":
+        if not pane_pid.isdigit() or deadline_expired(deadline):
+            return ""
+        before = kimi_process_identity(pane_pid, deadline)
+        if not before or deadline_expired(deadline) or not kimi_process_file_matches(pane_pid, before[0], deadline):
+            return ""
+        try:
+            result = subprocess.run(
+                [before[0], "--version"],
+                capture_output=True,
+                text=True,
+                timeout=2 if deadline is None else max(0.001, deadline - time.monotonic()),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        after = kimi_process_identity(pane_pid, deadline)
+        if after != before or deadline_expired(deadline) or not kimi_process_file_matches(pane_pid, before[0], deadline):
+            return ""
+        version = result.stdout.strip()
+        return version if not deadline_expired(deadline) and result.returncode == 0 and KIMI_VERSION.fullmatch(version) else ""
+    if kind != "codex" or not pane_pid.isdigit() or deadline_expired(deadline):
         return ""
-    kids = subprocess.run(["pgrep", "-P", pane_pid], capture_output=True, text=True).stdout.split()[:20]
+    kids = subprocess.run(
+        ["pgrep", "-P", pane_pid],
+        capture_output=True,
+        text=True,
+        timeout=None if deadline is None else max(0.001, deadline - time.monotonic()),
+    ).stdout.split()[:20]
     # Under a shell too (a window the person named): the Codex is its child, its release's helper one deeper.
-    kids += [g for k in kids for g in subprocess.run(["pgrep", "-P", k], capture_output=True, text=True).stdout.split()[:20]]
+    grandchildren = []
+    for kid in kids:
+        if deadline_expired(deadline):
+            return ""
+        grandchildren += subprocess.run(
+            ["pgrep", "-P", kid],
+            capture_output=True,
+            text=True,
+            timeout=None if deadline is None else max(0.001, deadline - time.monotonic()),
+        ).stdout.split()[:20]
+    kids += grandchildren
     for pid in kids[:60]:
-        args = subprocess.run(["ps", "-ww", "-o", "args=", "-p", pid], capture_output=True, text=True).stdout
+        if deadline_expired(deadline):
+            return ""
+        args = subprocess.run(
+            ["ps", "-ww", "-o", "args=", "-p", pid],
+            capture_output=True,
+            text=True,
+            timeout=None if deadline is None else max(0.001, deadline - time.monotonic()),
+        ).stdout
+        if deadline_expired(deadline):
+            return ""
         m = re.search(r"/releases/(\d+\.\d+\.\d+)-", args)
         if m:
-            return m.group(1)
+            return m.group(1) if not deadline_expired(deadline) else ""
     return ""
 
 
@@ -52,6 +157,17 @@ def read_prompt(kind: str, version: str, screen: str, width: int) -> dict[str, A
     {"lines": its words as shown,
     "options": [{"n", "lines"}], "selected": n, "print": what tells this question from any other}. None — no
     question this version's dialog has, or not all of it on the screen: no option is guessed."""
+    if kind == "kimi":
+        if not KIMI_VERSION.fullmatch(version):
+            return None
+        question = m_screen.kimi_cache_dialog(screen, width)
+        if not question or not question.pop("complete"):
+            return None
+        shown = [*question["lines"], *(f"{o['n']}. " + "\n".join(o["lines"]) for o in question["options"])]
+        question["print"] = hashlib.sha256("\n".join([kind, version, *shown, str(question["selected"])]).encode()).hexdigest()[
+            :32
+        ]
+        return question
     if not (kind == "claude" and CLAUDE_VERSION.fullmatch(version)) and not (
         kind == "codex" and CODEX_VERSION.fullmatch(version)
     ):
@@ -122,3 +238,13 @@ def key_for(kind: str, n: int) -> str:
     if kind not in ("claude", "codex") or type(n) is not int or not 1 <= n <= 9:
         raise ValueError(n)
     return "123456789"[n - 1]
+
+
+def keys_for(kind: str, n: int, selected: int) -> list[str]:
+    """The Cache dialog's selection moved to n, then confirmed: no numeric shortcuts."""
+    if kind != "kimi" or type(n) is not int or type(selected) is not int or not 1 <= n <= 4 or not 1 <= selected <= 4:
+        raise ValueError((n, selected))
+    if n == selected:
+        return ["Enter"]
+    direction = "Down" if n > selected else "Up"
+    return [direction] * abs(n - selected) + ["Enter"]

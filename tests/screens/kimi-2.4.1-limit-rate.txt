@@ -1,0 +1,9 @@
+ ❯ Continue the isolated probe
+
+   Error: [provider.api_error] 429 Too many requests. Please retry later.
+
+ ╭────────────────────────────────────╮
+ │ >                                  │
+ ╰────────────────────────────────────╯
+ Ask When Needed  probe  /tmp/project
+                 context: 1% (501/256k)

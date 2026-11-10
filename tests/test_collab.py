@@ -26,7 +26,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _isolation import PY_BIN, TEST_ROOTS, isolated  # noqa: E402
-from _seam import owner, seam, seam_paths  # noqa: E402
+from _seam import owner, seam, seam_paths, seam_room  # noqa: E402
 from _package import Loader as _Loader  # noqa: E402
 
 COLLAB = Path(__file__).resolve().parents[1] / "collab"
@@ -2392,6 +2392,7 @@ class RoomTest(Base):
         self.write_config([{"id": "owner", "label": "Андрей"}, {"id": "mira", "label": "Мира", "pane": False}])
         mod = _Loader(f"collab_add_settings_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
         mod.use_room(str(self.root))
+        self.enterContext(seam(mod, "agents.ensure_agent_cli", lambda *_args, **_kwargs: "/bin/true"))
         commands: list[str] = []
 
         def tmux(*argv, **_):
@@ -2841,11 +2842,162 @@ class RoomTest(Base):
         with self.assertRaises(SystemExit):  # and the name, too, by the file now
             mod.launch_new_agent(stale, "claude", str(self.root), "Joined Meanwhile")
 
+    def test_collab_add_calls_ensure_outside_the_room_lock(self):
+        self.write_config([{"id": "owner"}])
+        opened: list[str] = []
+        mod = self._launch_mod("collab_add_install", opened)
+        calls = []
+
+        def ensure(kind, progress=None):
+            calls.append((kind, mod._ROOM_LOCK["depth"]))
+            return "/bin/true"
+
+        self.enterContext(seam(mod, "agents.ensure_agent_cli", ensure))
+        self.enterContext(seam(mod, "installer.codex_room_rule", lambda pid, folder, label="": ""))
+        with mock.patch.object(sys, "argv", ["collab", "add", "codex", "--name", "Codex"]):
+            mod.main()
+        self.assertEqual(calls, [("codex", 0)])
+        participants = json.loads(self.cfg.read_text())["participants"]
+        self.assertTrue(any(p.get("label") == "Codex" for p in participants))
+
+    def test_add_menu_installs_a_missing_cli_and_continues_with_folder_choice(self):
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_add_menu_install", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.write_config([{"id": "owner"}])
+        ctx = SimpleNamespace(
+            wizard={},
+            config=mod.load_config(),
+            args=argparse.Namespace(as_="owner"),
+            feed=lambda text: None,
+            stale_chat=lambda: False,
+        )
+        ctx.run_wizard_step = lambda line: mod.wizard_step(ctx, line, said)
+        said = []
+        mod.wizard_step(ctx, "/add", said)
+        self.assertEqual(ctx.wizard["kinds"], list(mod.PRESETS))
+        with seam(mod, "agents.existing_agent_cli", lambda _kind: ""):
+            mod.wizard_step(ctx, "1", said)
+        self.assertEqual(ctx.wizard["step"], "install_confirm")
+        kind = ctx.wizard["kind"]
+        calls = []
+
+        def ensure(selected, progress=None, cancel=None):
+            calls.append(selected)
+            return "/bin/true"
+
+        with seam(mod, "agents.ensure_agent_cli", ensure):
+            mod.wizard_step(ctx, "install", said)
+            deadline = time.monotonic() + 2
+            while ctx.wizard.get("step") == "install_running" and time.monotonic() < deadline:
+                mod.pump_install_job(ctx)
+                time.sleep(0.01)
+        self.assertEqual(calls, [kind])
+        self.assertEqual(ctx.wizard["step"], "folder_pick")
+        self.assertEqual(ctx.wizard["kind"], kind)
+
+    def test_add_running_can_be_canceled_by_the_person(self):
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_add_running_cancel", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.write_config([{"id": "owner"}])
+        buf = []
+        ctx = SimpleNamespace(
+            wizard={
+                "step": "install_confirm",
+                "kind": "kimi",
+                "options": [("Install", "install"), ("Cancel", "cancel")],
+                "from_cmd": "/add",
+            },
+            config=mod.load_config(),
+            args=argparse.Namespace(as_="owner"),
+            feed=lambda text: None,
+            buffer=lambda: buf,
+            ui=SimpleNamespace(pos=0, suggested=False, menu_index=1, menu_closed=False, menu_moved=False),
+            commands=lambda: [("/add", "")],
+        )
+        ctx.run_wizard_step = lambda line: mod.wizard_step(ctx, line, [])
+        ctx.menu_items = lambda: mod.chat_menu_items(ctx)
+        entered = threading.Event()
+
+        def ensure(kind, progress=None, cancel=None):
+            entered.set()
+            while not cancel():
+                time.sleep(0.01)
+            raise mod.AgentCliError("installation canceled")
+
+        with seam(mod, "agents.ensure_agent_cli", ensure):
+            mod.wizard_step(ctx, "install", [])
+            self.assertEqual(ctx.wizard["step"], "install_running")
+            self.assertTrue(entered.wait(1))
+            action = mod.chat_choose_command(ctx)
+            self.assertEqual(action, "cancel")
+            mod.chat_add_wizard(ctx, action)
+            deadline = time.monotonic() + 2
+            while ctx.wizard and time.monotonic() < deadline:
+                mod.pump_install_job(ctx)
+                time.sleep(0.01)
+        self.assertEqual(ctx.wizard, {})
+
+    def test_proposal_install_is_nonblocking_and_cancelable(self):
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_proposal_running_cancel", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.write_config([{"id": "owner"}])
+        buf = []
+        ctx = SimpleNamespace(
+            wizard={
+                "step": "proposal",
+                "proposal": "m1",
+                "digest": "",
+                "options": [("Apply", "go"), ("Later", "later"), ("Decline", "decline")],
+            },
+            config=mod.load_config(),
+            args=argparse.Namespace(as_="owner"),
+            feed=lambda text: None,
+            refresh_people=lambda: None,
+            buffer=lambda: buf,
+            ui=SimpleNamespace(pos=0, suggested=False, menu_index=0, menu_closed=False, menu_moved=False),
+            commands=lambda: [("/team", "")],
+        )
+        ctx.run_wizard_step = lambda line: mod.wizard_step(ctx, line, [])
+        ctx.menu_items = lambda: mod.chat_menu_items(ctx)
+        entered = threading.Event()
+
+        def apply(mid, by, digest, cancel=None, progress=None):
+            entered.set()
+            while not cancel():
+                time.sleep(0.01)
+            raise mod.AgentCliError("installation canceled")
+
+        with seam(mod, "agents.apply_proposal", apply):
+            mod.chat_add_wizard(ctx, "go")
+            self.assertEqual(ctx.wizard["step"], "install_running")
+            self.assertTrue(entered.wait(1))
+            self.assertIn("pick:cancel", [value for _, value, _ in mod.chat_menu_items(ctx)])
+            event = ctx.wizard["cancel"]
+            mod.chat_wizard_back(ctx)
+            self.assertTrue(event.is_set())
+        self.assertEqual(ctx.wizard["step"], "proposal")
+
+        ctx.wizard = {"step": "proposal", "proposal": "m2", "digest": ""}
+        with seam(mod, "agents.apply_proposal", lambda *a, **k: ["done"]):
+            mod.wizard_step(ctx, "go", [])
+            deadline = time.monotonic() + 2
+            while ctx.wizard and time.monotonic() < deadline:
+                mod.pump_install_job(ctx)
+                time.sleep(0.01)
+        self.assertEqual(ctx.wizard, {})
+
     def test_collab_add_starts_an_agent_without_the_chat(self):
         # An agent could be added only by /add in the chat: a room could not be set up by a script.
         self.write_config([{"id": "owner", "label": "Андрей"}])
         opened: list[str] = []
         mod = self._launch_mod("collab_add_cli", opened)
+        self.enterContext(seam(mod, "agents.ensure_agent_cli", lambda kind, progress=None: "/bin/true"))
         self.enterContext(seam(mod, "installer.codex_room_rule", lambda pid, folder, label="": ""))
         work = self.root / "work"
         work.mkdir()
@@ -2882,6 +3034,7 @@ class RoomTest(Base):
 
         self.write_config([{"id": "owner", "label": "Андрей"}])
         mod = self._launch_mod("collab_add_trim", [])
+        self.enterContext(seam(mod, "agents.ensure_agent_cli", lambda *_args, **_kwargs: "/bin/true"))
         out = io.StringIO()
         with mock.patch.object(sys, "argv", ["collab", "add", "claude", "--name", "Own", "--context-trim", "120000:clear"]):
             with contextlib.redirect_stdout(out):
@@ -3047,8 +3200,10 @@ class RoomTest(Base):
         mod = _Loader("collab_mod", str(COLLAB)).load_module()
         for footer, model in (
             ("  GPT-6.1-Sol low fast · ~/WebstormProjects/collab-room · Reply with connection check", "GPT-6.1-Sol"),
+            ("  GPT-6.1-Sol default Fast · ~/WebstormProjects/collab-room · Reply with connection check", "GPT-6.1-Sol"),
             ("  GPT-6.1-Sol low · ~/WebstormProjects/collab-room · Подготовить план", "GPT-6.1-Sol"),
             ("  GPT-6 xhigh fast · ~/p", "GPT-6"),
+            ("  GPT-6.1-Sol default FAST · ~/p", ""),
         ):
             screen = f"› Ask Codex to do anything\n{footer}\n  ← for agents · ? for shortcuts\n"
             self.enterContext(
@@ -4628,11 +4783,19 @@ class RoomTest(Base):
         self.assertTrue(patterns)
         for command, rest in (
             ("say", f"--from {pid} --to all hi"),
+            ("take", f"--from {pid} parser"),
             ("ack", f"--for {pid} --no-reply --id 1"),
             ("inbox", f"--for {pid}"),
         ):
             hint = shlex.split(mod.room_cmd(command, rest, cli))
             self.assertTrue(any(hint[: len(pat)] == pat for pat in patterns), (hint, patterns))
+        # «Taking» in its brief is the command its rule allows: a bare `collab take` it would have asked the person for.
+        cfg = json.loads(self.cfg.read_text())
+        cfg["team"] = {"lead": "owner"}
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        line = next(x for x in mod.brief_of(pid, mod.load_config()).splitlines() if " take " in x)
+        cmd = shlex.split(line.split("no one: ", 1)[1].split(" '<", 1)[0])
+        self.assertTrue(any(cmd[: len(pat)] == pat for pat in patterns), (line, patterns))
 
     def test_a_codex_leads_commands_in_its_brief_and_round_are_what_its_rule_allows(self):
         # A Codex lead runs only what its rule names: its brief said nothing of proposing, and its round said a
@@ -5079,7 +5242,7 @@ class RoomTest(Base):
         self.assertEqual(cli.read_bytes(), COLLAB.read_bytes())
         self.assertEqual(oct(cli.stat().st_mode & 0o777), "0o444", "read-only")
         text = rules.read_text(encoding="utf-8")
-        self.assertEqual(text.count("prefix_rule("), 5 * len(mod.room_spellings()), text)  # say ack inbox propose goal
+        self.assertEqual(text.count("prefix_rule("), 6 * len(mod.room_spellings()), text)  # say take ack inbox propose goal
         self.assertNotIn(str(COLLAB), text, "never the checkout a sandboxed Codex might write")
         # What the room tells this agent is what the rule allows — and nothing around it.
         say = shlex.split(mod.room_cmd("say", f"--from {pid} --to all hi", str(cli)))
@@ -5283,6 +5446,138 @@ class RoomTest(Base):
             "an answer to another's message marks nothing for anyone",
         )
 
+    def test_a_plain_word_held_by_a_pause_answers_its_only_open_message_when_it_goes_out(self):
+        # Held by a pause, a say went out on resume as it was kept — no re, no receipt: the question stayed open.
+        self.run_collab("say", "--from", "owner", "--to", "codex", "a question")
+        asked = self.messages()[-1]["id"]
+        self.assertEqual(self.run_collab("pause").returncode, 0)
+        self.assertIn("Held", self.run_collab("say", "--from", "codex", "--to", "owner", "the answer").stdout)
+        self.assertEqual(self.run_collab("resume").returncode, 0)
+        sent = self.messages()[-1]
+        self.assertEqual((sent["text"], sent.get("re"), sent.get("re_auto")), ("the answer", asked, True))
+        self.assertIn("No unacknowledged", self.run_collab("inbox", "--for", "codex").stdout)
+        self.assertEqual(self.run_collab("pause").returncode, 0)
+        self.run_collab("say", "--from", "codex", "--to", "owner", "--re", asked, "more on it")
+        self.assertEqual(self.run_collab("resume").returncode, 0)
+        self.assertEqual((self.messages()[-1].get("re"), self.messages()[-1].get("re_auto")), (asked, None), "--re as given")
+
+    def test_a_plain_word_to_the_sender_answers_its_only_open_message_and_no_more(self):
+        # A say without --re to whoever asked left the question in the inbox and typed it again after
+        # a limit, while the wait counted it answered — and a word to everyone closed all at once.
+        say = lambda *a: self.run_collab("say", *a)
+        say("--from", "owner", "--to", "codex", "q1")
+        q1 = self.messages()[-1]["id"]
+        out = say("--from", "codex", "--to", "owner", "the answer").stdout
+        self.assertEqual(self.messages()[-1].get("re"), q1, "the only open one is the one answered")
+        self.assertIn(q1, out)
+        self.assertIn("No unacknowledged", self.run_collab("inbox", "--for", "codex").stdout)
+        say("--from", "owner", "--to", "codex", "q2")
+        say("--from", "owner", "--to", "codex", "q3")
+        q2, q3 = (m["id"] for m in self.messages()[-2:])
+        out = say("--from", "codex", "--to", "owner", "about which?").stdout
+        self.assertFalse(self.messages()[-1].get("re"), "of two open none is guessed")
+        self.assertIn(f"{q2}, {q3}", out, "the sender is told which are open")
+        say("--from", "codex", "--to", "all", "to everyone")
+        self.assertFalse(self.messages()[-1].get("re"))
+        inbox = self.run_collab("inbox", "--for", "codex").stdout
+        self.assertIn("q2", inbox)
+        self.assertIn("q3", inbox)
+        mod = _Loader(f"collab_answered_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        log = self.messages()
+        for m in log[-4:-2]:
+            w = {"id": m["id"], "at": m["at"], "from": "owner"}
+            self.assertFalse(mod.answered(w, "codex", log), "a word without --re answers no one of several")
+        say("--from", "claude", "--to", "codex", "--quiet", "taking the parser")
+        say("--from", "claude", "--to", "codex", "can you look?")
+        ask = self.messages()[-1]["id"]
+        say("--from", "codex", "--to", "claude", "--quiet", "taking the lexer")
+        self.assertFalse(self.messages()[-1].get("re"), "a quiet note answers nothing")
+        say("--from", "codex", "--to", "claude", "looking")
+        self.assertEqual(self.messages()[-1].get("re"), ask, "a quiet note is no question to answer")
+
+    def test_taking_is_told_to_everyone_by_its_command_and_wakes_no_one_and_inbox_reads_notes_once(self):
+        # «Taking» was quiet only when its sender remembered --quiet, and quiet notes hung in every inbox
+        # among the questions until an ack: the command marks it, and inbox reads such notes once.
+        r = self.run_collab("take", "--from", "codex", "the parser: src/parse.py")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        taking = self.messages()[-1]
+        self.assertEqual((taking["to"], taking.get("quiet"), taking["text"]), (["all"], True, "Taking: the parser: src/parse.py"))
+        self.run_collab("say", "--from", "owner", "--to", "claude", "a question")
+        out = self.run_collab("inbox", "--for", "claude").stdout
+        self.assertIn("a question", out)
+        self.assertIn("Taking: the parser: src/parse.py", out)
+        self.assertIn("no answer due", out)
+        again = self.run_collab("inbox", "--for", "claude").stdout
+        self.assertNotIn("Taking", again, "a note is read once")
+        self.assertIn("a question", again, "a question stays until answered or acked")
+        r = self.run_collab("take", "--from", "codex", "--task", "T1", "--kind", "fix", "the lexer")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("T1", self.run_collab("task", "show").stdout, "--task takes the task too")
+        self.assertEqual(self.run_collab("take", "--from", "codex", "--task", "T2", "no kind").returncode, 2)
+        self.assertNotIn("no kind", [m["text"] for m in self.messages()][-1], "refused before anything is said")
+
+    def test_inbox_reads_notes_that_wake_no_one_once_and_keeps_the_questions(self):
+        self.run_collab("say", "--from", "codex", "--to", "claude", "--quiet", "machine is free")
+        self.run_collab("say", "--from", "codex", "--to", "claude", "what about the parser?")
+        first = self.run_collab("inbox", "--for", "claude").stdout
+        self.assertIn("machine is free", first)
+        again = self.run_collab("inbox", "--for", "claude").stdout
+        self.assertNotIn("machine is free", again, "read once, no ack asked of anyone")
+        self.assertIn("what about the parser?", again)
+        self.assertIn("machine is free", self.run_collab("inbox", "--for", "claude", "--all").stdout)
+
+    def test_messages_left_unanswered_past_open_minutes_are_counted_and_told_once(self):
+        # Nothing counted what was left unanswered: «not delivered» was about typing, and a read question no one
+        # answered lay in the inbox with no trace in status or /team.
+        import datetime as dt
+
+        ago = lambda minutes: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        recs = []
+
+        def put(mid, minutes, **more):
+            recs.append({"id": mid, "at": ago(minutes), "from": "owner", "to": ["codex"], "text": mid, **more})
+
+        put("q_old", 40)
+        put("q_new", 5)
+        put("q_answered", 50)
+        put("q_closed", 45)
+        put("q_read", 42)
+        put("q_quiet", 41, **{"from": "claude", "quiet": True})
+        put("q_ancient", 3 * 24 * 60)
+        recs.append({"id": "a1", "at": ago(30), "from": "codex", "to": ["owner"], "text": "done", "re": "q_answered"})
+        put("q_auto", 48)  # a plain word to the sender answered it: not open here, though it still keeps /clear away
+        recs.append(
+            {"id": "a2", "at": ago(20), "from": "codex", "to": ["owner"], "text": "on it", "re": "q_auto", "re_auto": True}
+        )
+        self.run_collab("say", "--from", "owner", "--to", "claude", "the log begins")
+        with (self.state / "messages.jsonl").open("a", encoding="utf-8") as f:
+            f.writelines(json.dumps(r) + "\n" for r in recs)
+        self.run_collab("ack", "--for", "codex", "--no-reply", "--id", "q_closed")
+        self.run_collab("ack", "--for", "codex", "--id", "q_read")  # read is not answered
+        line = next(x for x in self.run_collab("status").stdout.splitlines() if "codex" in x)
+        self.assertIn("open: 2, the oldest 42 min", line)
+        mod = _Loader(f"collab_open_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        config = mod.load_config()
+        codex = next(q for q in config["participants"] if q["id"] == "codex")
+        tail = mod.open_tail(codex, config, mod.read_messages(), ["q_read"])
+        self.assertIn("q_old", tail)
+        self.assertNotIn("q_read", tail, "not the one being typed")
+        self.assertNotIn("q_auto", tail, "answered by a plain word")
+        self.assertTrue(mod.tell_open(codex, config, mod.read_messages()))
+        told = self.messages()[-1]
+        self.assertEqual((told["from"], told["to"]), ("room", ["codex"]))
+        self.assertIn("q_old, q_read", told["text"])
+        self.assertFalse(mod.tell_open(codex, config, mod.read_messages()), "once for each message")
+        cfg = json.loads(self.cfg.read_text())
+        cfg["open_minutes"] = 60
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        self.assertNotIn("open:", self.run_collab("status").stdout, "the room's own threshold")
+        cfg["open_minutes"] = 0
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        self.assertIn("open_minutes", self.run_collab("status").stderr)
+
     def test_the_feed_and_the_guide_count_columns(self):
         # The feed wrapped by characters and the /help frame measured with len() — a CJK
         # message or name came out wider than the window.
@@ -5315,7 +5610,7 @@ class RoomTest(Base):
         mod = _Loader("collab_guide_order", str(COLLAB)).load_module()
         expected = [
             "/open", "/dm", "/mine", "/answer", "/view", "/team", "/restart", "/add", "/pause", "/resume", "/rest",
-            "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/language", "/clear", "/stop", "/exit",
+            "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/vpn", "/language", "/clear", "/stop", "/exit",
         ]  # fmt: skip
         named: list[str] = []
         for line in mod.ANSI.sub("", mod.HELP("Андрей", full=True)).splitlines():
@@ -6024,7 +6319,10 @@ while True:
         self.assertEqual(read("take").count("ENTER"), 1, "typed once")
         self.assertEqual(read("draft"), [], "a person's draft in the input: nothing typed over it")
         self.assertEqual(delivered("draft"), set())
-        self.assertEqual(read("deaf").count("ENTER"), 1, "not seen taken: not typed again")
+        # Its own text still in the input: three Enters in all, one a tick — a loaded machine takes longer.
+        self.until(lambda: read("deaf").count("ENTER") >= 3, timeout=20)
+        time.sleep(2)
+        self.assertEqual(read("deaf").count("ENTER"), 3, "its own text still in the input: three Enters in all, no more")
         self.assertEqual(delivered("deaf"), set(), "and not marked delivered")
         self.assertEqual(read("ask"), [], "a question came up while typing: no Enter to answer it for the person")
         self.assertEqual(delivered("ask"), set())
@@ -6125,12 +6423,488 @@ while True:
         self.assertEqual(to, ["owner"])
         self.assertTrue(text.startswith("Yadro has not got your message of "), text)
         say("lead", 10)
-        ((to, text),) = told(working)
-        self.assertEqual(to, ["lead"], "a new late one: told about it alone")
-        self.assertTrue(text.startswith("Yadro has not got your message of "), text)
+        self.assertEqual(told(working), [], "a new late ID in the same stage does not repeat the notification")
         mod.write_set(mod.room().paths.delivered_dir, "yadro", {m["id"] for m in sent})
         self.assertEqual(told(working), [])
         self.assertEqual(mod.read_json(mod.room().paths.state_dir / "undelivered.json"), {"yadro": []}, "typed: forgotten")
+
+    def test_undelivered_episode_dedups_new_ids_and_restart_but_not_a_new_episode(self):
+        mod = _Loader("collab_episode_dedup", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda to, *a, **k: said.append((to, a, k))))
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)
+        first = mod.append_message("owner", ["yadro"], "first")
+        second = mod.append_message("owner", ["yadro"], "second")
+        messages = [{**m, "at": at.isoformat(timespec="seconds")} for m in (first, second)]
+        mod.tell_undelivered(p, "working", config, messages[:1])
+        mod.tell_undelivered(p, "working", config, messages)
+        self.assertEqual(len(said), 1, "new IDs in the same stage are not a new notification")
+        path = mod.room().paths.state_dir / "notification-episodes.json"
+        legacy = mod.read_json(path)
+        del legacy["yadro\towner"]["notice_sent"]
+        mod.write_json(path, legacy)
+        again = _Loader("collab_episode_dedup_restart", str(COLLAB)).load_module()
+        again.use_room(str(self.root))
+        again.tell_undelivered(p, "working", config, messages)
+        self.assertEqual(len(said), 1, "restart does not duplicate the episode")
+
+        mod.write_set(mod.room().paths.delivered_dir, "yadro", {first["id"], second["id"]})
+        mod.tell_undelivered(p, "working", config, messages)
+        third = mod.append_message("owner", ["yadro"], "third")
+        mod.tell_undelivered(p, "working", config, [{**third, "at": at.isoformat(timespec="seconds")}])
+        self.assertEqual(len(said), 2, "a closed episode allows a new one")
+
+    def test_notification_episode_stage_changes_and_partial_acceptance(self):
+        mod = _Loader("collab_episode_stages", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda to, *a, **k: said.append((to, a, k))))
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)
+        first = mod.append_message("lead", ["yadro"], "first")
+        second = mod.append_message("lead", ["yadro"], "second")
+        messages = [{**m, "at": at.isoformat(timespec="seconds")} for m in (first, second)]
+        mod.tell_undelivered(p, "working", config, messages)
+        mod.tell_drafted(p, "draft", config, messages)
+        mod.tell_undelivered(p, "working", config, messages)
+        mod.tell_drafted(p, "draft", config, messages)
+        self.assertEqual(
+            len([x for x in said if x[0] == ["lead"]]), 4, "each stable stage transition is one notification, A-B-A included"
+        )
+
+        mod.given(p, [first], config, set())
+        self.assertEqual(len([x for x in said if x[0] == ["lead"]]), 4, "acceptance itself adds no reply-wait notification")
+        data = mod.read_json(mod.room().paths.state_dir / "notification-episodes.json")
+        self.assertTrue(
+            any(not rec.get("accepted_ids") and second["id"] in rec.get("ids", []) for rec in data.values()),
+            "agent acceptance leaves no reply-wait ID and preserves the pending remainder",
+        )
+        mod.tell_undelivered(p, "working", config, messages)
+        self.assertEqual(
+            len([x for x in said if x[0] == ["lead"]]), 5, "the stage transition after partial acceptance is one notification"
+        )
+
+    def test_deliver_one_uses_one_stable_stage_for_working_held_draft(self):
+        mod = _Loader("collab_episode_working_held", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {
+            "id": "yadro",
+            "label": "Yadro",
+            "delivery": "tmux",
+            "target": "t:0",
+            "joined": True,
+            "idle": "^❯",
+            "busy": "^⏺ Working",
+        }
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda to, *a, **k: said.append((to, a, k))))
+        for name in ("screen.pane_guard", "screen.screen_model", "screen.claude_session_model"):
+            self.enterContext(seam(mod, name, lambda *a, **k: ""))
+        self.enterContext(seam(mod, "deliver.hold_for_limit", lambda *a, **k: False))
+        self.enterContext(seam(mod, "deliver.watch_for_reply", lambda *a, **k: None))
+        self.enterContext(seam(mod, "deliver.deliver_to", lambda *a, **k: ""))
+        mod.LEFT["yadro"] = {"held": True}
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)
+        message = mod.append_message("lead", ["yadro"], "held")
+        messages = [{**message, "at": at.isoformat(timespec="seconds")}]
+        working = "⏺ Working.\n────\n❯ \n────\n  ⏵⏵ auto mode on · esc to interrupt\n"
+        for _ in range(3):
+            out = lambda argv, working=working: SimpleNamespace(
+                returncode=0, stdout=working + (argv[-1] + "\n" if ";" in argv else ""), stderr=""
+            )
+            with seam(mod, "tmuxio.tmux", lambda *a, out=out, **k: out(a)):
+                mod.deliver_one(p, "t:0", config, messages)
+        self.assertEqual(len(said), 2, "owner and sender are told once, with no undelivered/draft churn")
+
+    def test_reply_closes_only_the_matching_accepted_id_not_a_new_wait(self):
+        mod = _Loader("collab_episode_reply_ids", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda to, *a, **k: said.append((to, a, k))))
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)
+        first = mod.append_message("owner", ["yadro"], "first")
+        second = mod.append_message("owner", ["yadro"], "second")
+        mod.given(p, [first], config, set())
+        mod.tell_undelivered(p, "working", config, [{**second, "at": at.isoformat(timespec="seconds")}])
+        self.assertEqual(len(said), 1)
+        reply = mod.append_message("yadro", ["owner"], "done first", re_=first["id"])
+        mod.watch_for_reply(p, "idle", [reply])
+        data = mod.read_json(mod.room().paths.state_dir / "notification-episodes.json")
+        self.assertTrue(
+            any(rec.get("stage") == "undelivered" for rec in data.values()), "the new wait is not the old accepted one"
+        )
+        mod.tell_undelivered(p, "working", config, [{**second, "at": at.isoformat(timespec="seconds")}])
+        self.assertEqual(len(said), 1, "the old reply does not reopen notification churn")
+
+        mod.given(p, [second], config, set())
+        reply = mod.append_message("yadro", ["owner"], "done second", re_=second["id"])
+        mod.watch_for_reply(p, "idle", [reply])
+        data = mod.read_json(mod.room().paths.state_dir / "notification-episodes.json")
+        self.assertFalse(any(rec.get("stage") == "accepted" and second["id"] in rec.get("ids", []) for rec in data.values()))
+
+    def test_urgent_is_reset_for_a_new_episode_after_acceptance(self):
+        mod = _Loader("collab_episode_urgent_reset", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda to, *a, **k: said.append((to, a, k))))
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)
+        old = mod.append_message("owner", ["yadro"], "old urgent", urgent=True)
+        mod.tell_undelivered(p, "working", config, [{**old, "at": at.isoformat(timespec="seconds")}])
+        mod.given(p, [old], config, set())
+        normal = mod.append_message("owner", ["yadro"], "new normal")
+        mod.tell_undelivered(p, "working", config, [{**normal, "at": at.isoformat(timespec="seconds")}])
+        urgent = mod.append_message("owner", ["yadro"], "new urgent", urgent=True)
+        mod.tell_undelivered(p, "working", config, [{**urgent, "at": at.isoformat(timespec="seconds")}])
+        self.assertEqual(len(said), 3, "old urgent, new normal and the new urgent escalation are distinct")
+        again = _Loader("collab_episode_urgent_reset_reload", str(COLLAB)).load_module()
+        again.use_room(str(self.root))
+        again.tell_undelivered(p, "working", config, [{**urgent, "at": at.isoformat(timespec="seconds")}])
+        self.assertEqual(len(said), 3, "reload does not repeat the new urgent episode")
+
+    def test_partial_acceptance_keeps_the_remaining_wait_and_owner_group_separate(self):
+        mod = _Loader("collab_episode_partial_batch", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda to, *a, **k: said.append((to, a, k))))
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)
+        first = mod.append_message("lead", ["yadro"], "first")
+        second = mod.append_message("lead", ["yadro"], "second")
+        mod.tell_undelivered(p, "working", config, [{**m, "at": at.isoformat(timespec="seconds")} for m in (first, second)])
+        self.assertEqual(len(said), 1)
+        mod.given(p, [first], config, set())
+        mod.tell_undelivered(p, "working", config, [{**second, "at": at.isoformat(timespec="seconds")}])
+        self.assertEqual(len(said), 1, "the already-notified remaining ID does not start another episode")
+        data = mod.read_json(mod.room().paths.state_dir / "notification-episodes.json")
+        self.assertTrue(any(second["id"] in rec.get("ids", []) for rec in data.values()))
+
+        owner_first = mod.append_message("owner", ["yadro"], "owner first")
+        owner_second = mod.append_message("owner", ["yadro"], "owner second")
+        mod.tell_drafted(
+            p,
+            "draft",
+            config,
+            [{**owner_first, "at": at.isoformat(timespec="seconds")}, {**owner_second, "at": at.isoformat(timespec="seconds")}],
+        )
+        mod.given(p, [owner_first], config, set())
+        mod.tell_drafted(p, "draft", config, [{**owner_second, "at": at.isoformat(timespec="seconds")}])
+        self.assertEqual(len(said), 2, "the owner group keeps the remaining wait without conflating its sender")
+
+    def test_acceptance_of_one_sender_does_not_hide_anothers_new_episode(self):
+        mod = _Loader("collab_episode_two_senders", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda to, *a, **k: said.append((to, a, k))))
+        at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)
+        first = mod.append_message("lead", ["yadro"], "first")
+        other = mod.append_message("owner", ["yadro"], "other")
+        mod.tell_undelivered(p, "working", config, [{**m, "at": at.isoformat(timespec="seconds")} for m in (first, other)])
+        self.assertEqual(len(said), 2)
+        mod.given(p, [first], config, set())
+        mod.tell_undelivered(p, "working", config, [{**other, "at": at.isoformat(timespec="seconds")}])
+        self.assertEqual(len(said), 2, "acceptance adds no reply-wait notification")
+        latest = mod.append_message("lead", ["yadro"], "latest")
+        mod.tell_undelivered(
+            p,
+            "working",
+            config,
+            [{**other, "at": at.isoformat(timespec="seconds")}, {**latest, "at": at.isoformat(timespec="seconds")}],
+        )
+        self.assertEqual(len(said), 3, "the other sender's new episode is not hidden by the accepted one")
+
+    def test_real_cmd_ack_and_no_reply_have_distinct_episode_effects(self):
+        mod = _Loader("collab_episode_real_ack", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        message = mod.append_message("owner", ["yadro"], "accepted")
+        mod.given(p, [message], config, set())
+        mod.cmd_ack(SimpleNamespace(participant="yadro", ids=[message["id"]], all=False, no_reply=False))
+        mod.watch_for_reply(p, "idle", [])
+        data = mod.read_json(mod.room().paths.state_dir / "notification-episodes.json")
+        self.assertTrue(any(message["id"] in rec.get("accepted_ids", []) for rec in data.values()), "plain cmd_ack only reads")
+        mod.cmd_ack(SimpleNamespace(participant="yadro", ids=[message["id"]], all=False, no_reply=True))
+        mod.watch_for_reply(p, "idle", [])
+        data = mod.read_json(mod.room().paths.state_dir / "notification-episodes.json")
+        self.assertFalse(
+            any(message["id"] in rec.get("accepted_ids", []) for rec in data.values()), "ack --no-reply closes the accepted wait"
+        )
+
+    def test_pending_all_survives_partial_acceptance_and_a_late_reply(self):
+        mod = _Loader("collab_episode_pending_all", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda to, *a, **k: said.append((to, a, k))))
+        old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)
+        first = mod.append_message("owner", ["yadro"], "old")
+        second = mod.append_message("owner", ["yadro"], "young")
+        messages = [{**first, "at": old.isoformat(timespec="seconds")}, second]
+        mod.tell_undelivered(p, "working", config, messages)
+        self.assertEqual(len(said), 1)
+        mod.given(p, [first], config, set())
+        path = mod.room().paths.state_dir / "notification-episodes.json"
+        rec = mod.read_json(path)["yadro\towner"]
+        self.assertEqual(rec["ids"], [second["id"]], "the young remainder is stored before it becomes due")
+        self.assertEqual(rec["accepted_ids"], [first["id"]])
+        self.assertTrue(rec["notice_sent"], "partial acceptance keeps the already-notified stage")
+
+        messages[1]["at"] = old.isoformat(timespec="seconds")
+        mod.tell_undelivered(p, "working", config, messages)
+        self.assertEqual(len(said), 1, "the remainder becoming due does not repeat its stage")
+        reply = mod.append_message("yadro", ["owner"], "done first", re_=first["id"])
+        mod.watch_for_reply(p, "idle", [reply])
+        rec = mod.read_json(path)["yadro\towner"]
+        self.assertEqual(rec["accepted_ids"], [])
+        self.assertEqual(rec["ids"], [second["id"]], "the late reply leaves the new delivery alone")
+
+    def test_people_acceptance_of_an_agent_sender_and_close_before_acceptance(self):
+        mod = _Loader("collab_episode_people_acceptance", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        self.enterContext(seam(mod, "log.room_line", lambda *a, **k: None))
+        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)).isoformat(timespec="seconds")
+        agent = mod.append_message("lead", ["yadro"], "agent")
+        human = mod.append_message("owner", ["yadro"], "human")
+        messages = [{**m, "at": old} for m in (agent, human)]
+        mod.tell_drafted(p, "draft", config, messages)
+        mod.given(p, [agent], config, set())
+        path = mod.room().paths.state_dir / "notification-episodes.json"
+        data = mod.read_json(path)
+        self.assertEqual(data["yadro\t*people"]["ids"], [human["id"]])
+        self.assertEqual(data["yadro\t*people"]["accepted_ids"], [])
+        self.assertEqual(data["yadro\towner"]["ids"], [human["id"]])
+        self.assertNotIn("yadro\tlead", data, "an accepted agent ID has no reply-wait record")
+
+        mod.cmd_ack(SimpleNamespace(participant="yadro", ids=[human["id"]], all=False, no_reply=True))
+        mod.tell_drafted(p, "draft", config, messages)
+        data = mod.read_json(path)
+        self.assertFalse(any(human["id"] in rec.get("ids", []) for rec in data.values()), "no-reply closes pending too")
+
+    def test_draft_idle_retry_keeps_pending_episode_until_closed(self):
+        mod = _Loader("collab_episode_idle_retry", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "delivery": "tmux", "target": "t:0", "idle": "^READY$"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda *a, **k: said.append(a)))
+        message = mod.append_message("owner", ["yadro"], "pending")
+        old = {**message, "at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)).isoformat()}
+        mod.tell_drafted(p, "draft", config, [old])
+        before = mod.read_json(mod.episode_path())
+        mod.tell_drafted(p, "idle", config, [old])
+        self.assertEqual(mod.read_json(mod.episode_path()), before, "idle does not empty a nonempty pending set")
+        mod.tell_drafted(p, "draft", config, [old])
+        self.assertEqual(len(said), 1, "retrying the same draft must not repeat the notice")
+        mod.cmd_ack(SimpleNamespace(participant="yadro", ids=[message["id"]], all=False, no_reply=True))
+        mod.tell_drafted(p, "idle", config, [old])
+        self.assertEqual(mod.read_json(mod.episode_path()), {}, "actual closure ends the pending episode")
+
+    def test_late_reply_and_no_reply_close_episodes_without_awaits(self):
+        mod = _Loader("collab_episode_late_closed", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "delivery": "tmux", "target": "t:0", "idle": "^READY$"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        self.enterContext(seam(mod, "log.room_line", lambda *a, **k: None))
+        for how in ("reply", "no-reply"):
+            with self.subTest(how=how):
+                first = mod.append_message("owner", ["yadro"], "accepted " + how)
+                mod.given(p, [first], config, set())
+                with mock.patch.dict(os.environ, {"COLLAB_QUIET_SECONDS": "0"}):
+                    mod.watch_for_reply(p, "idle", mod.read_messages())
+                self.assertEqual(mod.read_json(mod.room().paths.await_path), {})
+                second = mod.append_message("owner", ["yadro"], "new pending " + how)
+                old = {**second, "at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)).isoformat()}
+                mod.tell_drafted(p, "draft", config, [old])
+                before = mod.read_json(mod.episode_path())
+                mod.cmd_ack(SimpleNamespace(participant="yadro", ids=[first["id"]], all=False, no_reply=False))
+                mod.watch_for_reply(p, "idle", mod.read_messages())
+                self.assertEqual(mod.read_json(mod.episode_path()), before, "plain ack leaves accepted reply-wait intact")
+                if how == "reply":
+                    result = self.run_collab("say", "--from", "yadro", "--to", "owner", "--re", first["id"], "done")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                else:
+                    mod.cmd_ack(SimpleNamespace(participant="yadro", ids=[first["id"]], all=False, no_reply=True))
+                mod.watch_for_reply(p, "idle", mod.read_messages())
+                data = mod.read_json(mod.episode_path())
+                for key, rec in before.items():
+                    self.assertNotIn(first["id"], data[key].get("accepted_ids", []))
+                    self.assertEqual(data[key].get("ids"), rec.get("ids"), "late close preserves new pending")
+                    for field in ("stage", "notice_sent", "urgent", "first_at", "last_notice_at"):
+                        self.assertEqual(data[key].get(field), rec.get(field), field)
+                mod.cmd_ack(SimpleNamespace(participant="yadro", ids=[second["id"]], all=False, no_reply=True))
+                mod.tell_drafted(p, "idle", config, mod.read_messages())
+
+    def test_stage_without_due_does_not_suppress_the_next_stage_notice(self):
+        mod = _Loader("collab_episode_notice_sent", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, "idle": "^❯"}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        said = []
+        self.enterContext(seam(mod, "log.room_line", lambda to, *a, **k: said.append((to, a, k))))
+        message = mod.append_message("owner", ["yadro"], "stage")
+        old = {**message, "at": (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=12)).isoformat(timespec="seconds")}
+        mod.tell_undelivered(p, "working", config, [old])
+        self.assertEqual(len(said), 1)
+        mod.tell_drafted(p, "draft", config, [message])
+        path = mod.room().paths.state_dir / "notification-episodes.json"
+        rec = mod.read_json(path)["yadro\towner"]
+        self.assertEqual(rec["stage"], "draft")
+        self.assertFalse(rec["notice_sent"])
+        self.assertEqual(len(said), 1, "a stage without due IDs is silent")
+        mod.tell_undelivered(p, "working", config, [old])
+        self.assertEqual(len(said), 2, "A-B-A without an intermediate due still notifies the first due in A")
+
+    def test_the_people_and_a_sender_are_told_once_when_a_draft_in_an_agents_input_holds_its_messages(self):
+        # A text left unsent in the agent's input stopped all delivery to it until someone cleared it by hand, silently.
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_draft_told", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        rules = {k: v for k, v in mod.PRESETS["claude"].items() if k in mod.SCREEN_KEYS}
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, **rules}
+        self.write_config([{"id": "owner", "command": ["sh"]}, {"id": "lead", "delivery": "pull", **rules}, p])
+        for name in ("screen.pane_guard", "screen.screen_model", "screen.claude_session_model"):
+            self.enterContext(seam(mod, name, lambda *a, **k: ""))
+        self.enterContext(seam(mod, "deliver.hold_for_limit", lambda *a, **k: False))
+        self.enterContext(seam(mod, "deliver.watch_for_reply", lambda *a, **k: None))
+        self.enterContext(seam(mod, "deliver.deliver_to", lambda *a, **k: ""))
+        draft = "⏺ Done.\n────\n❯ half a sentence\n────\n  ⏵⏵ auto mode on\n"
+        ready = "⏺ Done.\n────\n❯ \n────\n  ⏵⏵ auto mode on\n"
+        sent: list[dict] = []
+
+        def say(sender, minutes):
+            rec = mod.append_message(sender, ["yadro"], "do it")
+            at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=minutes)
+            sent.append({**rec, "at": at.isoformat(timespec="seconds")})
+
+        def told(screen):
+            out = lambda argv: SimpleNamespace(returncode=0, stdout=screen + (argv[-1] + "\n" if ";" in argv else ""), stderr="")
+            before = len(mod.read_messages())
+            with seam(mod, "tmuxio.tmux", lambda *a, **k: out(a)):
+                mod.deliver_one(p, "t:0", mod.load_config(), list(sent))
+            return [(m["to"], m["text"]) for m in mod.read_messages()[before:]]
+
+        say("lead", 1)
+        self.assertEqual(told(draft), [], "a moment's draft: nothing yet")
+        sent[0]["at"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=3)).isoformat(timespec="seconds")
+        ((to, text), (to2, text2)) = told(draft)
+        self.assertEqual(to, ["owner"], "the person in the chat")
+        self.assertTrue(text.startswith("Yadro has an unsent text in its input"), text)
+        self.assertEqual(to2, ["lead"], "and the sender")
+        self.assertTrue(text2.startswith("Yadro has not got your message of "), text2)
+        self.assertEqual(told(draft), [], "once: not every tick")
+        say("lead", 3)
+        self.assertEqual(told(draft), [], "a new message behind the same draft does not repeat the notification")
+        say("owner", 3)
+        self.assertEqual(told(draft), [], "the person was told already")
+        self.assertEqual(told(ready), [], "cleared: nothing to tell")
+        self.assertEqual(told(draft), [], "idle/retry with the same pending IDs does not restart the episode")
+        log = mod.read_jsonl(mod.room().paths.state_dir / "deliver-log.jsonl")
+        self.assertEqual([r["reason"] for r in log], ["draft-held"] * 4, "each message newly held, in the room's file")
+        self.assertEqual(log[0]["ids"], [sent[0]["id"]])
+
+    def test_a_text_left_in_a_busy_input_without_its_enter_is_logged_with_its_time_past_a_restart(self):
+        # Why a message stayed out of a window was printed only on the deliverer's screen: each restart of the
+        # deliverer took it, and how often a text was left in an input without its Enter, and since when, was lost.
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_not_sent_log", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        rules = {k: v for k, v in mod.PRESETS["codex"].items() if k in mod.SCREEN_KEYS}
+        p = {"id": "yadro", "label": "Yadro", "delivery": "tmux", "target": "t:0", "joined": True, **rules}
+        self.write_config([{"id": "owner", "command": ["sh"]}, {"id": "lead", "delivery": "pull"}, p])
+        self.enterContext(seam(mod, "screen.pane_guard", lambda *a, **k: ""))
+        work = "• Working (6s • esc to interrupt)\n \n"
+        empty = work + "› Ask Codex to do anything\n \n  GPT-6.1-Sol default · /srv/room\n"
+        folded = work + "› [Pasted Content 300 chars]\n \n  GPT-6.1-Sol default · /srv/room\n"
+        keys: list[tuple] = []
+
+        def tmux(*argv, **_):
+            if argv[0] == "send-keys":
+                keys.append(argv)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            screen = folded if keys else empty
+            return SimpleNamespace(returncode=0, stdout=screen + (argv[-1] + "\n" if ";" in argv else ""), stderr="")
+
+        rec = mod.append_message("lead", ["yadro"], "check the build " * 18)
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        self.enterContext(mock.patch.dict(os.environ, {"COLLAB_ENTER_DELAY": "0"}))
+        got = mod.type_busy(
+            p,
+            "t:0",
+            rules,
+            [rec],
+            f"[lead → yadro] {rec['text']} (answer: collab say --re {rec['id']})",
+            mod.load_config(),
+            set(),
+        )
+        self.assertEqual(got, "")
+        self.assertNotIn(("send-keys", "-t", "t:0", "Enter"), keys, "folded: no Enter")
+        again = _Loader("collab_not_sent_log_restarted", str(COLLAB)).load_module()  # a new deliverer
+        again.use_room(str(self.root))
+        records = again.read_jsonl(again.room().paths.state_dir / "deliver-log.jsonl")
+        changed = [r for r in records if r["reason"] == "screen-changed"]
+        self.assertEqual(len(changed), 1)
+        line = changed[0]
+        self.assertEqual((line["to"], line["reason"], line["ids"]), ("yadro", "screen-changed", [rec["id"]]))
+        self.assertEqual({r["attempt_id"] for r in records}, {line["attempt_id"]})
+        at = dt.datetime.fromisoformat(line["at"])
+        self.assertLess(abs((dt.datetime.now(dt.timezone.utc) - at).total_seconds()), 60, "its time")
+
+    def test_the_rooms_log_of_unsent_messages_stays_small_and_keeps_the_newest(self):
+        mod = _Loader("collab_not_sent_trim", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.enterContext(seam(mod, "deliver.DELIVER_LOG_BYTES", 2000))
+        for i in range(200):
+            mod.not_sent("yadro", "screen-changed", [f"id{i:03}"])
+        path = mod.room().paths.state_dir / "deliver-log.jsonl"
+        self.assertLess(path.stat().st_size, 2 * 2000)
+        log = mod.read_jsonl(path)
+        self.assertEqual(log[-1]["ids"], ["id199"], "the newest kept")
+        self.assertIs(log[-1]["complete"], False, "rotation marks an incomplete observation window")
+        self.assertGreater(len(log), 5)
+
+    def test_the_rooms_log_of_unsent_messages_keeps_a_record_with_a_line_separator_whole(self):
+        # Written as it is (not \\u-escaped), a text's U+2028 was taken for a line's end: the record read back as
+        # two broken lines and was lost, and the halving could cut it in the middle.
+        mod = _Loader("collab_not_sent_u2028", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.enterContext(seam(mod, "deliver.DELIVER_LOG_BYTES", 2000))
+        for i in range(201):
+            mod.not_sent("yadro", "enter-gave-up", [f"/clear{i:03}\u2028x"])
+        path = mod.room().paths.state_dir / "deliver-log.jsonl"
+        raw = path.read_text(encoding="utf-8").split("\n")
+        self.assertEqual(raw[-1], "", "ends with a line's end")
+        self.assertEqual([json.loads(line)["reason"] for line in raw[:-1]], ["enter-gave-up"] * (len(raw) - 1), "no broken line")
+        self.assertEqual(mod.read_jsonl(path)[-1]["ids"], ["/clear200\u2028x"], "the newest kept, whole")
 
     def test_the_background_clock_starts_at_the_first_command_seen_and_runs_on_over_ready(self):
         # Ready while background agents still run — the time goes on, from the earliest
@@ -7466,10 +8240,10 @@ class ReportTest(Base):
 
     def test_report_without_git_says_so(self):
         # No git at all came out as a FileNotFoundError traceback.
-        out = self.merge(f"{sys.executable} -c pass", timeout=60)
         self.assertNotEqual(out.returncode, 0)
         self.assertIn("git push refused", out.stderr)
         self.assertIn("no-rights", out.stderr)
+        self.assertEqual(self.activity_phases(), {"claude": "failed"}, "green checks are not a successful push")
 
 
 class TmuxRefusalTest(Base):
@@ -7516,7 +8290,10 @@ class DeliveryTest(Base):
         stubs = self.root / "_stubs"
         stubs.mkdir()
         for name in ("claude", "codex"):
-            (stubs / name).write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+            (stubs / name).write_text(
+                '#!/bin/sh\nif [ "$1" = "--version" ]; then echo test-version; exit 0; fi\nsleep 30\n',
+                encoding="utf-8",
+            )
             (stubs / name).chmod(0o755)
         os.environ["PATH"] = f"{stubs}{os.pathsep}{os.environ['PATH']}"  # restored with the environment
         self.session = f"collab-test-{uuid.uuid4().hex[:6]}"
@@ -7653,14 +8430,18 @@ class DeliveryTest(Base):
         self.addCleanup(shutil.rmtree, old.parent, True)
         old.write_text(f"import pathlib, time\npathlib.Path({str(ran_old)!r}).write_text('old')\ntime.sleep(60)\n")
         self.write_config(
-            [{"id": "owner", "command": ["python3", str(old), "chat", "--as", "owner"], "delivery": "pull"}], session=session
+            [
+                {"id": "owner", "label": "Owner", "command": ["python3", str(old), "chat", "--as", "owner"], "delivery": "pull"},
+                {"id": "ann", "label": "Ann", "pane": False},
+            ],
+            session=session,
         )
         try:
             started = self.run_collab("start")
             self.assertEqual(started.returncode, 0, started.stderr)
             self.assertNotIn("besides your chat", started.stdout, "the recorded chat is still started unasked")
 
-            def chat_args():
+            def chat_args(kind="chat"):
                 pids = subprocess.run(
                     ["tmux", "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_pid}"], capture_output=True, text=True
                 ).stdout.split()
@@ -7673,7 +8454,7 @@ class DeliveryTest(Base):
                 found = [
                     row[2]
                     for row in table
-                    if len(row) == 3 and (row[0] in pids or row[1] in pids) and " chat --as owner" in row[2]
+                    if len(row) == 3 and (row[0] in pids or row[1] in pids) and f" {kind} --as owner" in row[2]
                 ]
                 return found
 
@@ -7682,6 +8463,15 @@ class DeliveryTest(Base):
             self.assertIn(str(COLLAB), found[0])
             self.assertNotIn(str(old), " ".join(found))
             self.assertFalse(ran_old.exists(), "the old copy was started")
+            pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+            self.assertTrue(self.wait_chat(pane, "Owner → Everyone"))
+            subprocess.run(["tmux", "resize-window", "-t", pane, "-x", "135", "-y", "35"], check=True)
+            self.type_in(pane, "/dm Ann")
+            subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
+            private = self.until(lambda: chat_args("dm"))
+            self.assertTrue(private, "the reopened chat opened its private panel")
+            self.assertIn(str(COLLAB), private[0])
+            self.assertNotIn(str(old), " ".join(private), "the panel inherits the current chat build")
         finally:
             subprocess.run(["tmux", "kill-session", "-t", f"={session}"], capture_output=True)
 
@@ -7978,7 +8768,9 @@ class DeliveryTest(Base):
         time.sleep(0.3)  # READY again
         self.note("other", ["agent"], "Merge queue: other landed", quiet=True)
         self.assertNotIn("→ agent", self.run_collab("deliver", "--once").stdout, "quiet notes alone wake no one")
-        self.assertIn("Merge queue: other landed", self.run_collab("inbox", "--for", "agent").stdout, "they wait in the inbox")
+        delivered = self.state / "delivered" / "agent.json"
+        landed = self.messages()[-1]["id"]
+        self.assertNotIn(landed, json.loads(delivered.read_text()) if delivered.exists() else [], "they wait")
         self.note("other", ["agent"], "a real question")
         self.assertEqual(self.run_collab("deliver", "--once").stdout.count("→ agent"), 1)
         joined = lambda: (
@@ -8068,8 +8860,10 @@ class DeliveryTest(Base):
         # landed is in main, its next idle moment gets /clear — after any real message, never instead of it.
         # Only by its memory: a lead set to «keep» was cleared after landing a release.
         agent = self.root / "agent.sh"
+        # A line-reading fake has no «❯» input line to check a paste by: typed as keys, as any fake.
         seat = lambda pid, kind, **more: {
-            "id": pid, "kind": kind, "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$", **more
+            "id": pid, "kind": kind, "command": [str(agent)], "delivery": "tmux", "idle": r"^READY$",
+            "bracketed_paste": False, **more
         }  # fmt: skip
         self.write_config(
             [
@@ -8211,8 +9005,13 @@ class DeliveryTest(Base):
         # «Clear» is after handing in the work — its answer (--re) to the task from whom it reports to — not by the
         # size of its context; a note on the way is not handing in.
         agent = self.root / "agent.sh"
+        # Its assignment with the commands in it is longer than a terminal's line (1024 on macOS): read raw.
+        agent.write_text(
+            '#!/bin/sh\nstty -icanon\necho READY\nwhile read l; do echo "got:$l"; echo READY; done\n', encoding="utf-8"
+        )
+        # A line-reading fake has no «❯» input line to check a paste by: typed as keys, as any fake.
         seat = lambda pid, **more: {"id": pid, "label": pid.capitalize(), "kind": "claude", "command": [str(agent)],
-                                    "delivery": "tmux", "idle": r"^READY$", **more}  # fmt: skip
+                                    "delivery": "tmux", "idle": r"^READY$", "bracketed_paste": False, **more}  # fmt: skip
         handoff = {"do": "clear", "after": "handoff"}
         self.write_config(
             [{"id": "owner"}, seat("lea", role="lead"), seat("wes", role="worker", context_trim=handoff)], session=self.session
@@ -8256,6 +9055,26 @@ class DeliveryTest(Base):
         self.assertIsNone(mod.trim_due(wes, config, [task]), "nothing handed in yet")
         answer = {"id": "a1", "from": "wes", "to": ["owner"], "re": "t1", "at": "2099-01-01T10:05:00+00:00", "text": "$12"}
         self.assertEqual((mod.trim_due(wes, config, [task, answer]) or ("",))[0], "clear")
+
+    def test_a_word_on_the_way_to_a_new_task_keeps_clear_away_after_an_earlier_handing_in(self):
+        # Task 1 handed in with --re, task 2 came, and «working on it» (said without --re, so it named task 2
+        # by itself) lifted the last barrier: the earlier handing in let /clear take task 2 away.
+        mod = _Loader(f"collab_handoff_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        wes = {"id": "wes", "label": "Wes", "kind": "claude", "pane": False, "idle": "x"}
+        wes["context_trim"] = {"do": "clear", "after": "handoff"}
+        config = {"version": 2, "participants": [{"id": "owner"}, wes]}
+        at = lambda mm: f"2099-01-01T10:{mm}:00+00:00"
+        log = [
+            {"id": "t1", "from": "owner", "to": ["wes"], "at": at("00"), "text": "task 1"},
+            {"id": "a1", "from": "wes", "to": ["owner"], "re": "t1", "at": at("05"), "text": "done"},
+            {"id": "t2", "from": "owner", "to": ["wes"], "at": at("06"), "text": "task 2"},
+        ]
+        self.assertIsNone(mod.trim_due(wes, config, log), "task 2 is open")
+        log.append({"id": "a2", "from": "wes", "to": ["owner"], "re": "t2", "re_auto": True, "at": at("07"), "text": "on it"})
+        self.assertIsNone(mod.trim_due(wes, config, log), "a word on the way is no handing in of task 2")
+        log.append({"id": "a3", "from": "wes", "to": ["owner"], "re": "t2", "at": at("09"), "text": "task 2 done"})
+        self.assertEqual((mod.trim_due(wes, config, log) or ("",))[0], "clear", "handed in with --re: cleared")
 
     def test_clear_after_handing_in_waits_while_the_agent_still_holds_a_task(self):
         # A part handed in while its task is still taken: the work goes on, and a /clear took what came next with it.
@@ -8936,6 +9755,16 @@ class DeliveryTest(Base):
         """Until a chat has started and drawn its input line: one term for all of them — a start, not a step."""
         return self.wait_for(pane, needle, timeout=self.CHAT_START)
 
+    def wait_all(self, pane, *needles, timeout=30.0):
+        """All of them on one look at the screen."""
+        end = time.time() + timeout
+        while time.time() < end:
+            shown = self.screen(pane)
+            if all(n in shown for n in needles):
+                return True
+            time.sleep(0.1)
+        return False
+
     def wait_for(self, pane, needle, timeout=30.0):
         # 30 s, not 5 or 10: under a full parallel run at the queue's low priority a chat's redraw took
         # longer, and steps of several chat tests failed once a run. A pass is as fast.
@@ -9070,6 +9899,7 @@ class DeliveryTest(Base):
                 "pane_pid": "111",
                 **{k: mod.PRESETS["codex"][k] for k in ("idle", "draft")},
             }
+            mod.LEFT.clear()
             mod.deliver_to(p, "%1", "idle", {"participants": [{"id": "owner"}, p]})
             return len(enters)
 
@@ -9118,6 +9948,7 @@ class DeliveryTest(Base):
         self.enterContext(seam(mod, "tmuxio.tmux", tmux))
         p = {"id": "klode", "kind": "claude", "delivery": "tmux", "pane_pid": "111"}
         p.update({k: v for k, v in mod.PRESETS["claude"].items() if k in mod.SCREEN_KEYS})
+        mod.LEFT.clear()  # each call a delivery of its own, not the text the last one left
         mod.deliver_to(p, "%1", "working" if working else "idle", {"participants": [{"id": "owner"}, p]})
         return asked, said
 
@@ -9159,6 +9990,1092 @@ class DeliveryTest(Base):
         self.assertNotIn(("send-keys", "-t", "%1", "Enter"), asked, "the middle of the text in its input: no Enter")
         asked, _ = self.deliver_to_claude(mod, "────\n❯ [owner → klode] ⟦hi⟧\n────\n")
         self.assertIn(("send-keys", "-t", "%1", "Enter"), asked, "its start in the input: sent")
+
+    @staticmethod
+    def claude_box(text, rows=30, cap=None, cols=60):
+        """A Claude screen of `rows` rows with `text` in its input box, wrapped to the window: the whole of it, or with
+        `cap` its last `cap` rows only — the first of them marked ❯, as Claude Code shows a box scrolled to its end."""
+        import textwrap
+
+        wrapped = textwrap.wrap(text, cols - 2, break_long_words=True)
+        shown = wrapped[-cap:] if cap else wrapped
+        box = ["❯ " + shown[0]] + ["  " + row for row in shown[1:]]
+        footer = ["─" * cols] + box + ["─" * cols, "  ⏵⏵ auto mode on (shift+tab to cycle)"]
+        return "\n".join(["▐▛███▛█   Claude Code"] + [""] * (rows - 1 - len(footer)) + footer) + "\n"
+
+    def test_a_long_message_in_a_narrow_claude_window_gets_its_enter(self):
+        # 60 columns: a 600-sign message wrapped to more rows than the 10 bottom lines, and the input line was looked
+        # for there only — not found, no Enter, the message stood as a draft and stopped all delivery to the agent.
+        mod = _Loader("collab_claude_narrow", str(COLLAB)).load_module()
+        text = "[owner → klode] ⟦" + " ".join(f"word{i:03d}" for i in range(85)) + "⟧ (you: worker · answer: run it)"
+        self.assertGreater(len(text), 600)
+        for screen, why in (
+            (self.claude_box(text, rows=30, cap=10), "its box at its height (30 rows: 10) scrolled to its end"),
+            (self.claude_box(text, rows=60), "its box as tall as the text, its start on top"),
+        ):
+            asked, _ = self.deliver_to_claude(mod, screen, text=text)
+            self.assertIn(("send-keys", "-t", "%1", "Enter"), asked, why)
+        for screen, why in (
+            (self.claude_box(text, rows=30, cap=5), "a short box with the tail only: its start lost"),
+            (self.claude_box(text, rows=50, cap=10), "lower than its height (50 rows: 20) and not its start"),
+            (self.claude_box(text[:640], rows=30, cap=10), "its rows are the text's middle, not its end"),
+        ):
+            asked, _ = self.deliver_to_claude(mod, screen, text=text)
+            self.assertNotIn(("send-keys", "-t", "%1", "Enter"), asked, why)
+
+    def test_a_text_left_in_a_tall_claude_input_box_reads_as_a_draft(self):
+        # Its first row above the bottom lines, the unsent text read as «unknown»: nobody was told why delivery stopped.
+        mod = _Loader("collab_claude_tall_draft", str(COLLAB)).load_module()
+        from types import SimpleNamespace
+
+        rules = {k: v for k, v in mod.PRESETS["claude"].items() if k in mod.SCREEN_KEYS}
+        screen = self.claude_box("a draft " * 120, rows=30, cap=10)
+        shot = SimpleNamespace(returncode=0, stdout=screen)
+        self.assertEqual(mod.screen_state(rules, "%1", shot)[0], "draft")
+
+    def test_a_set_buffer_not_answered_in_time_leaves_no_message_text_in_a_tmux_buffer(self):
+        # tmux not answering in time (124) may still have set the buffer: it was left on the server with the text.
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_set_buffer_late", str(COLLAB)).load_module()
+        asked = []
+
+        def tmux(*a, **k):
+            asked.append(a)
+            return SimpleNamespace(returncode=124 if a[0] == "set-buffer" else 0, stdout="", stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        self.assertEqual(mod.type_text({"bracketed_paste": True}, "%1", "secret text").returncode, 124)
+        buffer = next(a[a.index("-b") + 1] for a in asked if a[0] == "set-buffer")
+        self.assertIn(("delete-buffer", "-b", buffer), asked, "the buffer it may have set is removed")
+        self.assertFalse([a for a in asked if a[0] == "paste-buffer"], "nothing pasted")
+
+    def test_no_enter_when_a_claudes_input_is_not_the_whole_start_of_the_text(self):
+        # Only the first 16 signs were compared — the room's head, the same in every message; a fold was taken
+        # whatever followed it, and a screen with no input line at all went as before.
+        mod = _Loader("collab_claude_whole_start", str(COLLAB)).load_module()
+        text = "[owner → klode] ⟦hi⟧"
+        for screen, why in (
+            ("────\n❯ [owner → klode] ⟦hi there, my draft⟧\n────\n", "the same head, another text"),
+            ("────\n❯ [Pasted text #1] and a draft\n────\n", "a fold with someone's words after it"),
+            ("Press any key to continue\n", "no input line to judge by"),
+        ):
+            asked, _ = self.deliver_to_claude(mod, screen, text=text)
+            self.assertNotIn(("send-keys", "-t", "%1", "Enter"), asked, why)
+        for screen, why in (
+            ("────\n❯ [owner → klode] ⟦hi⟧\n────\n", "the whole text"),
+            ("────\n❯ [Pasted text #1 +3 lines]\n────\n", "its fold alone"),
+        ):
+            asked, _ = self.deliver_to_claude(mod, screen, text=text)
+            self.assertIn(("send-keys", "-t", "%1", "Enter"), asked, why)
+
+    def test_a_codex_still_starting_does_not_hold_the_rooms_lock_and_gets_its_enter_on_a_later_tick(self):
+        # Its Enter given while it started, the deliverer waited up to 20 s for the start under the room's lock:
+        # say and ack waited all that time.
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_codex_start_unlocked", str(COLLAB)).load_module()
+        os.environ["COLLAB_ENTER_DELAY"] = "0"
+        self.addCleanup(os.environ.pop, "COLLAB_ENTER_DELAY", None)
+        m = {"id": "m1", "from": "owner", "to": ["kodi"], "at": "2026-10-18T06:00:00", "text": "hi"}
+        marked, slept, clock = [], [], [0.0]
+        for name, value in {
+            "log.read_log_tick": lambda: [m],
+            "log.read_set": lambda *a: set(),
+            "log.write_set": lambda d, pid, ids: marked.append(set(ids)),
+            "log.closed_by": lambda *a: set(),
+            "store.write_json": lambda *a: None,
+            "store.read_json": lambda *a: {},
+        }.items():
+            self.enterContext(seam(mod, name, value))
+
+        def sleep(s):
+            slept.append(s)
+            clock[0] += s
+
+        self.enterContext(seam(time, "sleep", sleep))
+        self.enterContext(seam(time, "time", lambda: clock[0]))
+        asked, started, enters_then = [], [False], [9]
+        text = "[owner → kodi] ⟦hi⟧"
+        self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: text))
+        fold = f"› [Pasted Content {len(text)} chars]\n"
+
+        def tmux(*a, **k):
+            asked.append(a)
+            if "capture-pane" in a:
+                entered = asked.count(("send-keys", "-t", "%1", "Enter"))
+                screen = (
+                    (fold if started[0] else fold + "  Waiting for startup  · esc cancel\n")
+                    if entered and not (started[0] and entered > enters_then[0])
+                    else "› Ask Codex to do anything\n"
+                )
+                mark = a[-1].split("\t")[0] + "\t" if ";" in a else ""
+                return SimpleNamespace(returncode=0, stdout=screen + (mark + "0\t111\tcodex\n" if mark else ""), stderr="")
+            if "#{pane_in_mode}" in a:
+                return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="111\tcodex\n", stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        p = {"id": "kodi", "kind": "codex", "delivery": "tmux", "pane_pid": "111"}
+        p.update({k: v for k, v in mod.PRESETS["codex"].items() if k in mod.SCREEN_KEYS})
+        config = {"participants": [{"id": "owner"}, p]}
+        self.assertEqual(mod.deliver_to(p, "%1", "idle", config), "", "not delivered while it starts")
+        self.assertLess(sum(slept), 2, "the room's lock is not held for its start")
+        self.assertFalse(any("m1" in ids for ids in marked), "not marked delivered")
+        self.assertEqual(mod.deliver_to(p, "%1", "joining", config), "", "still starting: nothing")
+        typed = len([a for a in asked if a[:1] == ("send-keys",) and "-l" in a])
+        started[0] = True
+        enters = enters_then[0] = asked.count(("send-keys", "-t", "%1", "Enter"))
+        self.assertEqual(mod.deliver_to(p, "%1", "idle", config), "m1", "started since: delivered")
+        self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), enters + 1, "its fold left gets one more Enter")
+        self.assertEqual(len([a for a in asked if a[:1] == ("send-keys",) and "-l" in a]), typed, "not typed again")
+        self.assertTrue(any("m1" in ids for ids in marked))
+
+    def test_a_codex_started_since_gets_no_enter_into_a_fold_of_another_length(self):
+        # The fold left while it started was pressed once it had started, whatever fold stood there: a person who
+        # cleared ours and pasted their own text meanwhile got our Enter — their draft sent.
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_codex_start_theirs", str(COLLAB)).load_module()
+        os.environ["COLLAB_ENTER_DELAY"] = "0"
+        self.addCleanup(os.environ.pop, "COLLAB_ENTER_DELAY", None)
+        m = {"id": "m1", "from": "owner", "to": ["kodi"], "at": "2026-10-18T06:00:00", "text": "hi"}
+        marked, slept, clock = [], [], [0.0]
+        for name, value in {
+            "log.read_log_tick": lambda: [m],
+            "log.read_set": lambda *a: set(),
+            "log.write_set": lambda d, pid, ids: marked.append(set(ids)),
+            "log.closed_by": lambda *a: set(),
+            "store.write_json": lambda *a: None,
+            "store.read_json": lambda *a: {},
+        }.items():
+            self.enterContext(seam(mod, name, value))
+
+        def sleep(s):
+            slept.append(s)
+            clock[0] += s
+
+        self.enterContext(seam(time, "sleep", sleep))
+        self.enterContext(seam(time, "time", lambda: clock[0]))
+        asked, started, enters_then = [], [False], [9]
+        text = "[owner → kodi] ⟦hi⟧"
+        self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: text))
+        fold = f"› [Pasted Content {len(text)} chars]\n"
+
+        def tmux(*a, **k):
+            asked.append(a)
+            if "capture-pane" in a:
+                entered = asked.count(("send-keys", "-t", "%1", "Enter"))
+                screen = (
+                    (fold if started[0] else fold + "  Waiting for startup  · esc cancel\n")
+                    if entered and not (started[0] and entered > enters_then[0])
+                    else "› Ask Codex to do anything\n"
+                )
+                mark = a[-1].split("\t")[0] + "\t" if ";" in a else ""
+                return SimpleNamespace(returncode=0, stdout=screen + (mark + "0\t111\tcodex\n" if mark else ""), stderr="")
+            if "#{pane_in_mode}" in a:
+                return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="111\tcodex\n", stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        p = {"id": "kodi", "kind": "codex", "delivery": "tmux", "pane_pid": "111"}
+        p.update({k: v for k, v in mod.PRESETS["codex"].items() if k in mod.SCREEN_KEYS})
+        config = {"participants": [{"id": "owner"}, p]}
+        self.assertEqual(mod.deliver_to(p, "%1", "idle", config), "", "not delivered while it starts")
+        self.assertLess(sum(slept), 2, "the room's lock is not held for its start")
+        self.assertFalse(any("m1" in ids for ids in marked), "not marked delivered")
+        self.assertEqual(mod.deliver_to(p, "%1", "joining", config), "", "still starting: nothing")
+        started[0] = True
+        fold = "› [Pasted Content 512 chars]\n"  # theirs now
+        enters = enters_then[0] = asked.count(("send-keys", "-t", "%1", "Enter"))
+        self.assertEqual(mod.deliver_to(p, "%1", "idle", config), "", "not ours: not delivered")
+        self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), enters, "their fold gets no Enter of ours")
+        self.assertFalse(any("m1" in ids for ids in marked))
+
+    def fake_input(self, mod, kind, screens, messages=None, enter_returncode=0, pane_in_mode="0", pane_pid="111"):
+        """A fake agent window: `screens(asked)` gives its screen from what tmux was asked so far. What was marked
+        delivered, what tmux was asked, and a tick: deliver_to(state) → its result."""
+        from types import SimpleNamespace
+
+        os.environ["COLLAB_ENTER_DELAY"] = "0"
+        self.addCleanup(os.environ.pop, "COLLAB_ENTER_DELAY", None)
+        m = messages or [{"id": "m1", "from": "owner", "to": ["kodi"], "at": "2026-10-18T06:00:00", "text": "hi"}]
+        marked, asked, clock = [], [], [0.0]
+        for name, value in {
+            "log.read_log_tick": lambda: m,
+            "log.read_set": lambda *a: set(),
+            "log.write_set": lambda d, pid, ids: marked.append(set(ids)),
+            "log.closed_by": lambda *a: set(),
+            "store.write_json": lambda *a: None,
+            "store.read_json": lambda *a: {},
+        }.items():
+            self.enterContext(seam(mod, name, value))
+        self.enterContext(seam(time, "sleep", lambda s: clock.__setitem__(0, clock[0] + s)))
+        self.enterContext(seam(time, "time", lambda: clock[0]))
+
+        def tmux(*a, **k):
+            asked.append(a)
+            if "capture-pane" in a:
+                mark = a[-1].split("\t")[0] + "\t" if ";" in a else ""
+                guard = f"{pane_in_mode}\t{pane_pid}\t{kind}\n"
+                return SimpleNamespace(returncode=0, stdout=screens(asked) + (mark + guard if mark else ""), stderr="")
+            if "#{pane_in_mode}" in a:
+                return SimpleNamespace(returncode=0, stdout=f"{pane_in_mode}\n", stderr="")
+            if a == ("send-keys", "-t", "%1", "Enter"):
+                return SimpleNamespace(returncode=enter_returncode, stdout="", stderr="refused")
+            return SimpleNamespace(returncode=0, stdout=f"{pane_pid}\t{kind}\n", stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        p = {"id": "kodi", "kind": kind, "delivery": "tmux", "pane_pid": pane_pid}
+        p.update({k: v for k, v in mod.PRESETS[kind].items() if k in mod.SCREEN_KEYS})
+        config = {"participants": [{"id": "owner"}, p]}
+        return marked, asked, clock, lambda state="idle": mod.deliver_to(p, "%1", state, config)
+
+    def test_an_enter_swallowed_leaves_the_message_unmarked_and_its_text_is_pressed_again(self):
+        # An Enter that came while Claude still took in the paste was lost: the text stood in its input, and the
+        # message was marked delivered all the same — nobody was told, and the agent never read it.
+        mod = _Loader("collab_enter_swallowed", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        enters = lambda asked: asked.count(("send-keys", "-t", "%1", "Enter"))
+        taken_after = [2]  # the Enter that takes it
+
+        def screens(asked):
+            pasted = any(a[:1] == ("paste-buffer",) for a in asked)
+            if not pasted or enters(asked) >= taken_after[0]:
+                return "────\n❯ \n────\n  ⏵⏵ auto mode on\n"
+            return "────\n❯ [owner → kodi] ⟦hi⟧\n────\n  ⏵⏵ auto mode on\n"
+
+        marked, asked, clock, tick = self.fake_input(mod, "claude", screens)
+        self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: "[owner → kodi] ⟦hi⟧"))
+        self.assertEqual(tick(), "", "its Enter swallowed: not delivered")
+        self.assertFalse(any("m1" in ids for ids in marked), "not marked")
+        self.assertEqual(enters(asked), 1)
+        clock[0] += 2
+        self.assertEqual(tick("draft"), "", "its text still there, exactly ours: one more Enter")
+        self.assertEqual(enters(asked), 2)
+        self.assertEqual(len([a for a in asked if a[:1] == ("paste-buffer",)]), 1, "never typed again")
+        clock[0] += 2
+        self.assertEqual(tick("working"), "m1", "its input empty after that Enter: delivered")
+        self.assertTrue(any("m1" in ids for ids in marked))
+        records = mod.read_jsonl(mod.deliver_log_path())
+        self.assertEqual(
+            [r["reason"] for r in records],
+            ["eligible", "paste-start", "ok", "ok", "enter-not-taken", "enter-again", "taken"],
+        )
+        self.assertEqual(len({r["attempt_id"] for r in records}), 1)
+        self.assertEqual((records[-1]["stage"], records[-1]["acceptance"], records[-1]["enter"]), ("acceptance", "empty", 2))
+
+    def test_a_message_taken_at_its_first_enter_leaves_its_line_in_the_log_too(self):
+        # Only the retries wrote «taken»: a message delivered at once had no line at all, and the log did not hold
+        # every outcome.
+        mod = _Loader("collab_enter_first", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+
+        def screens(asked):
+            if asked.count(("send-keys", "-t", "%1", "Enter")) or not any(a[:1] == ("paste-buffer",) for a in asked):
+                return "────\n❯ \n────\n  ⏵⏵ auto mode on\n"
+            return "────\n❯ [owner → kodi] ⟦hi⟧\n────\n  ⏵⏵ auto mode on\n"
+
+        marked, asked, clock, tick = self.fake_input(mod, "claude", screens)
+        self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: "[owner → kodi] ⟦hi⟧"))
+        self.assertEqual(tick(), "m1")
+        records = mod.read_jsonl(mod.deliver_log_path())
+        self.assertEqual([r["stage"] for r in records], ["eligible", "paste-start", "paste-result", "enter-result", "acceptance"])
+        self.assertEqual(len({r["run_id"] for r in records}), 1)
+        self.assertEqual(len({r["attempt_id"] for r in records}), 1)
+        self.assertTrue(all(r["kind"] == "message" and r["ids"] == ["m1"] for r in records))
+        self.assertEqual((records[-1]["acceptance"], records[-1]["enter"]), ("empty", 1))
+        self.assertTrue(all(isinstance(r["elapsed"], float) for r in records))
+        self.assertRegex(records[0]["at"], r"\.\d{3}")
+        raw = mod.deliver_log_path().read_text(encoding="utf-8")
+        self.assertNotIn("⟦hi⟧", raw)
+        self.assertNotIn("paste-buffer", raw)
+
+    def test_delivery_trace_records_enter_refusal_and_scrolled_wait(self):
+        mod = _Loader("collab_delivery_trace_refusal", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+
+        def screens(asked):
+            if asked.count(("send-keys", "-t", "%1", "Enter")) or not any(a[:1] == ("paste-buffer",) for a in asked):
+                return "────\n❯ \n────\n  ⏵⏵ auto mode on\n"
+            return "────\n❯ [owner → kodi] ⟦hi⟧\n────\n  ⏵⏵ auto mode on\n"
+
+        marked, asked, clock, tick = self.fake_input(mod, "claude", screens, enter_returncode=1)
+        self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: "[owner → kodi] ⟦hi⟧"))
+        self.assertEqual(tick(), "")
+        records = mod.read_jsonl(mod.deliver_log_path())
+        refused = next(r for r in records if r["stage"] == "enter-result")
+        self.assertEqual((refused["reason"], refused["returncode"], refused["enter"]), ("tmux-refused", 1, 1))
+        self.assertNotIn("acceptance", [r["stage"] for r in records])
+
+        scrolled = _Loader("collab_delivery_trace_scrolled", str(COLLAB)).load_module()
+        scrolled.use_room(str(self.root))
+        scrolled.deliver_log_path().unlink()
+        marked, asked, clock, tick = self.fake_input(scrolled, "claude", screens, pane_in_mode="1")
+        tick()
+        tick()
+        records = scrolled.read_jsonl(scrolled.deliver_log_path())
+        self.assertEqual([(r["stage"], r["reason"]) for r in records], [("wait", "scrolled")])
+
+    def test_delivery_trace_separates_batch_waits_and_does_not_repeat_a_reason(self):
+        mod = _Loader("collab_delivery_trace_batch", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        messages = [{"id": f"m{i}", "from": "owner", "to": ["kodi"], "at": "2026-10-18T06:00:00", "text": "hi"} for i in (1, 2)]
+
+        def screens(asked):
+            if asked.count(("send-keys", "-t", "%1", "Enter")) or not any(a[:1] == ("paste-buffer",) for a in asked):
+                return "────\n❯ \n────\n  ⏵⏵ auto mode on\n"
+            return "────\n❯ [owner → kodi] ⟦hi⟧\n────\n  ⏵⏵ auto mode on\n"
+
+        marked, asked, clock, tick = self.fake_input(mod, "claude", screens, messages)
+        self.enterContext(seam(mod, "deliver.digest_text", lambda *a, **k: "[owner → kodi] ⟦hi⟧"))
+        tick("needs_owner")
+        tick("needs_owner")
+        self.assertEqual(tick(), "m1")
+        records = mod.read_jsonl(mod.deliver_log_path())
+        self.assertEqual([r["reason"] for r in records if r["stage"] == "wait"], ["needs_owner"])
+        self.assertEqual(len([r for r in records if r["stage"] == "wait-end"]), 1)
+        accepted = records[-1]
+        self.assertEqual((accepted["stage"], accepted["ids"], accepted["kind"]), ("acceptance", ["m1", "m2"], "message"))
+        self.assertEqual(len({r["attempt_id"] for r in records}), 1)
+
+    def test_delivery_trace_does_not_churn_wait_and_eligible_before_a_refused_attempt(self):
+        mod = _Loader("collab_delivery_trace_last_guard", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        screens = lambda asked: "────\n❯ \n────\n  ⏵⏵ auto mode on\n"
+        marked, asked, clock, tick = self.fake_input(mod, "claude", screens)
+        self.enterContext(seam(mod, "screen.screen_state", lambda *a, **k: ("working", "")))
+        for _ in range(3):
+            tick()
+        records = mod.read_jsonl(mod.deliver_log_path())
+        self.assertEqual([r["reason"] for r in records if r["stage"] == "wait"], ["screen-changed"])
+        self.assertNotIn("eligible", [r["stage"] for r in records])
+
+        busy = _Loader("collab_delivery_trace_busy_guard", str(COLLAB)).load_module()
+        busy.use_room(str(self.root))
+        busy.deliver_log_path().unlink()
+        marked, asked, clock, tick = self.fake_input(busy, "claude", screens)
+        self.enterContext(seam(busy, "deliver.busy_due", lambda *a: True))
+        self.enterContext(seam(busy, "screen.screen_state", lambda *a, **k: ("working", "")))
+        self.enterContext(seam(busy, "deliver.input_free", lambda *a, **k: False))
+        for _ in range(3):
+            tick("working")
+        records = busy.read_jsonl(busy.deliver_log_path())
+        self.assertEqual([r["reason"] for r in records if r["stage"] == "wait"], ["input-not-free"])
+        self.assertNotIn("eligible", [r["stage"] for r in records])
+
+    def test_service_command_retry_result_is_logged_without_changing_its_return(self):
+        mod = _Loader("collab_delivery_trace_service_retry", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "kodi", "kind": "claude", "delivery": "tmux", "started_by_room": True}
+        self.enterContext(seam(mod, "screen.screen_state", lambda *a, **k: ("idle", {})))
+        self.enterContext(seam(mod, "screen.pane_guard", lambda *a, **k: ""))
+        self.enterContext(seam(mod, "screen.look", lambda *a: mod.Shot(0, "", "")))
+        ours = iter((True, False))
+        self.enterContext(seam(mod, "deliver.input_ours", lambda *a: next(ours)))
+        enters = []
+
+        def tmux(*args, **kwargs):
+            if args == ("send-keys", "-t", "%1", "Enter"):
+                enters.append(args)
+                return SimpleNamespace(returncode=1 if len(enters) == 2 else 0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        self.enterContext(seam(time, "sleep", lambda _: None))
+        self.assertTrue(mod.type_command(p, "%1", "/clear"))
+        self.assertEqual(len(enters), 2)
+        retries = [r for r in mod.read_jsonl(mod.deliver_log_path()) if r.get("enter") == 2]
+        self.assertEqual([(r["stage"], r["returncode"]) for r in retries], [("enter-result", 1)])
+
+    def test_delivery_trace_distinguishes_service_and_unverified_acceptance(self):
+        mod = _Loader("collab_delivery_trace_service", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        p = {"id": "kodi", "kind": "claude", "delivery": "tmux"}
+        self.enterContext(seam(mod, "screen.screen_state", lambda *a, **k: ("idle", {})))
+        self.enterContext(seam(mod, "screen.pane_guard", lambda *a, **k: ""))
+        self.enterContext(seam(mod, "tmuxio.tmux", lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr="")))
+        self.enterContext(seam(time, "sleep", lambda _: None))
+        self.assertTrue(mod.type_command(p, "%1", "/clear"))
+        service = mod.read_jsonl(mod.deliver_log_path())
+        self.assertTrue(service)
+        self.assertTrue(all(r["kind"] == "service" for r in service))
+        self.assertIn("enter-result", [r["stage"] for r in service])
+
+        message = {"id": "m1", "from": "owner", "to": ["kodi"], "at": "2026-10-18T06:00:00", "text": "hi"}
+        mod.given(p, [message], {"participants": [{"id": "owner"}, p]}, set())
+        self.assertEqual(mod.read_jsonl(mod.deliver_log_path())[-1]["acceptance"], "unverified")
+
+    def test_delivery_trace_marks_the_window_incomplete_after_a_log_failure(self):
+        mod = _Loader("collab_delivery_trace_log_failure", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+
+        def fail(*args, **kwargs):
+            raise OSError("read-only log")
+
+        with seam(mod, "store.write_state", fail):
+            mod.not_sent("kodi", "enter-not-taken", ["m1"])
+        mod.not_sent("kodi", "enter-again", ["m1"])
+        record = mod.read_jsonl(mod.deliver_log_path())[-1]
+        self.assertIs(record["complete"], False)
+        self.assertEqual((record["run_id"], record["attempt_id"], record["kind"]), (mod.RUN_ID, record["attempt_id"], "message"))
+        self.assertTrue(record["attempt_id"])
+
+    def test_a_text_left_gets_three_enters_in_all_and_someones_words_none(self):
+        mod = _Loader("collab_enter_tries", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        enters = lambda asked: asked.count(("send-keys", "-t", "%1", "Enter"))
+        theirs = [False]
+
+        def screens(asked):
+            if not any(a[:1] == ("paste-buffer",) for a in asked):
+                return "────\n❯ \n────\n"
+            return "────\n❯ [owner → kodi] ⟦hi⟧" + (" and my words" if theirs[0] else "") + "\n────\n"
+
+        marked, asked, clock, tick = self.fake_input(mod, "claude", screens)
+        self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: "[owner → kodi] ⟦hi⟧"))
+        tick()
+        for _ in range(5):
+            clock[0] += 2
+            tick("draft")
+        self.assertEqual(enters(asked), 3, "three Enters in all, then none")
+        self.assertTrue(mod.LEFT["kodi"]["held"])
+        self.assertFalse(any("m1" in ids for ids in marked))
+        said = []
+        self.enterContext(seam(mod, "deliver.room_line", lambda to, *a, **k: said.append(to)))
+        p = {"id": "kodi", "kind": "claude", "delivery": "tmux"}
+        config = {"participants": [{"id": "owner"}, p]}
+        clock[0] = dt.datetime.now(dt.timezone.utc).timestamp()  # its message hours old now
+        mod.tell_drafted(p, "working", config, mod.read_log_tick())
+        self.assertEqual(said, [["owner"]], "the people are told, in a running turn too")
+        self.assertEqual(
+            [r["reason"] for r in mod.read_jsonl(mod.deliver_log_path())],
+            [
+                "eligible",
+                "paste-start",
+                "ok",
+                "ok",
+                "enter-not-taken",
+                "enter-again",
+                "enter-again",
+                "enter-gave-up",
+                "draft-held",
+            ],
+        )
+        mod.LEFT.clear()
+        asked.clear()
+        tick()
+        theirs[0] = True
+        clock[0] += 2
+        tick("draft")
+        tick("draft")
+        self.assertEqual(enters(asked), 1, "someone's words after ours: never pressed")
+        self.assertTrue(mod.LEFT["kodi"]["held"])
+        self.assertEqual(mod.read_jsonl(mod.deliver_log_path())[-1]["reason"], "input-changed")
+
+    def test_a_text_left_told_as_changed_is_never_pressed_though_it_reads_as_ours_again(self):
+        # The people were told «nothing more is pressed» once someone's words stood after ours; those words gone,
+        # the input read as ours again and got our Enter — the text sent behind the backs of those told it waits.
+        mod = _Loader("collab_enter_told", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        enters = lambda asked: asked.count(("send-keys", "-t", "%1", "Enter"))
+        theirs = [False]
+
+        def screens(asked):
+            if not any(a[:1] == ("paste-buffer",) for a in asked):
+                return "────\n❯ \n────\n"
+            return "────\n❯ [owner → kodi] ⟦hi⟧" + (" and my words" if theirs[0] else "") + "\n────\n"
+
+        marked, asked, clock, tick = self.fake_input(mod, "claude", screens)
+        self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: "[owner → kodi] ⟦hi⟧"))
+        tick()
+        theirs[0] = True
+        clock[0] += 2
+        tick("draft")
+        self.assertEqual(mod.read_jsonl(mod.deliver_log_path())[-1]["reason"], "input-changed")
+        theirs[0] = False
+        for _ in range(3):
+            clock[0] += 2
+            tick("draft")
+        self.assertEqual(enters(asked), 1, "told it waits: never pressed again")
+        self.assertFalse(any("m1" in ids for ids in marked))
+
+    def test_someones_fold_seen_as_an_agent_starts_is_never_pressed_though_ours_reads_there_again(self):
+        # Its Enter given while the agent started; once started, someone's paste stood in the input. It got no Enter,
+        # but the text was left as merely untaken, that paste's fold kept as ours: had the input read as ours again
+        # by the next look, it was pressed — behind the backs of those it was not.
+        text = "[owner → kodi] ⟦hi⟧"
+        screen = ["› [Pasted Content 512 chars]\n"]
+        mod = _Loader("collab_starting_theirs", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        marked, asked, clock, tick = self.fake_input(mod, "codex", lambda asked: screen[0])
+        self.enterContext(seam(mod, "screen.still_starting", lambda *a, **k: False))
+        mod.STARTING["kodi"] = (["m1"], text, clock[0] + 20, f"[Pasted Content {len(text)} chars]", "%1", "111", "attempt-1")
+        tick()
+        screen[0] = f"› [Pasted Content {len(text)} chars]\n"
+        for _ in range(3):
+            clock[0] += 2
+            tick("draft")
+        self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), 0, "someone's fold seen: never pressed")
+        self.assertFalse(any("m1" in ids for ids in marked))
+        self.assertIn("input-changed", [r["reason"] for r in mod.read_jsonl(mod.deliver_log_path())])
+
+    def test_a_codex_starting_fold_is_recovered_by_a_deliverer_started_anew(self):
+        # Restarting before the startup timeout must preserve the one pending delivery, not paste its text again.
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"› [Pasted Content {len(text)} chars]\n"
+        ready = [False]
+        streams = []
+
+        def count(call):
+            return sum(stream.count(call) for stream in streams)
+
+        def screens(_asked):
+            enters = count(("send-keys", "-t", "%1", "Enter"))
+            if not enters:
+                return "› Ask Codex to do anything\n"
+            if not ready[0]:
+                return fold + "  Waiting for startup  · esc cancel\n"
+            if enters >= 2:
+                return text + "\n› Ask Codex to do anything\n"
+            return fold
+
+        old = _Loader("collab_starting_restart_old", str(COLLAB)).load_module()
+        old.use_room(str(self.root))
+        old_marked, old_asked, old_clock, old_tick = self.fake_input(old, "codex", screens)
+        streams.append(old_asked)
+        self.enterContext(seam(old, "deliver.delivery_text", lambda *a, **k: text))
+        self.assertEqual(old_tick(), "", "the first Enter waits for startup")
+        self.assertEqual(old.STARTING["kodi"][0], ["m1"])
+        self.assertEqual(old.LEFT, {})
+        self.assertLess(old_clock[0], old.STARTING["kodi"][2])
+        self.assertFalse(any("m1" in ids for ids in old_marked), "not delivered before acceptance")
+        attempt = old.read_jsonl(old.deliver_log_path())[-1]["attempt_id"]
+
+        ready[0] = True
+        new = _Loader("collab_starting_restart_new", str(COLLAB)).load_module()
+        new.use_room(str(self.root))
+        new.load_left()
+        getattr(new, "load_starting", lambda: None)()
+        new_marked, new_asked, new_clock, new_tick = self.fake_input(new, "codex", screens)
+        new_clock[0] = old_clock[0]
+        streams.append(new_asked)
+        self.enterContext(seam(new, "deliver.delivery_text", lambda *a, **k: text))
+        result = new_tick()
+        typed = sum(a[:1] == ("send-keys",) and "-l" in a for stream in streams for a in stream)
+        self.assertEqual(typed, 1, "never pasted again")
+        self.assertEqual(count(("send-keys", "-t", "%1", "Enter")), 2, "only the bounded second Enter")
+        self.assertEqual(result, "m1", "ready with the same fold: bounded recovery completes")
+        self.assertTrue(any("m1" in ids for ids in new_marked))
+        self.assertEqual(new.read_jsonl(new.deliver_log_path())[-1]["attempt_id"], attempt)
+        self.assertEqual(json.loads(new.read_state_text(new.starting_path())), {})
+
+        third = _Loader("collab_starting_restart_third", str(COLLAB)).load_module()
+        third.use_room(str(self.root))
+        third.load_left()
+        getattr(third, "load_starting", lambda: None)()
+        self.assertEqual(third.STARTING, {}, "the completed attempt stays deleted")
+        _marked, third_asked, _clock, third_tick = self.fake_input(third, "codex", screens)
+        streams.append(third_asked)
+        self.enterContext(seam(third, "log.read_set", lambda *a: {"m1"}))
+        self.enterContext(seam(third, "log.closed_by", lambda *a: {"m1"}))
+        self.assertEqual(third_tick(), "", "a closed message is not resurrected")
+        self.assertEqual(count(("send-keys", "-t", "%1", "Enter")), 2)
+
+    def test_a_restored_starting_record_is_fail_closed(self):
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"[Pasted Content {len(text)} chars]"
+        cases = (
+            ("pid", "222", f"› {fold}\n", "0", 20.0),
+            ("fold", "111", "› [Pasted Content 512 chars]\n", "0", 20.0),
+            ("input", "111", "› somebody else's draft\n", "0", 20.0),
+            ("question", "111", f"› {fold}\nPress enter to continue\n", "0", 20.0),
+            ("scrolled", "111", f"› {fold}\n", "1", 20.0),
+            ("expired", "111", f"› {fold}\n", "0", -1.0),
+            ("bool", "111", f"› {fold}\n", "0", True),
+            ("nan", "111", f"› {fold}\n", "0", float("nan")),
+        )
+        for name, pid, screen, in_mode, until in cases:
+            with self.subTest(name):
+                mod = _Loader(f"collab_starting_restore_{name}", str(COLLAB)).load_module()
+                mod.use_room(str(self.root))
+                record = {
+                    "ids": ["m1"],
+                    "text": text,
+                    "until": until,
+                    "fold": fold,
+                    "pane": "%1",
+                    "pane_pid": "111",
+                    "attempt_id": "attempt-1",
+                }
+                mod.replace_state(mod.starting_path(), json.dumps({"kodi": record}))
+                mod.load_starting()
+                marked, asked, _clock, tick = self.fake_input(
+                    mod, "codex", lambda _a, screen=screen: screen, pane_pid=pid, pane_in_mode=in_mode
+                )
+                self.assertEqual(tick(), "")
+                self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), 0)
+                self.assertFalse([a for a in asked if a[:1] == ("send-keys",) and "-l" in a])
+                self.assertFalse(any("m1" in ids for ids in marked))
+
+    def test_a_starting_question_keeps_recovery_for_a_later_tick(self):
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"[Pasted Content {len(text)} chars]"
+        mod = _Loader("collab_starting_question_retry", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        record = {
+            "ids": ["m1"],
+            "text": text,
+            "until": 20.0,
+            "fold": fold,
+            "pane": "%1",
+            "pane_pid": "111",
+            "attempt_id": "attempt-1",
+        }
+        mod.replace_state(mod.starting_path(), json.dumps({"kodi": record}))
+        mod.load_starting()
+        screen = [f"› {fold}\nPress enter to continue\n"]
+        marked, asked, _clock, tick = self.fake_input(mod, "codex", lambda _a: screen[0])
+        self.assertEqual(tick(), "")
+        self.assertIn("kodi", mod.STARTING, "a temporary question keeps the pending attempt")
+        screen[0] = f"› {fold}\n"
+        self.assertEqual(tick("draft"), "", "the same fold gets its bounded Enter")
+        screen[0] = text + "\n› Ask Codex to do anything\n"
+        self.assertEqual(tick(), "m1", "acceptance is confirmed on the next tick")
+        self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), 1)
+        self.assertFalse([a for a in asked if a[:1] == ("send-keys",) and "-l" in a])
+        self.assertTrue(any("m1" in ids for ids in marked))
+
+    def test_an_expired_starting_record_becomes_bounded_left(self):
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"[Pasted Content {len(text)} chars]"
+        mod = _Loader("collab_starting_expired_second_tick", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        record = {
+            "ids": ["m1"],
+            "text": text,
+            "until": -1.0,
+            "fold": fold,
+            "pane": "%1",
+            "pane_pid": "111",
+            "attempt_id": "attempt-1",
+        }
+        mod.replace_state(mod.starting_path(), json.dumps({"kodi": record}))
+        mod.load_starting()
+        marked, asked, _clock, tick = self.fake_input(mod, "codex", lambda _a: f"› {fold}\n")
+        tick()
+        tick("draft")
+        self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), 1, "expiry permits the bounded LEFT Enter")
+        self.assertEqual(mod.LEFT["kodi"]["enters"], 2)
+
+        restarted = _Loader("collab_starting_expired_third_tick", str(COLLAB)).load_module()
+        restarted.use_room(str(self.root))
+        restarted.load_left()
+        restarted.load_starting()
+        _marked, restarted_asked, _clock, restarted_tick = self.fake_input(restarted, "codex", lambda _a: f"› {fold}\n")
+        restarted_tick("draft")
+        self.assertEqual(restarted_asked.count(("send-keys", "-t", "%1", "Enter")), 1)
+        self.assertEqual(restarted.LEFT["kodi"]["enters"], 3, "the restart does not reset the Enter budget")
+
+        last = _Loader("collab_starting_expired_fourth_tick", str(COLLAB)).load_module()
+        last.use_room(str(self.root))
+        last.load_left()
+        last.load_starting()
+        _marked, last_asked, _clock, last_tick = self.fake_input(last, "codex", lambda _a: f"› {fold}\n")
+        last_tick("draft")
+        self.assertEqual(last_asked.count(("send-keys", "-t", "%1", "Enter")), 0, "no fourth Enter")
+        for left in (mod.LEFT["kodi"], restarted.LEFT["kodi"], last.LEFT["kodi"]):
+            self.assertEqual((left["pane"], left["pane_pid"]), ("%1", "111"), "unchanged identity still permits recovery")
+            self.assertEqual(left["attempt_id"], "attempt-1")
+        for calls in (asked, restarted_asked, last_asked):
+            self.assertFalse([a for a in calls if a[:1] == ("paste-buffer",)])
+            self.assertFalse([a for a in calls if a[:1] == ("send-keys",) and "-l" in a])
+        self.assertFalse(any("m1" in ids for ids in marked))
+
+    def test_closed_starting_ids_never_get_a_recovery_enter(self):
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"[Pasted Content {len(text)} chars]"
+        for name, ids, closed in (("single", ["m1"], {"m1"}), ("batch", ["m1", "m2"], {"m1"})):
+            with self.subTest(name):
+                mod = _Loader(f"collab_starting_closed_{name}", str(COLLAB)).load_module()
+                mod.use_room(str(self.root))
+                record = {
+                    "ids": ids,
+                    "text": text,
+                    "until": 20.0,
+                    "fold": fold,
+                    "pane": "%1",
+                    "pane_pid": "111",
+                    "attempt_id": "attempt-1",
+                }
+                mod.replace_state(mod.starting_path(), json.dumps({"kodi": record}))
+                mod.load_starting()
+                _marked, asked, _clock, tick = self.fake_input(mod, "codex", lambda _a: f"› {fold}\n")
+                self.enterContext(seam(mod, "log.closed_by", lambda *a, closed=closed: closed))
+                self.assertEqual(tick(), "")
+                self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), 0)
+                self.assertNotIn("kodi", mod.STARTING)
+                self.assertFalse([r for r in mod.read_jsonl(mod.deliver_log_path()) if r["stage"] == "acceptance"])
+
+    def test_left_completion_clears_starting_state_on_disk(self):
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"[Pasted Content {len(text)} chars]"
+        mod = _Loader("collab_starting_left_race", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        starting = {
+            "ids": ["m1"],
+            "text": text,
+            "until": 20.0,
+            "fold": fold,
+            "pane": "%1",
+            "pane_pid": "111",
+            "attempt_id": "attempt-1",
+        }
+        left = {"ids": ["m1"], "text": text, "fold": fold, "token": text, "before": 0, "enters": 1}
+        left |= {"pressed": 0.0, "since": 0.0, "held": False, "changed": False}
+        mod.replace_state(mod.starting_path(), json.dumps({"kodi": starting}))
+        mod.replace_state(mod.left_path(), json.dumps({"kodi": left}))
+        mod.load_left()
+        mod.load_starting()
+        _marked, asked, _clock, tick = self.fake_input(mod, "codex", lambda _a: text + "\n› Ask Codex to do anything\n")
+        self.assertEqual(tick(), "m1")
+        self.assertEqual(mod.STARTING, {})
+        self.assertEqual(json.loads(mod.read_state_text(mod.starting_path())), {})
+        self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), 0)
+
+    def test_expired_starting_checks_the_window_before_left(self):
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"[Pasted Content {len(text)} chars]"
+        mod = _Loader("collab_starting_expired_guard", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        record = {
+            "ids": ["m1"],
+            "text": text,
+            "until": -1.0,
+            "fold": fold,
+            "pane": "%1",
+            "pane_pid": "111",
+            "attempt_id": "attempt-1",
+        }
+        mod.replace_state(mod.starting_path(), json.dumps({"kodi": record}))
+        mod.load_starting()
+        _marked, _asked, _clock, tick = self.fake_input(mod, "codex", lambda _a: f"› {fold}\n")
+        self.enterContext(seam(mod, "screen.pane_guard", lambda *a, **k: "pid"))
+        self.assertEqual(tick(), "")
+        self.assertEqual(mod.LEFT, {})
+
+    def test_expired_starting_left_keeps_its_window_identity_after_restart(self):
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"[Pasted Content {len(text)} chars]"
+        for name, screen in (("enter", f"› {fold}\n"), ("acceptance", f"{text}\n› Ask Codex to do anything\n")):
+            with self.subTest(name):
+                old = _Loader(f"collab_starting_left_identity_old_{name}", str(COLLAB)).load_module()
+                old.use_room(str(self.root))
+                record = {
+                    "ids": ["m1"],
+                    "text": text,
+                    "until": -1.0,
+                    "fold": fold,
+                    "pane": "%1",
+                    "pane_pid": "111",
+                    "attempt_id": "attempt-1",
+                }
+                old.replace_state(old.starting_path(), json.dumps({"kodi": record}))
+                old.load_starting()
+                _marked, _asked, _clock, old_tick = self.fake_input(old, "codex", lambda _a: f"› {fold}\n")
+                old_tick()
+                self.assertIn("kodi", old.LEFT)
+
+                new = _Loader(f"collab_starting_left_identity_new_{name}", str(COLLAB)).load_module()
+                new.use_room(str(self.root))
+                new.load_left()
+                new.load_starting()
+                marked, asked, _clock, tick = self.fake_input(new, "codex", lambda _a, screen=screen: screen, pane_pid="222")
+                self.assertEqual(tick("draft"), "", "a replacement process cannot settle the old window's pending text")
+                self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), 0)
+                self.assertFalse(any("m1" in ids for ids in marked))
+
+    def test_identified_left_checks_the_fresh_window_before_acceptance(self):
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"[Pasted Content {len(text)} chars]"
+        for name, screen in (("empty", "› Ask Codex to do anything\n"), ("token", f"{text}\n› {fold}\n")):
+            with self.subTest(name):
+                old = _Loader(f"collab_starting_live_identity_old_{name}", str(COLLAB)).load_module()
+                old.use_room(str(self.root))
+                record = {
+                    "ids": ["m1"],
+                    "text": text,
+                    "until": -1.0,
+                    "fold": fold,
+                    "pane": "%1",
+                    "pane_pid": "111",
+                    "attempt_id": "attempt-1",
+                }
+                old.replace_state(old.starting_path(), json.dumps({"kodi": record}))
+                old.load_starting()
+                _marked, _asked, _clock, old_tick = self.fake_input(old, "codex", lambda _a: f"› {fold}\n")
+                old_tick()
+
+                new = _Loader(f"collab_starting_live_identity_new_{name}", str(COLLAB)).load_module()
+                new.use_room(str(self.root))
+                new.load_left()
+                new.load_starting()
+                marked, asked, _clock, tick = self.fake_input(new, "codex", lambda _a, screen=screen: screen, pane_pid="222")
+                for cell in tick.__closure__ or ():
+                    value = cell.cell_contents
+                    if isinstance(value, dict) and value.get("id") == "kodi":
+                        value["pane_pid"] = "111"  # the config is stale; the fresh Shot belongs to PID222
+                self.assertEqual(tick("draft"), "")
+                self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), 0)
+                self.assertFalse(any("m1" in ids for ids in marked))
+
+    def test_legacy_left_without_identity_keeps_current_guards_without_backfill(self):
+        # A legacy record cannot establish its original process after a reload. Compatibility keeps its former
+        # current-window guards; the current pane/PID is not invented as the original identity.
+        text = "[owner → kodi] ⟦hi⟧"
+        fold = f"[Pasted Content {len(text)} chars]"
+        legacy = {"ids": ["m1"], "text": text, "fold": fold, "token": text, "before": 0, "enters": 1}
+        legacy |= {"pressed": 0.0, "since": 0.0, "held": False, "changed": False, "attempt_id": "legacy-attempt"}
+        mod = _Loader("collab_left_legacy_identity", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        mod.replace_state(mod.left_path(), json.dumps({"kodi": legacy}))
+        mod.load_left()
+        marked, asked, _clock, tick = self.fake_input(mod, "codex", lambda _a: f"› {fold}\n", pane_pid="222")
+        self.assertEqual(tick("draft"), "")
+        self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), 1, "former current-window guards remain")
+        self.assertNotIn("pane", mod.LEFT["kodi"])
+        self.assertNotIn("pane_pid", mod.LEFT["kodi"])
+        self.assertFalse([a for a in asked if a[:1] == ("paste-buffer",)])
+        self.assertFalse(any("m1" in ids for ids in marked))
+
+    def test_a_text_left_is_still_ours_for_a_deliverer_started_anew(self):
+        # What was left in an input lived only in the deliverer's memory: a deliverer started anew (each update does)
+        # took the text still there for a draft, and once the agent took it, typed its message again — read twice.
+        taken = [False]
+
+        def screens(asked):
+            if taken[0]:
+                return "● [owner → kodi] ⟦hi⟧\n────\n❯ \n────\n"
+            if not any(a[:1] == ("paste-buffer",) for a in asked):
+                return "────\n❯ \n────\n"
+            return "────\n❯ [owner → kodi] ⟦hi⟧\n────\n"
+
+        old = _Loader("collab_left_old", str(COLLAB)).load_module()
+        old.use_room(str(self.root))
+        marked, asked, clock, tick = self.fake_input(old, "claude", screens)
+        self.enterContext(seam(old, "deliver.delivery_text", lambda *a, **k: "[owner → kodi] ⟦hi⟧"))
+        self.assertEqual(tick(), "", "its Enter not taken: left")
+        attempt = old.LEFT["kodi"]["attempt_id"]
+        old_records = old.read_jsonl(old.deliver_log_path())
+        taken[0] = True
+        new = _Loader("collab_left_new", str(COLLAB)).load_module()
+        new.use_room(str(self.root))
+        getattr(new, "load_left", lambda: None)()  # what a deliverer does as it starts
+        marked, asked, clock, tick = self.fake_input(new, "claude", screens)
+        self.enterContext(seam(new, "deliver.delivery_text", lambda *a, **k: "[owner → kodi] ⟦hi⟧"))
+        self.assertEqual(tick(), "m1", "taken since: delivered")
+        self.assertFalse([a for a in asked if a[:1] == ("paste-buffer",)], "never typed again")
+        self.assertTrue(any("m1" in ids for ids in marked))
+        new_records = new.read_jsonl(new.deliver_log_path())
+        self.assertEqual(new_records[-1]["attempt_id"], attempt)
+        self.assertNotEqual(new_records[-1]["run_id"], old_records[-1]["run_id"])
+        self.assertEqual(new.LEFT, {})
+        new.load_left()
+        self.assertEqual(new.LEFT, {}, "taken: gone from the disk too")
+
+    def test_a_broken_left_record_is_skipped_and_an_unreadable_file_is_none(self):
+        mod = _Loader("collab_left_broken", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        good = {"ids": ["m1"], "text": "hi", "fold": "", "token": "[a→b]", "before": 0, "enters": 1}
+        good |= {"pressed": 5.5, "since": 5, "held": False, "changed": False}
+        identified = {**good, "pane": "%1", "pane_pid": "111", "attempt_id": "attempt-1"}
+        bad = [
+            {**good, "enters": "1"},
+            {**good, "ids": []},
+            {**good, "held": 0},
+            {**good, "before": True},
+            {**good, "pane": "%1"},
+            {**good, "pane_pid": "111"},
+            {**identified, "pane": ""},
+            {**identified, "pane_pid": 222},
+            "x",
+            {},
+        ]
+        records = {"kodi": good, "identified": identified, **{f"p{i}": b for i, b in enumerate(bad)}}
+        mod.replace_state(mod.left_path(), json.dumps(records))
+        mod.load_left()
+        self.assertEqual(mod.LEFT, {"kodi": good, "identified": identified})
+        for text in (b"{", b"[1]", b"\xff\xfe", b"[" * 100000):
+            mod.left_path().write_bytes(text)
+            mod.load_left()
+            self.assertEqual(mod.LEFT, {}, text[:5])
+
+    def test_a_claudes_full_box_showing_our_end_is_pressed_only_after_an_enter_of_ours(self):
+        # A text left before its first Enter — a running turn's screen changed while typing, or its start unseen —
+        # had its start never checked; a box as tall as it grows showing only our text's end got our Enter all the
+        # same, with whatever stood in its hidden start sent along.
+        tail = (
+            "/home/user/projects/collab-room/tools/collab-current say --room /tmp/probe/room --from worker3 --to lead"
+            " --re 9fe3171002f1 - <<'END_5a70bbb1a3bc' ↵ … ↵ END_5a70bbb1a3bc · if no answer is needed: python3"
+            " /home/user/projects/collab-room/tools/collab-current ack --room /tmp/probe/room --for worker3"
+            " --no-reply --id 9fe3171002f1)"
+        )
+        text = "[lead → worker3] " + "a word " * 70 + " (answer: python3 " + tail
+        tall = (SCREENS / "claude-2.1.311-busy-tall-60x30.txt").read_text(encoding="utf-8")
+        for enters, pressed in ((0, 0), (1, 1)):
+            mod = _Loader(f"collab_tall_left_{enters}", str(COLLAB)).load_module()
+            mod.use_room(str(self.root))
+            marked, asked, clock, tick = self.fake_input(mod, "claude", lambda asked: tall)
+            mod.LEFT["kodi"] = {
+                "ids": ["m1"],
+                "text": text,
+                "fold": "",
+                "token": "[lead→worker3]",
+                "before": 9,
+                "enters": enters,
+                "pressed": 0.0,
+                "since": 0.0,
+                "held": False,
+                "changed": False,
+            }
+            clock[0] += 30
+            tick("working")
+            self.assertEqual(asked.count(("send-keys", "-t", "%1", "Enter")), pressed, f"Enters given before: {enters}")
+
+    def test_a_claudes_fold_left_is_pressed_only_while_it_is_the_fold_seen_with_only_our_texts_end_after_it(self):
+        # A Claude's fold tells no length: any paste with nothing after it read as ours, and a person who cleared our
+        # text and pasted their own got our Enter — their draft sent. A word of theirs after it found anywhere in our
+        # text passed too.
+        for later in ("[Pasted text #6]", "[Pasted text #5] hi"):
+            mod = _Loader(f"collab_claude_fold_k_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+            mod.use_room(str(self.root))
+            enters = lambda asked: asked.count(("send-keys", "-t", "%1", "Enter"))
+            theirs = [False]
+
+            def screens(asked, later=later, theirs=theirs):
+                if not any(a[:1] == ("paste-buffer",) for a in asked):
+                    return "────\n❯ \n────\n"
+                return "────\n❯ " + (later if theirs[0] else "[Pasted text #5]") + "\n────\n"
+
+            marked, asked, clock, tick = self.fake_input(mod, "claude", screens)
+            self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: "[owner → kodi] ⟦hi there⟧"))
+            tick()
+            pressed = enters(asked)
+            theirs[0] = True
+            clock[0] += 2
+            tick("draft")
+            self.assertEqual(enters(asked), pressed, f"{later}: not ours, never pressed")
+            self.assertEqual(mod.read_jsonl(mod.deliver_log_path())[-1]["reason"], "input-changed")
+            self.assertFalse(any("m1" in ids for ids in marked))
+
+    def test_a_question_come_since_the_ticks_first_look_gets_no_enter_into_a_text_left(self):
+        # The question was judged on the tick's earlier look, the Enter on a later one: a question that came between
+        # them would get our Enter.
+        mod = _Loader("collab_left_asks", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        enters = lambda asked: asked.count(("send-keys", "-t", "%1", "Enter"))
+        asks = [False]
+
+        def screens(asked):
+            if not any(a[:1] == ("paste-buffer",) for a in asked):
+                return "────\n❯ \n────\n"
+            question = " Do you want to proceed?\n Esc to cancel · Tab to amend\n" if asks[0] else ""
+            return "────\n❯ [owner → kodi] ⟦hi⟧\n────\n" + question
+
+        marked, asked, clock, tick = self.fake_input(mod, "claude", screens)
+        self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: "[owner → kodi] ⟦hi⟧"))
+        tick()
+        pressed = enters(asked)
+        asks[0] = True
+        clock[0] += 2
+        tick("draft")  # the tick's own look, before the question
+        self.assertEqual(enters(asked), pressed, "a question on the screen: no Enter")
+
+    def test_a_codex_fold_left_in_a_running_turn_is_pressed_only_by_its_own_length(self):
+        # Typed fast into a running turn, a Codex folds the text — «[Pasted Content N chars]», N in code points —
+        # it read as a changed screen, and the text stood in its input, unsent, for good.
+        text = "[owner → kodi] ⟦" + "Ж" * 60 + "⟧"
+        work = "• Working (6s • esc to interrupt)\n \n"
+        for count, pressed in ((len(text), True), (len(text.encode()), False)):
+            mod = _Loader(f"collab_codex_fold_busy_{count}", str(COLLAB)).load_module()
+            mod.use_room(str(self.root))
+
+            def screens(asked, count=count):
+                if not any(a[:1] == ("send-keys",) and "-l" in a for a in asked):
+                    return work + "› Ask Codex to do anything\n"
+                if asked.count(("send-keys", "-t", "%1", "Enter")):
+                    return work + "› Ask Codex to do anything\n"
+                return work + f"› [Pasted Content {count} chars]\n"
+
+            marked, asked, clock, tick = self.fake_input(mod, "codex", screens)
+            self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: text))
+            self.enterContext(seam(mod, "deliver.busy_due", lambda *a, **k: True))
+            self.assertEqual(tick("working"), "")
+            self.assertNotIn(("send-keys", "-t", "%1", "Enter"), asked, "folded while typing: no Enter then")
+            clock[0] += 2
+            tick("working")
+            self.assertEqual(("send-keys", "-t", "%1", "Enter") in asked, pressed, f"fold of {count}")
+            clock[0] += 2
+            self.assertEqual(tick("working"), "m1" if pressed else "")
+
+    def test_a_clear_left_in_the_input_gets_another_enter(self):
+        mod = _Loader("collab_clear_left", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        enters = lambda asked: asked.count(("send-keys", "-t", "%1", "Enter"))
+
+        def screens(asked):
+            typed = any(a[:1] == ("send-keys",) and "-l" in a for a in asked)
+            return "────\n❯ /clear\n────\n" if typed and enters(asked) < 2 else "────\n❯ \n────\n"
+
+        _, asked, _, _ = self.fake_input(mod, "claude", screens)
+        p = {"id": "kodi", "kind": "claude", "delivery": "tmux", "pane_pid": "111"}
+        p.update({k: v for k, v in mod.PRESETS["claude"].items() if k in mod.SCREEN_KEYS})
+        self.enterContext(seam(mod, "screen.pane_guard", lambda *a, **k: ""))
+        self.assertTrue(mod.type_command(p, "%1", "/clear"))
+        self.assertEqual(enters(asked), 2, "its Enter swallowed: one more")
+
+    def test_a_clear_left_gets_no_more_enters_once_another_process_has_its_window(self):
+        # The retries pressed Enter with the window checked only once, before typing: a window another process took
+        # since got our keys.
+        mod = _Loader("collab_clear_guard", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        enters = lambda asked: asked.count(("send-keys", "-t", "%1", "Enter"))
+
+        def screens(asked):
+            return "────\n❯ /clear\n────\n" if any(a[:1] == ("send-keys",) and "-l" in a for a in asked) else "────\n❯ \n────\n"
+
+        _, asked, _, _ = self.fake_input(mod, "claude", screens)
+        real = getattr(*owner(mod, "tmuxio.tmux"))
+
+        def tmux(*a, **k):
+            shown = real(*a, **k)
+            if enters(asked) and "capture-pane" in a:
+                shown.stdout = shown.stdout.replace("\t111\t", "\t222\t")  # another process since its Enter
+            return shown
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        p = {"id": "kodi", "kind": "claude", "delivery": "tmux", "pane_pid": "111"}
+        p.update({k: v for k, v in mod.PRESETS["claude"].items() if k in mod.SCREEN_KEYS})
+        self.assertFalse(mod.type_command(p, "%1", "/clear"), "not done")
+        self.assertEqual(enters(asked), 1, "no Enter into another process")
+
+    def test_a_rooms_own_message_too_long_even_as_a_pointer_is_told_to_the_people_and_the_lead(self):
+        # The room's own message (an assignment) past the limit even as a pointer was not typed, and no one was told:
+        # it has no sender to tell.
+        mod = _Loader(f"collab_room_too_long_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        agent = {"id": "bob", "label": "Bob", "kind": "claude", "role": "worker"}
+        config = {"participants": [{"id": "owner"}, {"id": "mal", "kind": "claude", "role": "lead"}, agent]}
+        mod.use_room(str(self.root))
+        said = []
+        self.enterContext(seam(mod, "store.load_config", lambda: config))
+        self.enterContext(seam(mod, "deliver.room_line", lambda to, en, **k: said.append((to, en))))
+        brief = {"id": "b1", "from": "room", "to": ["bob"], "at": mod.now(), "text": "x" * 20000}
+        self.assertTrue(mod.too_long(agent, [brief], "y" * 2000, {"paste_limit": 1000}))
+        self.assertEqual(len(said), 1, said)
+        self.assertEqual(said[0][0], ["owner", "mal"], "the people (the chat) and the lead")
+        self.assertIn("the room's message", said[0][1])
+        mod.too_long(agent, [brief], "y" * 2000, {"paste_limit": 1000})
+        self.assertEqual(len(said), 1, "once")
 
     def test_a_pointer_too_long_only_for_a_running_turn_is_not_told_as_a_room_path_too_long(self):
         # The limit of a running turn (1000 bytes) is shorter than the agent's own: a pointer that an idle agent
@@ -9225,7 +11142,7 @@ class DeliveryTest(Base):
             "buf, folded, until = '', False, 0.0\n"
             "while True:\n"
             "    if until and time.time() >= until:\n"
-            "        until = 0.0; print('\\x1b[2J\\x1b[H', end=''); say(f'› [Pasted Content {len(buf)} chars]')  # its footer gone\n"
+            "        until = 0.0; print('\\x1b[2J\\x1b[H', end=''); say(f'› [Pasted Content {len(buf.encode(\"latin-1\").decode())} chars]')  # its footer gone\n"
             "    if not select.select([fd], [], [], 0.1)[0]:\n"
             "        continue\n"
             "    ch = os.read(fd, 1).decode('latin-1')\n"
@@ -9235,7 +11152,7 @@ class DeliveryTest(Base):
             "        continue  # starting: the Enter is lost\n"
             "    if not folded:\n"
             "        folded, until = True, time.time() + 2\n"
-            "        say(f'› [Pasted Content {len(buf)} chars]'); say('  Waiting for startup  · esc cancel'); continue\n"
+            "        say(f'› [Pasted Content {len(buf.encode(\"latin-1\").decode())} chars]'); say('  Waiting for startup  · esc cancel'); continue\n"
             "    say('got:' + buf[:60]); buf, folded = '', False\n"
             "    say('› Ask Codex to do anything')\n",
             encoding="utf-8",
@@ -9251,7 +11168,15 @@ class DeliveryTest(Base):
         pane = json.loads((self.state / "panes.json").read_text())["panes"]["kodi"]
         self.assertTrue(self.wait_for(pane, "Ask Codex"))
         self.owner_says("first one", to=("kodi",))
-        self.run_collab("deliver", "--once")
+        # Ticks of one deliverer: the start is looked at again next tick, not waited for under the room's lock.
+        deliverer = subprocess.Popen(
+            [str(COLLAB), "deliver", "--interval", "0.5"],
+            cwd=self.root,
+            env={**os.environ, "COLLAB_ROOT": str(self.root), "COLLAB_NO_ATTACH": "1"},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(lambda: (deliverer.kill(), deliverer.wait()))
         self.assertTrue(self.wait_for(pane, "got:"), "its Enter after the start: " + self.screen(pane))
 
     def test_a_long_message_goes_as_a_pointer_and_the_next_one_still_arrives(self):
@@ -10854,10 +12779,13 @@ class DeliveryTest(Base):
             time.sleep(0.1)
         self.assertRegex(coloured, r"48;5;196m ! Агент6", "the one that needs the person is red, in its place")
         subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", "30", "-y", "24"], check=True)
-        deadline = time.time() + 5
-        while len([x for x in tail(6) if "Агент" in x]) < 6 and time.time() < deadline:
-            time.sleep(0.1)
-        rows = [x for x in tail(6) if "Агент" in x]
+
+        def narrow_rows():
+            rows = [x for x in tail(6) if "Агент" in x]
+            return rows if len(rows) == 6 else []
+
+        # Assert the same completed frame: another capture may see the repaint's clear.
+        rows = self.until(narrow_rows, timeout=5)
         self.assertEqual(len(rows), 6, "a narrow window: one cell a row, still everyone")
         self.assertLessEqual(max(len(x.rstrip()) for x in rows), 30, "never wider than the window")
 
@@ -11807,6 +13735,40 @@ class DeliveryTest(Base):
         alive = subprocess.run(["tmux", "list-panes", "-t", pane, "-F", "#{pane_dead}"], capture_output=True, text=True).stdout
         self.assertEqual(alive.strip(), "0", "without a terminal to ask in, nothing is restarted")
 
+    def test_a_chat_with_the_same_version_but_another_build_is_reported_without_restart(self):
+        mod = _Loader(f"collab_chatbuild_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        old = self.root / "older" / "collab"
+        old.parent.mkdir()
+        original = COLLAB.read_bytes()
+        config = {"participants": [{"id": "owner", "command": ["python3", str(COLLAB), "chat", "--as", "owner"]}]}
+        calls = []
+
+        def tmux(*args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "123\n", "")
+
+        def process(args, **kwargs):
+            return subprocess.CompletedProcess(args, 0, f"python3 {old} chat --as owner\n" if args[0] == "ps" else "", "")
+
+        with (
+            seam(mod, "store.read_panes", lambda: {"panes": {"owner": "%1"}}),
+            seam(mod, "tmuxio.tmux", tmux),
+            mock.patch.object(subprocess, "run", process),
+            mock.patch.object(sys.stdin, "isatty", return_value=False),
+        ):
+            for changed in (False, True):
+                with self.subTest(changed=changed):
+                    old.write_bytes(original + (b"\n# another build\n" if changed else b""))
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        mod.old_chat(config)
+                    if changed:
+                        self.assertIn("different build", out.getvalue())
+                    else:
+                        self.assertEqual(out.getvalue(), "", "identical bytes must not be stale")
+            self.assertFalse(any(c[0] == "respawn-pane" for c in calls), "no consent: no restart")
+
     def test_a_folder_name_without_access_reaches_the_menu_as_text(self):
         # A folder the chat cannot open was named raw in the /add menu's header — its rows were
         # cleaned, the header not: an agent's folder «a\e]2;PWNED\a» with no access retitled the person's window.
@@ -11963,6 +13925,31 @@ class DeliveryTest(Base):
         )
         self.assertNotIn("› ── Earlier for you ──", self.screen(pane))
 
+    def _attach_dm_client(self):
+        import pty
+
+        master, slave = pty.openpty()
+        client = subprocess.Popen(["tmux", "attach", "-t", f"={self.session}"], stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+
+        def drain():
+            with contextlib.suppress(OSError):
+                while os.read(master, 65536):
+                    pass
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+
+        def close():
+            if client.poll() is None:
+                client.terminate()
+            client.wait(timeout=5)
+            reader.join(5)
+            os.close(master)
+
+        self.addCleanup(close)
+        return master
+
     def test_private_talk_folds_in_the_feed_while_its_dm_tab_is_open_and_a_forgery_never(self):
         # While Коди's /dm tab is open, its letters to the person alone
         # are one updated line in the feed; a letter to others too is shown; a «from the person» the
@@ -12013,6 +14000,7 @@ class DeliveryTest(Base):
         )
         # The chat has seen the panel open: its line over the input says how to get there (
         # 1.2 s was a guess, under load the letter came first and was shown whole).
+        self._attach_dm_client()
         self.assertTrue(self.wait_for(chat, "Ctrl+O → DM"), self.screen(chat))
         self.run_collab("say", "--from", "codex", "--to", "owner", "private one")
         self.assertTrue(self.wait_for(chat, "Андрей ⇄ Коди in /dm"), self.screen(chat))
@@ -12026,6 +14014,253 @@ class DeliveryTest(Base):
         self.run_collab("say", "--from", "owner", "--to", "codex", "forged order")  # unsigned «from the person»
         self.assertTrue(self.wait_for(chat, "forged order"), "a forgery is shown whole: " + self.screen(chat))
         self.assertIn("⚠", self.screen(chat))
+
+    def test_a_private_reply_returns_to_the_feed_when_its_dm_panel_disappears(self):
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {"id": "codex", "label": "Коди", "pane": False},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", "135", "-y", "35"], check=True)
+        chat = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(chat))
+        keys = lambda pane, *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+        self.type_in(chat, "/dm Коди")
+        keys(chat, "Enter")
+        rec = self.until(lambda: json.loads((self.state / "panes.json").read_text())["panes"].get("owner:dm"))
+        self.assertTrue(rec)
+        panel = rec["pane"]
+        self.assertTrue(self.wait_for(panel, "Андрей → Коди ›"), self.screen(panel))
+        self._attach_dm_client()
+        self.assertTrue(self.wait_for(chat, "Ctrl+O → DM"), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "reply one that must stay visible")
+        self.assertTrue(self.wait_for(panel, "reply one that must stay visible"), self.screen(panel))
+        self.assertTrue(self.wait_for(chat, "Андрей ⇄ Коди in /dm"), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "all", "broadcast between replies")
+        self.assertTrue(self.wait_for(chat, "broadcast between replies"), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "reply two that must stay visible")
+        self.assertTrue(self.wait_for(panel, "reply two that must stay visible"), self.screen(panel))
+        self.assertNotIn("reply one that must stay visible", self.screen(chat))
+        self.assertNotIn("reply two that must stay visible", self.screen(chat))
+        before = self.screen(chat)
+        subprocess.run(["tmux", "kill-pane", "-t", panel], check=True)
+        self.assertTrue(self.until(lambda: "Ctrl+O → DM" not in self.screen(chat)), self.screen(chat))
+        self.assertTrue(
+            self.until(lambda: "reply two that must stay visible" in self.screen(chat), timeout=3),
+            "BEFORE PANEL LOSS:\n" + before + "\nAFTER PANEL LOSS:\n" + self.screen(chat),
+        )
+
+        def chronological():
+            shot = self.screen(chat)
+            texts = ("reply one that must stay visible", "broadcast between replies", "reply two that must stay visible")
+            return all(shot.count(text) == 1 for text in texts) and shot.index(texts[0]) < shot.index(texts[1]) < shot.index(
+                texts[2]
+            )
+
+        self.assertTrue(self.until(chronological), self.screen(chat))
+
+        old_panel = panel
+        self.type_in(chat, "/dm Коди")
+        keys(chat, "Enter")
+        panel = self.until(
+            lambda: (lambda current: current if current and current != old_panel else None)(
+                (json.loads((self.state / "panes.json").read_text())["panes"].get("owner:dm") or {}).get("pane")
+            )
+        )
+        self.assertTrue(self.wait_for(panel, "Андрей → Коди ›"), self.screen(panel))
+        self._attach_dm_client()
+        self.assertTrue(self.wait_for(chat, "Ctrl+O → DM"), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "reply after reopen")
+        self.assertTrue(self.wait_for(panel, "reply after reopen"), self.screen(panel))
+        keys(chat, "-l", "/dm close")
+        keys(chat, "Enter")
+        self.assertTrue(self.until(lambda: "Ctrl+O → DM" not in self.screen(chat)), self.screen(chat))
+        self.assertTrue(self.wait_for(chat, "reply after reopen"), self.screen(chat))
+
+        def restored_once():
+            shot = self.screen(chat)
+            return (
+                all(
+                    shot.count(text) <= 1
+                    for text in (
+                        "reply one that must stay visible",
+                        "broadcast between replies",
+                        "reply two that must stay visible",
+                    )
+                )
+                and shot.count("reply after reopen") == 1
+            )
+
+        self.assertTrue(self.until(restored_once), self.screen(chat))
+
+    def test_a_private_reply_does_not_fold_into_a_hidden_dm_panel(self):
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {"id": "codex", "label": "Коди", "pane": False},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", "135", "-y", "35"], check=True)
+        chat = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(chat))
+        keys = lambda pane, *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+        self.type_in(chat, "/dm Коди")
+        keys(chat, "Enter")
+        rec = self.until(lambda: json.loads((self.state / "panes.json").read_text())["panes"].get("owner:dm"))
+        self.assertTrue(rec)
+        panel = rec["pane"]
+        self.assertTrue(self.wait_for(panel, "Андрей → Коди ›"), self.screen(panel))
+        self._attach_dm_client()
+        self.assertTrue(self.wait_for(chat, "Ctrl+O → DM"), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "visible before hiding")
+        self.assertTrue(self.wait_for(panel, "visible before hiding"), self.screen(panel))
+        subprocess.run(["tmux", "new-window", "-d", "-t", f"={self.session}:", "-n", "hidden-dm", "sleep 60"], check=True)
+        subprocess.run(["tmux", "move-pane", "-d", "-s", panel, "-t", f"={self.session}:hidden-dm"], check=True)
+        self.assertEqual(
+            subprocess.run(
+                ["tmux", "display-message", "-p", "-t", panel, "#{pane_pid}"], capture_output=True, text=True
+            ).stdout.strip(),
+            rec["pid"],
+            "the hidden panel process is still alive",
+        )
+        before = self.screen(chat)
+        self.run_collab("say", "--from", "codex", "--to", "owner", "reply while panel is hidden")
+        self.assertTrue(self.wait_for(panel, "reply while panel is hidden"), self.screen(panel))
+        self.assertTrue(
+            self.until(lambda: "reply while panel is hidden" in self.screen(chat), timeout=3),
+            "BEFORE HIDDEN REPLY:\n" + before + "\nAFTER HIDDEN REPLY:\n" + self.screen(chat),
+        )
+
+    def test_a_private_reply_does_not_fold_into_a_zoomed_dm_window(self):
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {"id": "codex", "label": "Коди", "pane": False},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", "135", "-y", "35"], check=True)
+        chat = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(chat))
+        keys = lambda pane, *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+        self.type_in(chat, "/dm Коди")
+        keys(chat, "Enter")
+        rec = self.until(lambda: json.loads((self.state / "panes.json").read_text())["panes"].get("owner:dm"))
+        self.assertTrue(rec)
+        panel = rec["pane"]
+        self.assertTrue(self.wait_for(panel, "Андрей → Коди ›"), self.screen(panel))
+        self._attach_dm_client()
+        self.assertTrue(self.wait_for(chat, "Ctrl+O → DM"), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "folded before zoom")
+        self.assertTrue(self.wait_for(panel, "folded before zoom"), self.screen(panel))
+        self.assertNotIn("folded before zoom", self.screen(chat))
+        subprocess.run(["tmux", "resize-pane", "-Z", "-t", chat], check=True)
+        self.assertEqual(
+            subprocess.run(
+                ["tmux", "display-message", "-p", "-t", chat, "#{window_zoomed_flag}"], capture_output=True, text=True
+            ).stdout.strip(),
+            "1",
+        )
+        self.assertTrue(self.wait_for(chat, "folded before zoom"), self.screen(chat))
+        self.assertTrue(self.until(lambda: "Ctrl+O → DM" not in self.screen(chat)), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "reply while main is zoomed")
+        self.assertTrue(self.wait_for(chat, "reply while main is zoomed"), self.screen(chat))
+        subprocess.run(["tmux", "resize-pane", "-Z", "-t", chat], check=True)
+        self.assertTrue(self.wait_for(chat, "Ctrl+O → DM"), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "reply after unzoom")
+        self.assertTrue(self.wait_for(panel, "reply after unzoom"), self.screen(panel))
+        self.assertNotIn("reply after unzoom", self.screen(chat))
+        for text in ("folded before zoom", "reply while main is zoomed"):
+            self.assertEqual(self.screen(chat).count(text), 1, text)
+
+    def test_private_replies_survive_detach_and_reattach_without_duplicates(self):
+        self.write_config(
+            [
+                {
+                    "id": "owner",
+                    "label": "Андрей",
+                    "command": ["python3", str(COLLAB), "chat", "--as", "owner", "--interval", "0.2"],
+                },
+                {"id": "codex", "label": "Коди", "pane": False},
+            ],
+            session=self.session,
+        )
+        self.assertEqual(self.run_collab("start").returncode, 0)
+        subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", "135", "-y", "35"], check=True)
+        chat = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
+        self.assertTrue(self.wait_chat(chat))
+        keys = lambda pane, *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
+        self.type_in(chat, "/dm Коди")
+        keys(chat, "Enter")
+        rec = self.until(lambda: json.loads((self.state / "panes.json").read_text())["panes"].get("owner:dm"))
+        self.assertTrue(rec)
+        panel = rec["pane"]
+        self.assertTrue(self.wait_for(panel, "Андрей → Коди ›"), self.screen(panel))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "full text while detached")
+        self.assertTrue(self.wait_for(chat, "full text while detached"), self.screen(chat))
+
+        self._attach_dm_client()
+        self.assertTrue(self.wait_for(chat, "Ctrl+O → DM"), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "folded while attached")
+        self.assertTrue(self.wait_for(panel, "folded while attached"), self.screen(panel))
+        self.assertNotIn("folded while attached", self.screen(chat))
+        subprocess.run(["tmux", "detach-client", "-s", f"={self.session}"], check=True)
+        self.assertTrue(self.wait_for(chat, "folded while attached"), self.screen(chat))
+        self.assertTrue(self.until(lambda: "Ctrl+O → DM" not in self.screen(chat)), self.screen(chat))
+
+        self._attach_dm_client()
+        self.assertTrue(self.wait_for(chat, "Ctrl+O → DM"), self.screen(chat))
+        self.run_collab("say", "--from", "codex", "--to", "owner", "folded after reattach")
+        self.assertTrue(self.wait_for(panel, "folded after reattach"), self.screen(panel))
+        self.assertNotIn("folded after reattach", self.screen(chat))
+        subprocess.run(["tmux", "detach-client", "-s", f"={self.session}"], check=True)
+        self.assertTrue(self.wait_for(chat, "folded after reattach"), self.screen(chat))
+
+        def all_once():
+            shot = self.screen(chat)
+            return all(
+                shot.count(text) == 1 for text in ("full text while detached", "folded while attached", "folded after reattach")
+            )
+
+        self.assertTrue(self.until(all_once), self.screen(chat))
+
+    def test_dm_restore_is_once_by_id_and_skips_cleared_messages(self):
+        mod = _Loader("collab_dm_restore_filter", str(COLLAB)).load_module()
+        kept, cleared = {"id": "kept"}, {"id": "cleared"}
+        other, kept_status, cleared_status = ["other"], ["dm kept"], ["dm cleared"]
+        blocks = [other, kept_status, cleared_status]
+        repaints = []
+        ctx = SimpleNamespace(
+            folded=["codex", cleared_status, [(kept_status, [kept, kept]), (cleared_status, [cleared])]],
+            blocks=blocks,
+            feed_log=[line for block in blocks for line in block],
+            show=lambda m: "full:" + m["id"],
+            repaint=lambda: repaints.append(True),
+        )
+        with seam(mod, "log.read_messages", lambda: [kept]):
+            mod.chat_restore_folded(ctx)
+        self.assertEqual(blocks, [["other"], ["full:kept"]])
+        self.assertEqual(ctx.feed_log, ["other", "full:kept"])
+        self.assertEqual(ctx.folded, [None, None, []])
+        self.assertEqual(repaints, [True])
 
     def test_a_quiet_note_is_one_pale_line_in_the_feed_and_not_for_you(self):
         # In the person's feed a quiet note («the machine is free») is a pale line —
@@ -12329,6 +14564,7 @@ class DeliveryTest(Base):
         self.assertTrue(rec, "the chat wrote the panel's window down")
         panel = rec["pane"]
         self.assertTrue(self.wait_for(panel, "Андрей → Коди ›"), self.screen(panel))
+        self._attach_dm_client()
         # The chat got narrower: it is drawn again — the draft hint of «/dm Коди» stayed over its
         # input.
         self.assertTrue(self.until(lambda: "Clear draft" not in self.screen(chat), timeout=10), self.screen(chat))
@@ -12971,9 +15207,13 @@ class DeliveryTest(Base):
     def test_restart_continues_the_agents_own_conversation_in_its_window(self):
         # A Codex reads its rules only at start; after a new rule it asked the person for
         # every answer. /restart starts it again in its window with the same conversation.
+        lsof = shutil.which("lsof")
+        if not lsof:
+            self.skipTest("lsof is needed to prove the process owns its rollout")
         fake_bin = self.root / "bin"
         fake_bin.mkdir()
         (fake_bin / "tmux").symlink_to(shutil.which("tmux"))
+        (fake_bin / "lsof").symlink_to(lsof)
         argv = self.root / "codex-argv"
         codex = fake_bin / "codex"
         # Its help (asked whether it takes --no-daemon) answers at once and is not a start.
@@ -13040,7 +15280,7 @@ class DeliveryTest(Base):
                 "kodi",
                 "sh",
                 "-c",
-                "echo '› Ask Codex to do anything'; sleep 60",
+                f"exec 3< {shlex.quote(str(logs / f'rollout-a-{sid}.jsonl'))}; echo '› Ask Codex to do anything'; sleep 60",
             ],
             capture_output=True,
             text=True,
@@ -13204,7 +15444,9 @@ class DeliveryTest(Base):
         fake_bin = self.root / "bin"
         fake_bin.mkdir()
         (fake_bin / "tmux").symlink_to(shutil.which("tmux"))
-        (fake_bin / "codex").write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        (fake_bin / "codex").write_text(
+            '#!/bin/sh\nif [ "$1" = "--version" ]; then echo test-version; exit 0; fi\nsleep 30\n', encoding="utf-8"
+        )
         (fake_bin / "codex").chmod(0o755)
         self.write_config(
             [
@@ -13568,7 +15810,7 @@ class DeliveryTest(Base):
         # Most used first; the menu is taller than the window, so its top and its end are read apart.
         expected = [
             "/open", "/dm", "/mine", "/answer", "/view", "/team", "/restart", "/add", "/pause", "/resume", "/rest",
-            "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/language", "/clear", "/stop", "/exit",
+            "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/vpn", "/language", "/clear", "/stop", "/exit",
         ]  # fmt: skip
 
         def column():  # the menu's rows: the last unbroken run of command lines (the start card names a few too)
@@ -13862,8 +16104,14 @@ class DeliveryTest(Base):
         # «how do I go back in the menu? — everywhere, not only in /add».
         fake_bin = self.root / "bin"
         fake_bin.mkdir()
-        (fake_bin / "claude").write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        (fake_bin / "claude").write_text(
+            '#!/bin/sh\nif [ "$1" = "--version" ]; then echo test-version; exit 0; fi\nsleep 30\n', encoding="utf-8"
+        )
         (fake_bin / "claude").chmod(0o755)
+        (fake_bin / "codex").write_text(
+            '#!/bin/sh\nif [ "$1" = "--version" ]; then echo test-version; exit 0; fi\nsleep 30\n', encoding="utf-8"
+        )
+        (fake_bin / "codex").chmod(0o755)
         self.write_config(
             [
                 {
@@ -15118,7 +17366,7 @@ class DeliveryTest(Base):
         entry = next(p for p in mod.load_config()["participants"] if p["id"] == pid)
         check(entry["target"], resumed=True)
 
-    def _codex_view_client(self):
+    def _codex_view_client(self, mode_keys="vi"):
         """A fullscreen Codex stand-in in the room, its view made by view_options and a client of the
         view in a pty: returns the agent's pane, the pty's master, the agent's input file and its mode."""
         import pty
@@ -15127,6 +17375,7 @@ class DeliveryTest(Base):
         mod = _Loader("collab_wheel", str(COLLAB)).load_module()
         subprocess.run(["tmux", "new-session", "-d", "-s", self.session, "sleep 60"], check=True)
         subprocess.run(["tmux", "set-option", "-t", f"={self.session}:", "mouse", "off"], check=True)
+        subprocess.run(["tmux", "set-option", "-g", "mode-keys", mode_keys], check=True)
         received = self.root / "received"
         agent = self.root / "wheel_agent.py"
         agent.write_text(
@@ -15216,6 +17465,227 @@ class DeliveryTest(Base):
         self.assertTrue(self.until(lambda: mode() == "1"), "C-b [ enters scrollback in the view")
         self.assertEqual(received.read_bytes(), b"hello", "the prefix and «[» are tmux's, not the agent's input")
 
+    def _assert_mouse_drag_copy(self, mode_keys):
+        clip = self.root / "clipboard #;$`touch PWNED`.out"
+        helper = self.root / "clipboard #;$`touch PWNED`.py"
+        helper.write_text(
+            "import sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_bytes(sys.stdin.buffer.read())\n", encoding="utf-8"
+        )
+        command = shlex.join([sys.executable, str(helper), str(clip)])
+        with mock.patch.dict(os.environ, {"COLLAB_CLIPBOARD": command}):
+            pane, master, received, mode = self._codex_view_client(mode_keys)
+        first = (
+            subprocess.run(["tmux", "capture-pane", "-p", "-t", pane], capture_output=True, text=True, check=True)
+            .stdout.splitlines()[0]
+            .rstrip()
+        )
+        self.assertTrue(first)
+        os.write(master, b"\x1b[<0;1;1M")
+        os.write(master, f"\x1b[<32;{len(first) + 1};1M".encode())
+        self.assertTrue(self.until(lambda: mode() == "1"), "mouse-drag starts a selection in copy mode")
+        os.write(master, f"\x1b[<0;{len(first) + 1};1m".encode())
+        self.assertTrue(self.until(clip.exists), "drag-end reaches the configured clipboard")
+        self.assertEqual(clip.read_text(), first + ("\n" if mode_keys == "vi" else ""))
+        copied = subprocess.run(["tmux", "show-buffer"], capture_output=True, text=True, check=True).stdout.rstrip("\n")
+        self.assertEqual(copied, first, "the same exact selection stays in tmux's buffer")
+        self.assertEqual(received.read_bytes(), b"hello", "no mouse escape reaches the agent")
+        self.assertFalse((self.root / "PWNED").exists(), "clipboard paths are data, not shell syntax")
+
+    def test_mouse_drag_copies_exact_selection_in_codex_view_vi(self):
+        self._assert_mouse_drag_copy("vi")
+
+    def test_mouse_drag_copies_exact_selection_in_codex_view_emacs(self):
+        self._assert_mouse_drag_copy("emacs")
+
+    def test_codex_copy_wrapper_refreshes_backend_and_stays_idempotent(self):
+        def clipboard(name):
+            helper = self.root / f"{name}.py"
+            clip = self.root / f"{name}.out"
+            helper.write_text(
+                "import sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_bytes(sys.stdin.buffer.read())\n",
+                encoding="utf-8",
+            )
+            return shlex.join([sys.executable, str(helper), str(clip)]), clip, helper
+
+        first_command, first_clip, _ = clipboard("first-backend")
+        second_command, second_clip, second_helper = clipboard("second-backend")
+        marker = self.root / "global-copy-marker"
+        marker_helper = self.root / "global-copy.py"
+        marker_helper.write_text("import sys\nopen(sys.argv[1], 'w').write('called')\n", encoding="utf-8")
+        marker_command = shlex.join([sys.executable, str(marker_helper), str(marker)])
+        for table in ("copy-mode", "copy-mode-vi"):
+            subprocess.run(
+                [
+                    "tmux",
+                    "bind-key",
+                    "-T",
+                    table,
+                    "MouseDragEnd1Pane",
+                    "send-keys",
+                    "-X",
+                    "copy-pipe-and-cancel",
+                    marker_command,
+                ],
+                check=True,
+            )
+        with mock.patch.dict(os.environ, {"COLLAB_CLIPBOARD": first_command}):
+            pane, master, received, mode = self._codex_view_client("vi")
+        mod = _Loader("collab_mouse_refresh", str(COLLAB)).load_module()
+        view = f"{self.session}-view"
+
+        def reopen(command):
+            with mock.patch.dict(os.environ, {"COLLAB_CLIPBOARD": command}):
+                chain = mod.view_options(view, {"kind": "codex"}, "Codex", "back")
+            subprocess.run(["tmux", *chain[:-1]], check=True)
+            return {
+                table: subprocess.run(
+                    ["tmux", "list-keys", "-T", table, "MouseDragEnd1Pane"], capture_output=True, text=True, check=True
+                ).stdout
+                for table in ("copy-mode", "copy-mode-vi")
+            }
+
+        before = reopen(first_command)
+        after = reopen(second_command)
+        self.assertEqual(after, before, "reopening does not nest or rewrite either wrapper")
+        selected_backend = subprocess.run(
+            ["tmux", "show-options", "-v", "-t", f"={view}:", mod.CODEX_CLIPBOARD],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        self.assertEqual(selected_backend, second_command)
+        first = (
+            subprocess.run(["tmux", "capture-pane", "-p", "-t", pane], capture_output=True, text=True, check=True)
+            .stdout.splitlines()[0]
+            .rstrip()
+        )
+
+        def drag():
+            os.write(master, b"\x1b[<0;1;1M")
+            os.write(master, f"\x1b[<32;{len(first) + 1};1M".encode())
+            self.assertTrue(self.until(lambda: mode() == "1"))
+            os.write(master, f"\x1b[<0;{len(first) + 1};1m".encode())
+            self.assertTrue(self.until(lambda: mode() == "0"))
+
+        drag()
+        self.assertTrue(self.until(second_clip.exists))
+        self.assertEqual(second_clip.read_text(), first + "\n")
+        self.assertFalse(first_clip.exists())
+        self.assertFalse(marker.exists())
+
+        second_clip.unlink()
+        missing = reopen("/nonexistent/collab-clipboard-backend")
+        self.assertEqual(missing, before)
+        drag()
+        self.assertFalse(second_clip.exists(), "an unavailable backend never runs the user's global copy action")
+        self.assertFalse(marker.exists())
+        copied = subprocess.run(["tmux", "show-buffer"], capture_output=True, text=True, check=True).stdout.rstrip("\n")
+        self.assertEqual(copied, first)
+
+        self.assertEqual(reopen(second_command), before)
+        second_helper.unlink()
+        drag()
+        self.assertFalse(second_clip.exists(), "a backend removed after reopen leaves only the tmux buffer")
+        self.assertFalse(marker.exists())
+        copied = subprocess.run(["tmux", "show-buffer"], capture_output=True, text=True, check=True).stdout.rstrip("\n")
+        self.assertEqual(copied, first)
+        self.assertEqual(received.read_bytes(), b"hello")
+
+    def test_codex_copy_wrapper_preserves_compound_action_outside_view(self):
+        import pty
+
+        marker = self.root / "compound #;$ marker"
+        marker_helper = self.root / "compound #;$ helper.py"
+        marker_helper.write_text("import sys\nopen(sys.argv[1], 'w').write('called')\n", encoding="utf-8")
+        marker_command = shlex.join([sys.executable, str(marker_helper), str(marker)])
+        binding = self.root / "compound-binding.conf"
+        binding.write_text(
+            "\n".join(
+                f"""bind-key -T {table} MouseDragEnd1Pane {{
+ run-shell {json.dumps(marker_command)}
+ send-keys -X copy-selection-and-cancel
+}}"""
+                for table in ("copy-mode", "copy-mode-vi")
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["tmux", "source-file", str(binding)], check=True)
+        owned_clip = self.root / "owned-clipboard"
+        owned_helper = self.root / "owned-clipboard.py"
+        owned_helper.write_text(
+            "import sys\nfrom pathlib import Path\nPath(sys.argv[1]).write_bytes(sys.stdin.buffer.read())\n",
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"COLLAB_CLIPBOARD": shlex.join([sys.executable, str(owned_helper), str(owned_clip)])}):
+            pane, master, received, mode = self._codex_view_client("vi")
+        first = (
+            subprocess.run(["tmux", "capture-pane", "-p", "-t", pane], capture_output=True, text=True, check=True)
+            .stdout.splitlines()[0]
+            .rstrip()
+        )
+
+        def drag(target):
+            os.write(target, b"\x1b[<0;1;1M")
+            os.write(target, f"\x1b[<32;{len(first) + 1};1M".encode())
+            self.assertTrue(self.until(lambda: mode() == "1"))
+            os.write(target, f"\x1b[<0;{len(first) + 1};1m".encode())
+            self.assertTrue(self.until(lambda: mode() == "0"))
+
+        drag(master)
+        self.assertTrue(self.until(owned_clip.exists))
+        self.assertEqual(owned_clip.read_text(), first + "\n")
+        self.assertFalse(marker.exists(), "the owned view replaces, rather than runs, the compound action")
+        owned_clip.unlink()
+
+        other = f"{self.session}-other"
+        subprocess.run(["tmux", "new-session", "-d", "-t", f"={self.session}", "-s", other], check=True)
+        self.addCleanup(subprocess.run, ["tmux", "kill-session", "-t", f"={other}"], capture_output=True)
+        subprocess.run(["tmux", "set-option", "-t", f"={other}:", "mouse", "on"], check=True)
+        window = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{window_id}"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        subprocess.run(["tmux", "select-window", "-t", f"={other}:{window}"], check=True)
+        other_master, slave = pty.openpty()
+        client = subprocess.Popen(["tmux", "attach", "-t", f"={other}"], stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+
+        def drain():
+            with contextlib.suppress(OSError):
+                while os.read(other_master, 65536):
+                    pass
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+
+        def close():
+            client.terminate()
+            client.wait(timeout=5)
+            reader.join(5)
+            os.close(other_master)
+
+        self.addCleanup(close)
+        drag(other_master)
+        self.assertTrue(self.until(marker.exists), "the untouched session runs its original compound action")
+        self.assertFalse(owned_clip.exists(), "another session never uses the owned view's clipboard")
+        copied = subprocess.run(["tmux", "show-buffer"], capture_output=True, text=True, check=True).stdout.rstrip("\n")
+        self.assertEqual(copied, first)
+        self.assertEqual(received.read_bytes(), b"hello")
+
+    def test_codex_copy_wrapper_leaves_unknown_bindings_untouched(self):
+        mod = _Loader("collab_mouse_unknown_binding", str(COLLAB)).load_module()
+        results = (
+            subprocess.CompletedProcess(["tmux"], 1, "", "failed"),
+            subprocess.CompletedProcess(["tmux"], 0, "not-a-binding\n", ""),
+            subprocess.CompletedProcess(
+                ["tmux"], 0, 'bind-key -T copy-mode MouseDragEnd1Pane display-message -p "unterminated\n', ""
+            ),
+        )
+        for result in results:
+            with self.subTest(result=result), seam(mod, "tmux", mock.Mock(return_value=result)) as tmux:
+                mod.install_codex_copy_binding("copy-mode")
+                self.assertEqual(tmux.call_count, 1, "no source-file or empty fallback is installed")
+
     def test_open_gives_an_agents_window_to_a_new_tab_and_the_chat_stays(self):
         # «a full window with the agent», in a new terminal tab: /open → choose the
         # agent → the steps, the command already copied. The chat's tab stays where it is,
@@ -15296,12 +17766,19 @@ class DeliveryTest(Base):
         keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", chat, *k], check=True)
         keys("-l", "/open")
         keys("Enter")
-        self.assertTrue(self.wait_for(chat, "Open an agent's window  ↑↓"), self.screen(chat))
-        self.assertIn("Коди — not in tmux", self.screen(chat))
+        # Each step in one look at the screen: the chat repaints it whole once a menu closes, and tmux shows the
+        # cleared screen until the rest is written — a second look right after the first caught it blank.
+        self.assertTrue(self.wait_all(chat, "Open an agent's window  ↑↓", "Коди — not in tmux"), self.screen(chat))
         keys("Down", "Enter")  # «Бэк …»
-        self.assertTrue(self.wait_for(chat, "already in your clipboard"), self.screen(chat))
-        self.assertIn("If pasting doesn't work, copy this command yourself", self.screen(chat), "and the command is shown")
-        self.assertIn("Open a new terminal tab (+)", self.screen(chat))
+        self.assertTrue(
+            self.wait_all(
+                chat,
+                "already in your clipboard",
+                "If pasting doesn't work, copy this command yourself",  # and the command is shown
+                "Open a new terminal tab (+)",
+            ),
+            self.screen(chat),
+        )
         command = clip.read_text(encoding="utf-8")
         self.assertTrue(command.endswith(" open bek"), f"only this room has it: the short command ({command!r})")
         # The new tab: another terminal, another folder, no room in its environment.
@@ -16101,6 +18578,7 @@ class DeliveryTest(Base):
         self.assertEqual(self.run_collab("start").returncode, 0)
         pane = json.loads((self.state / "panes.json").read_text())["panes"]["owner"]
         self.assertTrue(self.wait_for(pane, "an old line to be cleared"))
+        self.assertTrue(self.wait_chat(pane), self.screen(pane))
         keys = lambda *k: subprocess.run(["tmux", "send-keys", "-t", pane, *k], check=True)
         keys("-l", "/pause")
         keys("Enter")
@@ -16256,12 +18734,23 @@ class DeliveryTest(Base):
         self.run_collab("status", "--as", "claude", "idle")
         # Wide enough for both names with models (a narrow window cuts them with «…»).
         subprocess.run(["tmux", "resize-window", "-t", f"={self.session}:room", "-x", "140", "-y", "24"], check=True)
+
+        # Capture one complete bar: a later read can fall between clearing and repainting it.
+        def ready_bar():
+            return next(
+                (
+                    line
+                    for line in self.screen(panes["owner"]).splitlines()
+                    if re.search(r"Коди: Ready +GPT-6-Luna", line) and re.search(r"Клод: Ready +Opus 5\.5", line)
+                ),
+                "",
+            )
+
+        bar = self.until(ready_bar)
+        self.assertTrue(bar, "both agents and their models share one ready status bar")
         # The model at the cell's right edge («spread the words to the edges»).
-        self.assertTrue(self.wait_for(panes["owner"], "GPT-6-Luna"), self.screen(panes["owner"]))
-        self.assertTrue(self.wait_for(panes["owner"], "Клод: Ready"), "a self-reported model is kept")
-        self.assertRegex(self.screen(panes["owner"]), r"Коди: Ready +GPT-6-Luna")
-        self.assertRegex(self.screen(panes["owner"]), r"Клод: Ready +Opus 5\.5")
-        bar = [x for x in self.screen(panes["owner"]).splitlines() if x.strip()][-1]
+        self.assertRegex(bar, r"Коди: Ready +GPT-6-Luna")
+        self.assertRegex(bar, r"Клод: Ready +Opus 5\.5")
         self.assertLessEqual(
             bar.index("Клод") - bar.index("Коди"), 44, "a wide window: a cell stops at 40 columns, the name stays near its model"
         )
@@ -16659,6 +19148,246 @@ class RoomPathsTest(Base):
             self.assertFalse(hasattr(self.mod, name), name)
 
 
+class DeliveryOnlyTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.mod = _Loader(f"collab_deliveryonly_{uuid.uuid4().hex[:6]}", str(COLLAB)).load_module()
+        self.mod.use_room(str(self.root))
+        self.session = "collab-delivery-only-test"
+        self.write_config([{"id": "owner", "command": ["python3", str(COLLAB), "chat", "--as", "owner"]}], session=self.session)
+        self.effects = []
+        self.present = True
+        self.mark = os.path.realpath(self.root)
+
+    def isolated_start(self):
+        stack = contextlib.ExitStack()
+        for name in (
+            "lifecycle.start_deliverer",
+            "lifecycle.start_telegram",
+            "lifecycle.room_options",
+            "lifecycle.restore_owner_pane",
+            "lifecycle.old_chat",
+            "lifecycle.not_running",
+            "lifecycle.refresh_codex_rules",
+            "installer.update_in_background",
+            "log.owner_key",
+            "store.record_room_root",
+            "agents.remember_room",
+            "tmuxio.attach",
+        ):
+            stack.enter_context(seam(self.mod, name, lambda *a, _name=name, **k: self.effects.append(_name)))
+        stack.enter_context(
+            seam(self.mod, "tmuxio.tmux", lambda *a, **k: subprocess.CompletedProcess(a, 0 if self.present else 1, "", ""))
+        )
+        stack.enter_context(seam(self.mod, "tmuxio.session_room", lambda *a: self.mark))
+        stack.enter_context(seam(self.mod, "tmuxio.tmux_can_read", lambda *a: True))
+        stack.enter_context(seam(self.mod, "tmuxio.leave_venv", lambda: ""))
+        stack.enter_context(seam(self.mod, "lifecycle.deliverer_outside", lambda *a: ""))
+        return stack
+
+    def start(self):
+        args = self.mod.build_parser().parse_args(["start", "--delivery-only"])
+        args.func(args)
+
+    def test_only_delivery_is_restarted_even_without_an_owner_pane(self):
+        before = self.cfg.read_bytes()
+        with self.isolated_start():
+            self.start()
+        self.assertEqual(self.effects, ["lifecycle.start_deliverer"])
+        self.assertEqual(self.cfg.read_bytes(), before)
+        self.assertFalse((self.state / "panes.json").exists(), "no owner restoration")
+
+    def test_a_missing_or_foreign_session_is_refused_without_effects(self):
+        for present, mark in ((False, self.mark), (True, str(self.root / "another")), (True, "")):
+            with self.subTest(present=present, mark=mark), self.isolated_start():
+                self.present, self.mark = present, mark
+                with self.assertRaises(SystemExit):
+                    self.start()
+                self.assertEqual(self.effects, [])
+
+    def test_a_missing_room_is_not_created(self):
+        self.cfg.unlink()
+        with self.isolated_start(), self.assertRaises(SystemExit):
+            self.start()
+        self.assertEqual(self.effects, [])
+        self.assertFalse(self.cfg.exists())
+
+    def test_an_outside_deliverer_is_not_stopped_or_replaced(self):
+        with self.isolated_start(), seam(self.mod, "lifecycle.deliverer_outside", lambda *a: "123"):
+            with self.assertRaises(SystemExit):
+                self.start()
+        self.assertEqual(self.effects, [])
+
+    def test_a_legacy_room_is_not_migrated(self):
+        before = self.cfg.read_bytes()
+        with self.isolated_start(), seam_room(self.mod, base=self.root), self.assertRaises(SystemExit):
+            self.start()
+        self.assertEqual(self.effects, [])
+        self.assertEqual(self.cfg.read_bytes(), before)
+
+    def test_failed_delivery_window_start_is_reported_as_failure(self):
+        for exists in (True, False):
+            with self.subTest(existing_window=exists):
+                calls = []
+
+                def tmux(*args, _calls=calls, _exists=exists, **kwargs):
+                    _calls.append(args[0])
+                    rc = 0 if args[0] == "has-session" else ((0 if _exists else 1) if args[0] == "list-panes" else 1)
+                    return subprocess.CompletedProcess(args, rc, "", "failed")
+
+                real_start = self.mod.start_deliverer
+                with (
+                    self.isolated_start(),
+                    seam(self.mod, "lifecycle.start_deliverer", real_start),
+                    seam(self.mod, "tmuxio.tmux", tmux),
+                ):
+                    with self.assertRaises(SystemExit):
+                        self.start()
+                self.assertEqual(self.effects, [])
+                self.assertIn("respawn-window" if exists else "new-window", calls)
+
+    @unittest.skipUnless(HAVE_TMUX, "tmux required")
+    def test_real_delivery_restart_preserves_other_processes_and_does_not_restore_chat(self):
+        session = f"collab-delivery-only-{uuid.uuid4().hex[:6]}"
+        subprocess.run(["tmux", "new-session", "-d", "-s", session, "-n", "room", "/bin/sleep", "120"], check=True)
+        self.addCleanup(lambda: subprocess.run(["tmux", "kill-session", "-t", f"={session}"], capture_output=True))
+        subprocess.run(["tmux", "set-option", "-t", session, "@collab_root", os.path.realpath(self.root)], check=True)
+        for name in ("agent", "telegram", "deliver"):
+            subprocess.run(["tmux", "new-window", "-d", "-t", f"={session}:", "-n", name, "/bin/sleep", "120"], check=True)
+
+        def process(name):
+            r = subprocess.run(
+                ["tmux", "list-panes", "-a", "-F", "#{session_name}\t#{window_name}\t#{pane_id}\t#{pane_pid}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            for line in r.stdout.splitlines():
+                fields = line.split("\t")
+                if fields[:2] == [session, name]:
+                    return fields[2:]
+            return []
+
+        before = {name: process(name) for name in ("room", "agent", "telegram", "deliver")}
+        self.write_config(
+            [
+                {"id": "owner", "command": ["python3", str(COLLAB), "chat", "--as", "owner"], "delivery": "pull"},
+                {"id": "agent", "kind": "codex", "target": before["agent"][0], "delivery": "pull"},
+            ],
+            session=session,
+        )
+        config = self.cfg.read_bytes()
+        self.state.mkdir(exist_ok=True)
+        panes = {"session": session, "panes": {"owner": before["room"][0]}}
+        (self.state / "panes.json").write_text(json.dumps(panes))
+        started = self.run_collab("start", "--delivery-only")
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        lock = self.state / "deliver.lock"
+        self.assertTrue(self.until(lambda: lock.exists() and lock.read_text().strip() != before["deliver"][1]))
+        first = lock.read_text().strip()
+        self.assertEqual(process("deliver")[1], first)
+        for name in ("room", "agent", "telegram"):
+            self.assertEqual(process(name), before[name], f"{name} must not restart")
+        self.assertEqual(self.cfg.read_bytes(), config)
+        subprocess.run(["tmux", "kill-pane", "-t", before["room"][0]], check=True)
+        restarted = self.run_collab("start", "--delivery-only")
+        self.assertEqual(restarted.returncode, 0, restarted.stdout + restarted.stderr)
+        self.assertTrue(self.until(lambda: lock.read_text().strip() not in ("", first)))
+        self.assertFalse(process("room"), "an absent chat is not restored")
+        for name in ("agent", "telegram"):
+            self.assertEqual(process(name), before[name])
+        self.assertEqual(self.cfg.read_bytes(), config)
+        self.assertEqual(json.loads((self.state / "panes.json").read_text()), panes)
+
+    @unittest.skipUnless(HAVE_TMUX, "tmux required")
+    def test_delivery_restart_preserves_the_attached_clients_current_window(self):
+        import pty
+
+        session = f"collab-delivery-focus-{uuid.uuid4().hex[:6]}"
+        subprocess.run(["tmux", "new-session", "-d", "-s", session, "-n", "room", "/bin/sleep", "120"], check=True)
+        self.addCleanup(lambda: subprocess.run(["tmux", "kill-session", "-t", f"={session}"], capture_output=True))
+        subprocess.run(["tmux", "set-option", "-t", session, "@collab_root", os.path.realpath(self.root)], check=True)
+        subprocess.run(["tmux", "new-window", "-d", "-t", f"={session}:", "-n", "deliver", "/bin/sleep", "120"], check=True)
+        room = subprocess.run(
+            ["tmux", "list-panes", "-t", f"={session}:=room", "-F", "#{pane_id}"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        self.write_config([{"id": "owner", "command": ["python3", str(COLLAB), "chat", "--as", "owner"]}], session=session)
+        self.state.mkdir(exist_ok=True)
+        (self.state / "panes.json").write_text(json.dumps({"session": session, "panes": {"owner": room}}))
+        subprocess.run(["tmux", "select-window", "-t", f"={session}:=room"], check=True)
+        master, slave = pty.openpty()
+        client = subprocess.Popen(["tmux", "attach", "-t", f"={session}"], stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+
+        def drain():
+            with contextlib.suppress(OSError):
+                while os.read(master, 65536):
+                    pass
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+
+        def close():
+            if client.poll() is None:
+                client.terminate()
+            client.wait(timeout=5)
+            reader.join(5)
+            os.close(master)
+
+        self.addCleanup(close)
+
+        def current():
+            return subprocess.run(
+                ["tmux", "display-message", "-p", "-t", f"={session}:", "#{window_name}"], capture_output=True, text=True
+            ).stdout.strip()
+
+        self.assertEqual(current(), "room")
+        existing = self.run_collab("start", "--delivery-only")
+        self.assertEqual(existing.returncode, 0, existing.stdout + existing.stderr)
+        after_existing = current()
+        subprocess.run(["tmux", "select-window", "-t", f"={session}:=room"], check=True)
+        subprocess.run(["tmux", "kill-pane", "-t", f"={session}:=deliver"], check=True)
+        missing = self.run_collab("start", "--delivery-only")
+        self.assertEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+        after_missing = current()
+        subprocess.run(["tmux", "new-window", "-d", "-t", f"={session}:", "-n", "agentview", "/bin/sleep", "120"], check=True)
+        subprocess.run(["tmux", "select-window", "-t", f"={session}:=agentview"], check=True)
+        agentview = self.run_collab("start", "--delivery-only")
+        self.assertEqual(agentview.returncode, 0, agentview.stdout + agentview.stderr)
+        after_agentview = current()
+        print(json.dumps({"after_existing": after_existing, "after_missing": after_missing, "after_agentview": after_agentview}))
+        self.assertEqual(after_existing, "room", "existing delivery changed the attached client's current window")
+        self.assertEqual(after_missing, "room", "missing delivery changed the attached client's current window")
+        self.assertEqual(after_agentview, "agentview", "the original non-room window was not restored")
+
+    def test_delivery_window_restore_is_conditional_and_failure_safe(self):
+        for original, selected, expected in (("@1", "@2", "@1"), ("@1", "@3", None), ("unknown", "@2", None)):
+            with self.subTest(original=original, selected=selected):
+                calls = []
+                shown = iter([original, selected])
+
+                def tmux(*args, _shown=shown, _calls=calls, **kwargs):
+                    if args[0] == "display-message":
+                        return subprocess.CompletedProcess(args, 0, next(_shown) if args[-2] == f"={self.session}:" else "@2", "")
+                    if args[0] == "select-window":
+                        _calls.append(args)
+                        return subprocess.CompletedProcess(args, 1, "", "original window is gone")
+                    return subprocess.CompletedProcess(args, 0, "", "")
+
+                def fail(*args, **kwargs):
+                    raise SystemExit(2)
+
+                with (
+                    self.isolated_start(),
+                    seam(self.mod, "lifecycle.start_deliverer", fail),
+                    seam(self.mod, "tmuxio.tmux", tmux),
+                    self.assertRaises(SystemExit) as caught,
+                ):
+                    self.start()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertEqual(calls, [("select-window", "-t", f"={self.session}:{expected}")] if expected else [])
+
+
 class DeliveryTmuxBudgetTest(Base):
     """What one delivery tick asks tmux (agents + 1 + 2 per typing)."""
 
@@ -16697,7 +19426,7 @@ class DeliveryTmuxBudgetTest(Base):
             return 0, re.sub(r"#\{([^}]*)\}", lambda m: fields.get(m.group(1), ""), argv[-1]) + "\n"
         return 0, ""
 
-    def tmux(self, *argv, check=True):
+    def tmux(self, *argv, check=True, timeout=None):
         # tmux runs a chain «a ; b» in one process and stops at the first that fails.
         self.calls.append(argv)
         commands, out = [[]], ""
@@ -17263,6 +19992,33 @@ class PromptsTest(unittest.TestCase):
         self.assertFalse(holds("────\n❯ [lead → yadro] step 1. check the build\n────\n"), "only part of it")
         self.assertFalse(holds(box + "⏺ " + "a screen of something else " * 20 + "\n"), "more than its frame below it")
 
+    def test_a_claudes_fold_of_a_text_typed_into_its_turn_reads_as_ours_and_not_taken(self):
+        # Typed into a running turn, a 914-byte message folded to «[Pasted text #5]», «paste again to expand» under
+        # its box: read as a changed screen, it stood there unsent (Claude Code 2.1.311).
+        rules = {k: v for k, v in self.mod.PRESETS["claude"].items() if k in self.mod.SCREEN_KEYS}
+        shot = self.mod.Shot(0, self.screen("claude-2.1.311-busy-fold"), "")
+        self.assertEqual(self.mod.screen_state(rules, "%1", shot)[0], "working")
+        self.assertTrue(self.mod.input_ours(rules, shot, "x" * 900, "[Pasted text #5]"), "its own fold: pressed again")
+        self.assertFalse(self.mod.input_ours(rules, shot, "x" * 900, "[Pasted text #4]"), "a later paste's fold")
+        self.assertFalse(self.mod.input_free(rules, shot, queue_too=False), "not taken")
+
+    def test_a_claudes_box_as_tall_as_it_grows_showing_our_texts_end_reads_as_ours(self):
+        # Typed into a running turn in a 60×30 window, a 1038-byte message filled Claude's box to its 10 rows and it
+        # scrolled to the text's end: read as a changed screen, it was never pressed again (Claude Code 2.1.311).
+        rules = {k: v for k, v in self.mod.PRESETS["claude"].items() if k in self.mod.SCREEN_KEYS}
+        shot = self.mod.Shot(0, self.screen("claude-2.1.311-busy-tall-60x30"), "")
+        tail = (
+            "/home/user/projects/collab-room/tools/collab-current say --room /tmp/probe/room --from worker3 --to lead"
+            " --re 9fe3171002f1 - <<'END_5a70bbb1a3bc' ↵ … ↵ END_5a70bbb1a3bc · if no answer is needed: python3"
+            " /home/user/projects/collab-room/tools/collab-current ack --room /tmp/probe/room --for worker3"
+            " --no-reply --id 9fe3171002f1)"
+        )
+        text = "[lead → worker3] " + "a word " * 70 + " (answer: python3 " + tail
+        self.assertTrue(self.mod.input_ours(rules, shot, text), "its tail in a full box: pressed again")
+        self.assertFalse(self.mod.input_ours(rules, shot, text + " more"), "not our text's end")
+        self.assertFalse(self.mod.input_ours(rules, shot, text.replace("worker3 --no-reply", "worker3 --x")))
+        self.assertFalse(self.mod.input_free(rules, shot, queue_too=False), "not taken")
+
     def test_a_working_agents_input_is_read_as_empty_drafted_or_with_a_message_queued_from_real_screens(self):
         # Typed into a running turn only into an empty input: a person's draft under «Working» is the person's, and
         # a message already in the agent's queue waits there first.
@@ -17368,6 +20124,180 @@ class PromptsTest(unittest.TestCase):
         self.assertNotEqual(self.mod.read_prompt("claude", "2.1.310", moved, 110)["print"], first)
         other = claude.replace("touch a1.txt", "rm -rf build")
         self.assertNotEqual(self.mod.read_prompt("claude", "2.1.310", other, 110)["print"], first)
+
+    def test_kimi_cache_expired_is_attention_and_a_complete_version_bound_prompt(self):
+        text = self.screen("kimi-2.4.1-cache-expired-100")
+        below_tail = text + "\n" + " \n" * 12
+        state = self.mod.screen_state(self.mod.PRESETS["kimi"], "%1", self.mod.Shot(0, below_tail, ""))
+        self.assertEqual(state, ("needs_owner", "Cache expired"))
+        got = self.mod.read_prompt("kimi", "2.4.1", text, 100)
+        self.assertEqual(
+            got["lines"],
+            [
+                "This session has been idle for 7h 39m and is ~12.1k tokens.",
+                "Cache expired — the next message re-sends the entire history at full price.",
+            ],
+        )
+        self.assertEqual(
+            [option["lines"] for option in got["options"]],
+            [
+                ["Compact and continue", "one-time compact cost · cheapest way to keep this topic"],
+                ["Start a new session", "zero context cost · best for a new task"],
+                ["Continue as-is", "full history kept · highest cost per turn"],
+                ["Don't ask me again"],
+            ],
+        )
+        self.assertEqual(got["selected"], 1)
+        for count in ("1k", "1M", "1.5M", "512"):
+            with self.subTest(count=count):
+                native = self.mod.read_prompt("kimi", "2.4.1", text.replace("12.1k", count), 100)
+                self.assertIsNotNone(native, count)
+        moved = text.replace("   ❯ Compact and continue", "     Compact and continue").replace(
+            "     Continue as-is", "   ❯ Continue as-is"
+        )
+        other = self.mod.read_prompt("kimi", "2.4.1", moved, 100)
+        self.assertEqual(other["selected"], 3)
+        self.assertNotEqual(other["print"], got["print"])
+        truncated = self.screen("kimi-2.4.1-cache-expired-60")
+        self.assertIsNone(self.mod.read_prompt("kimi", "2.4.1", truncated, 60), "native truncation grants no buttons")
+        narrow_state = self.mod.screen_state(self.mod.PRESETS["kimi"], "%1", self.mod.Shot(0, truncated + "\n" + " \n" * 12, ""))
+        self.assertEqual(narrow_state, ("needs_owner", "Cache expired"))
+
+    def test_kimi_cache_modal_with_native_status_footer_is_still_current(self):
+        # Captured native frame: status and context stay below the modal's closing rule.
+        text = " ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  This session has been idle for 31m and is ~599k tokens.\n  ↑↓ navigate · Enter select · Esc cancel\n\n  Cache expired — the next message re-sends the entire history at full price.\n   ❯ Compact and continue    one-time compact cost · cheapest way to keep this topic\n     Start a new session     zero context cost · best for a new task\n     Continue as-is          full history kept · highest cost per turn\n     Don't ask me again\n\n ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n Ask When Needed  K3.1 Pro Highspeed 2x Usage Cost thinking: high  ~/PycharmProjects/collab-room  main [±]                                                                                                 ctrl+o expand\n                                                                                                                                                                                                  context: 59% (599k/1M)\n"
+        width = 217
+        self.assertEqual(
+            self.mod.screen_state(self.mod.PRESETS["kimi"], "%1", self.mod.Shot(0, text, "")),
+            ("needs_owner", "Cache expired"),
+        )
+        prompt = self.mod.read_prompt("kimi", "2.4.1", text, width)
+        self.assertIsNotNone(prompt)
+        self.assertEqual(prompt["selected"], 1)
+        self.assertEqual(len(prompt["options"]), 4)
+        self.assertIsNone(self.mod.read_prompt("kimi", "2.4.2", text, width), "unknown version grants no buttons")
+        native_footer = "\n".join(text.splitlines()[-2:]) + "\n"
+        narrow = self.screen("kimi-2.4.1-cache-expired-60") + native_footer
+        self.assertEqual(
+            self.mod.screen_state(self.mod.PRESETS["kimi"], "%1", self.mod.Shot(0, narrow, "")),
+            ("needs_owner", "Cache expired"),
+        )
+        self.assertIsNone(self.mod.read_prompt("kimi", "2.4.1", narrow, 60), "truncated dialog grants no buttons")
+        for changed in (
+            text + self.screen("kimi-2.4.1-idle"),
+            text.replace(" Ask When Needed  ", " example footer "),
+            text.replace("context: 59% (599k/1M)", "context: quoted words"),
+            text.rsplit("\n", 2)[0] + "\n",
+            text + " unexplained trailing text\n",
+            "\n".join("    " + line for line in text.splitlines()),
+        ):
+            with self.subTest(changed=changed[-250:]):
+                self.assertIsNone(self.mod.kimi_cache_dialog(changed), "only the complete native footer can follow a modal")
+
+    def test_kimi_cache_prompt_rejects_incomplete_changed_quoted_and_unsupported_frames(self):
+        text = self.screen("kimi-2.4.1-cache-expired-100")
+        self.assertIsNone(self.mod.read_prompt("kimi", "2.4.2", text, 100))
+        self.assertIsNone(self.mod.read_prompt("kimi", "2.4.1", text, 99))
+        self.assertIsNone(
+            self.mod.read_prompt("kimi", "2.4.1", text.replace("  ↑↓ navigate · Enter select · Esc cancel\n", ""), 100)
+        )
+        self.assertIsNone(
+            self.mod.read_prompt("kimi", "2.4.1", text.replace("Start a new session", "Start a different session"), 100)
+        )
+        self.assertIsNone(
+            self.mod.read_prompt("kimi", "2.4.1", "  Cache expired\n  ↑↓ navigate · Enter select · Esc cancel\n", 100)
+        )
+        quoted = text + self.screen("kimi-2.4.1-idle")
+        self.assertIsNone(self.mod.read_prompt("kimi", "2.4.1", quoted, 100))
+        state = self.mod.screen_state(self.mod.PRESETS["kimi"], "%1", self.mod.Shot(0, quoted, ""))
+        self.assertEqual(state[0], "idle", "a quoted modal above the current editor is history")
+
+    def test_kimi_prompt_version_is_unknown_without_running_image_proof(self):
+        calls = []
+
+        def forbidden(argv, **_kwargs):
+            calls.append(argv)
+            raise AssertionError("no disk or PATH version without a running image identity")
+
+        with (
+            seam(self.mod, "prompts.sys.platform", "darwin"),
+            seam(self.mod, "prompts.subprocess.run", forbidden),
+        ):
+            self.assertEqual(self.mod.program_version("kimi", "kimi", "123"), "")
+        self.assertEqual(calls, [])
+        with self.assertRaises(ValueError):
+            self.mod.key_for("kimi", 1)
+
+    def test_kimi_linux_prompt_version_uses_proc_exe_and_rechecks_its_inode(self):
+        from types import SimpleNamespace
+
+        executable = "/opt/kimi/bin/kimi"
+        running = "/proc/123/exe"
+        links, stats = [], []
+
+        def readlink(path):
+            links.append(path)
+            return executable
+
+        def stat(path):
+            stats.append(path)
+            return SimpleNamespace(st_dev=7, st_ino=8)
+
+        def run_with_version(version, starts=None, timeout=False):
+            starts = iter(starts or ["process-start", "process-start"])
+            calls = []
+
+            def run(argv, **_kwargs):
+                if argv == ["ps", "-ww", "-o", "lstart=", "-p", "123"]:
+                    return SimpleNamespace(returncode=0, stdout=next(starts) + "\n")
+                if argv == [executable, "--version"]:
+                    calls.append(argv)
+                    if timeout:
+                        raise subprocess.TimeoutExpired(argv, 2)
+                    return SimpleNamespace(returncode=0, stdout=version + "\n")
+                raise AssertionError(argv)
+
+            return run, calls
+
+        self.enterContext(seam(self.mod, "prompts.sys.platform", "linux"))
+        self.enterContext(seam(self.mod, "prompts.os.readlink", readlink))
+        self.enterContext(seam(self.mod, "prompts.os.stat", stat))
+        run, _ = run_with_version("2.4.1")
+        with seam(self.mod, "prompts.subprocess.run", run):
+            self.assertEqual(self.mod.program_version("kimi", "kimi", "123"), "2.4.1")
+        self.assertEqual(links, [running, running])
+        self.assertEqual(stats.count(running), 2)
+        links.clear()
+        stats.clear()
+        run, _ = run_with_version("2.4.2")
+        with seam(self.mod, "prompts.subprocess.run", run):
+            self.assertEqual(self.mod.program_version("kimi", "kimi", "123"), "")
+        run, _ = run_with_version("2.4.1", ["process-start", "reused-start"])
+        with seam(self.mod, "prompts.subprocess.run", run):
+            self.assertEqual(self.mod.program_version("kimi", "kimi", "123"), "")
+        run, _ = run_with_version("2.4.1", timeout=True)
+        with seam(self.mod, "prompts.subprocess.run", run):
+            self.assertEqual(self.mod.program_version("kimi", "kimi", "123"), "")
+
+        after_stats = []
+
+        def replaced_after(path):
+            after_stats.append(path)
+            replaced = path == executable and after_stats.count(path) > 1
+            return SimpleNamespace(st_dev=7, st_ino=9 if replaced else 8)
+
+        run, calls = run_with_version("2.4.1")
+        with seam(self.mod, "prompts.os.stat", replaced_after), seam(self.mod, "prompts.subprocess.run", run):
+            self.assertEqual(self.mod.program_version("kimi", "kimi", "123"), "")
+        self.assertEqual(calls, [[executable, "--version"]])
+
+        def replaced_before(path):
+            return SimpleNamespace(st_dev=7, st_ino=9 if path == executable else 8)
+
+        run, calls = run_with_version("2.4.1")
+        with seam(self.mod, "prompts.os.stat", replaced_before), seam(self.mod, "prompts.subprocess.run", run):
+            self.assertEqual(self.mod.program_version("kimi", "kimi", "123"), "")
+        self.assertEqual(calls, [], "a replaced running image never borrows the disk version")
 
     def test_an_option_is_chosen_by_its_digit_alone(self):
         self.assertEqual(self.mod.key_for("codex", 2), "2")
@@ -17766,14 +20696,15 @@ class TelegramTest(Base):
         self.mod.write_status("ann", "needs_owner", "Do you want to proceed?", "screen")
         self.screens = [(SCREENS / "claude-2.1.310-bash.txt").read_text(encoding="utf-8")]
         self.keys: list[str] = []
+        self.fail_keys: set[str] = set()
         self.history = ""  # what is above the screen
 
-    def window(self):
+    def window(self, width=110):
         """Ann's window as the room sees it: the screens the test gives, one per look (the last one stays), the
         agent's own process, and the keys typed into it."""
         real = self.mod.tmux
 
-        def look(p, pane):
+        def look(p, pane, deadline=None):
             if p is not None:  # the guard's look: the same screen the text is read from next
                 return self.mod.Shot(0, self.screens[0], "4242\t2.1.310\tcollab\t" + str(self.root))
             screen = self.screens.pop(0) if len(self.screens) > 1 else self.screens[0]
@@ -17783,10 +20714,10 @@ class TelegramTest(Base):
             if args[:1] == ("capture-pane",) and "-S" in args:  # with the lines above the screen
                 return subprocess.CompletedProcess(args, 0, self.history + look(None, "").stdout, "")
             if args[:1] == ("display-message",) and args[-1] == "#{pane_width}":
-                return subprocess.CompletedProcess(args, 0, "110\n", "")
+                return subprocess.CompletedProcess(args, 0, f"{width}\n", "")
             if args[:1] == ("send-keys",):
                 self.keys.append(args[-1])
-                return subprocess.CompletedProcess(args, 0, "", "")
+                return subprocess.CompletedProcess(args, 1 if args[-1] in self.fail_keys else 0, "", "")
             return real(*args, **kw)
 
         stack = contextlib.ExitStack()
@@ -17873,6 +20804,222 @@ class TelegramTest(Base):
             self.mod.take_in(state, 0)  # the same question still there after the key
         self.assertEqual((self.keys, self.bot.answered["u1"]), (["1"], "unconfirmed"))
 
+    def kimi_cache_room(self, width=100):
+        self.asking_room()
+        cfg = json.loads(self.cfg.read_text())
+        cfg["participants"][2]["kind"] = "kimi"
+        self.cfg.write_text(json.dumps(cfg), encoding="utf-8")
+        self.mod.write_status("ann", "needs_owner", "Cache expired", "screen")
+        self.screens = [(SCREENS / f"kimi-2.4.1-cache-expired-{width}.txt").read_text(encoding="utf-8")]
+
+    def test_kimi_cache_question_goes_to_telegram_and_choice_uses_arrows_once(self):
+        self.kimi_cache_room()
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"), self.window(width=100):
+            state = self.mod.send_out(self.mod.load())
+            card = next(m for m in self.bot.sent if m["kind"] == "prompt")
+            self.assertEqual([o["n"] for o in card["options"]], [1, 2, 3, 4])
+            self.assertIn("cheapest way", card["options"][0]["text"])
+            gen = card["prompt"]
+            self.screens = [*self.cache_path(self.screens[0], 1, 3), " ❯\n"]
+            self.bot.actions.append({"id": "kc1", "kind": "choose", "to": "ann", "n": 3, "prompt": gen})
+            state = self.mod.take_in(state, 0)
+            self.assertEqual((self.keys, self.bot.answered), (["Down", "Down", "Enter"], {"kc1": "done"}))
+            del self.bot.answered["kc1"]
+            state = self.mod.take_in(state, 0)
+            self.assertEqual(self.keys, ["Down", "Down", "Enter"], "the same action never repeats keys")
+            lines = [m["text"] for m in self.messages() if m["from"] == "room" and "chose" in m["text"]]
+            self.assertEqual(lines, ["Андрей chose «3. Continue as-is» for Ann from Telegram."])
+
+    def test_kimi_cache_changed_selection_and_old_card_are_stale_without_keys(self):
+        self.kimi_cache_room()
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"), self.window(width=100):
+            state = self.mod.send_out(self.mod.load())
+            gen = next(m for m in self.bot.sent if m["kind"] == "prompt")["prompt"]
+            moved = (
+                self.screens[0]
+                .replace("   ❯ Compact and continue", "     Compact and continue")
+                .replace("     Continue as-is", "   ❯ Continue as-is")
+            )
+            self.screens = [moved]
+            self.bot.actions.append({"id": "ks1", "kind": "choose", "to": "ann", "n": 1, "prompt": gen})
+            self.bot.actions.append({"id": "ks2", "kind": "choose", "to": "ann", "n": 1, "prompt": "old"})
+            state = self.mod.take_in(state, 0)
+        self.assertEqual((self.keys, self.bot.answered), ([], {"ks1": "stale", "ks2": "stale"}))
+
+    def test_kimi_cache_changed_process_is_stale_without_keys(self):
+        self.kimi_cache_room()
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"), self.window(width=100):
+            state = self.mod.send_out(self.mod.load())
+            gen = next(m for m in self.bot.sent if m["kind"] == "prompt")["prompt"]
+            self.bot.actions.append({"id": "kp1", "kind": "choose", "to": "ann", "n": 1, "prompt": gen})
+            with seam(self.mod, "screen.pane_guard", lambda *a, **k: "reused process"):
+                state = self.mod.take_in(state, 0)
+        self.assertEqual((self.keys, self.bot.answered), ([], {"kp1": "stale"}))
+
+    def test_kimi_cache_truncated_frame_gets_attention_without_a_card(self):
+        self.kimi_cache_room(width=60)
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"), self.window(width=60):
+            self.mod.send_out(self.mod.load())
+        self.assertEqual([m["kind"] for m in self.bot.sent], ["attention"])
+        self.assertEqual(self.keys, [])
+
+    def test_kimi_cache_unknown_version_gets_attention_without_a_card(self):
+        self.kimi_cache_room()
+        with seam(self.mod, "prompts.program_version", lambda *a: ""), self.window(width=100):
+            self.mod.send_out(self.mod.load())
+        self.assertEqual([m["kind"] for m in self.bot.sent], ["attention"])
+        self.assertEqual(self.keys, [])
+
+    def cache_selected(self, text, selected):
+        labels = ["Compact and continue", "Start a new session", "Continue as-is", "Don't ask me again"]
+        for label in labels:
+            text = text.replace("   ❯ " + label, "     " + label)
+        return text.replace("     " + labels[selected - 1], "   ❯ " + labels[selected - 1])
+
+    def cache_path(self, text, selected, n):
+        step = 1 if n >= selected else -1
+        return [self.cache_selected(text, current) for current in range(selected, n + step, step)]
+
+    def test_kimi_cache_every_option_and_selected_uses_one_verified_sequence(self):
+        self.kimi_cache_room()
+        base = self.screens[0]
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"):
+            for selected in range(1, 5):
+                for n in range(1, 5):
+                    with self.subTest(selected=selected, n=n):
+                        initial = self.cache_selected(base, selected)
+                        question = self.mod.read_prompt("kimi", "2.4.1", initial, 100)
+                        self.mod.set_prompt("ann", {"gen": "known", "print": question["print"]})
+                        self.screens = self.cache_path(base, selected, n)
+                        self.keys = []
+                        with self.window(width=100):
+                            word, _, _ = self.mod.answer("choose", "ann", n, "known")
+                        self.assertEqual(word, "sent")
+                        self.assertEqual(self.keys, self.mod.keys_for("kimi", n, selected))
+
+    def test_kimi_cache_act_compares_the_pre_enter_question_for_every_source_and_target(self):
+        self.kimi_cache_room()
+        base = self.screens[0]
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"), self.window(width=100):
+            state = self.mod.load()
+            for selected in range(1, 5):
+                for n in range(1, 5):
+                    for remains, expected in ((True, "unconfirmed"), (False, "done")):
+                        with self.subTest(selected=selected, n=n, remains=remains):
+                            initial = self.cache_selected(base, selected)
+                            target = self.cache_selected(base, n)
+                            question = self.mod.read_prompt("kimi", "2.4.1", initial, 100)
+                            self.mod.set_prompt("ann", {"gen": "known", "print": question["print"]})
+                            self.screens = [*self.cache_path(base, selected, n), target if remains else " ❯\n"]
+                            self.keys = []
+                            action = f"ka{selected}{n}{int(remains)}"
+                            self.bot.actions.append({"id": action, "kind": "choose", "to": "ann", "n": n, "prompt": "known"})
+                            state = self.mod.take_in(state, 0)
+                            self.assertEqual(self.bot.answered[action], expected)
+                            self.assertEqual(self.keys, self.mod.keys_for("kimi", n, selected))
+
+    def test_kimi_cache_delayed_redraw_waits_for_each_selection_without_extra_keys(self):
+        self.kimi_cache_room()
+        initial = self.screens[0]
+        second = self.cache_selected(initial, 2)
+        third = self.cache_selected(initial, 3)
+        question = self.mod.read_prompt("kimi", "2.4.1", initial, 100)
+        self.mod.set_prompt("ann", {"gen": "known", "print": question["print"]})
+        self.screens = [initial, initial, second, third, " ❯\n"]
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"), self.window(width=100):
+            self.bot.actions.append({"id": "kd1", "kind": "choose", "to": "ann", "n": 3, "prompt": "known"})
+            self.mod.take_in(self.mod.load(), 0)
+        self.assertEqual(self.bot.answered, {"kd1": "done"})
+        self.assertEqual(self.keys, ["Down", "Down", "Enter"])
+
+    def test_kimi_cache_frame_change_after_first_arrow_stops_the_remaining_sequence(self):
+        self.kimi_cache_room()
+        initial = self.screens[0]
+        question = self.mod.read_prompt("kimi", "2.4.1", initial, 100)
+        self.mod.set_prompt("ann", {"gen": "known", "print": question["print"]})
+        self.screens = [initial, initial]
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"), self.window(width=100):
+            word, _, _ = self.mod.answer("choose", "ann", 3, "known")
+        self.assertEqual(word, "stale")
+        self.assertEqual(self.keys, ["Down"], "the next arrow and Enter wait for the expected selection")
+
+    def test_kimi_cache_guard_failure_after_first_arrow_is_not_retried(self):
+        self.kimi_cache_room()
+        initial = self.screens[0]
+        question = self.mod.read_prompt("kimi", "2.4.1", initial, 100)
+        self.mod.set_prompt("ann", {"gen": "known", "print": question["print"]})
+        self.screens = [initial, self.cache_selected(initial, 2), self.cache_selected(initial, 3)]
+        calls = []
+
+        def version(*_args):
+            calls.append(True)
+            return "" if len(calls) == 2 else "2.4.1"
+
+        with (
+            seam(self.mod, "prompts.program_version", version),
+            seam(self.mod, "telegram.KIMI_REDRAW_WAIT", 0.01),
+            seam(self.mod, "telegram.KIMI_REDRAW_INTERVAL", 0.001),
+            self.window(width=100),
+        ):
+            word, _, _ = self.mod.answer("choose", "ann", 3, "known")
+        self.assertEqual(word, "stale")
+        self.assertEqual(self.keys, ["Down"], "a failed guard never restores the action later")
+        self.assertEqual(len(calls), 2)
+
+    def test_kimi_cache_deadline_rejects_a_late_expected_frame_without_more_keys(self):
+        self.kimi_cache_room()
+        initial = self.screens[0]
+        question = self.mod.read_prompt("kimi", "2.4.1", initial, 100)
+        self.mod.set_prompt("ann", {"gen": "known", "print": question["print"]})
+        self.screens = [initial, self.cache_selected(initial, 2), self.cache_selected(initial, 3)]
+
+        def slow_look(p, pane, deadline=None):
+            subprocess.run([sys.executable, "-c", "import time; time.sleep(1.1)"], check=True, timeout=2)
+            return self.mod.Shot(0, self.screens[0], "4242\t2.1.310\tcollab\t" + str(self.root))
+
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"), self.window(width=100):
+            with seam(self.mod, "screen.look", slow_look):
+                word, _, _ = self.mod.answer("choose", "ann", 3, "known")
+        self.assertEqual(word, "stale")
+        self.assertEqual(self.keys, ["Down"], "a frame accepted after the absolute deadline must not continue")
+
+    def test_kimi_cache_session_fallback_obeys_the_remaining_deadline(self):
+        seen = []
+
+        def slow(*args, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            subprocess.run([sys.executable, "-c", "import time; time.sleep(0.1)"], check=True, timeout=1)
+            return subprocess.CompletedProcess(args, 0, str(self.root), "")
+
+        shot = self.mod.Shot(0, "", "4242\tkimi\tgroup\t")
+        participant = {"target": "named:0", "started_by_room": False}
+        with seam(self.mod, "tmuxio.tmux", slow):
+            result = self.mod.pane_guard(participant, "%1", idle=False, shot=shot, deadline=time.monotonic() + 0.05)
+        self.assertEqual(result, "Screen check timed out.")
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0])
+        self.assertLessEqual(seen[0], 0.05)
+
+    def test_kimi_cache_arrow_failure_stops_before_enter(self):
+        self.kimi_cache_room()
+        initial = self.screens[0]
+        question = self.mod.read_prompt("kimi", "2.4.1", initial, 100)
+        self.mod.set_prompt("ann", {"gen": "known", "print": question["print"]})
+        self.screens = [initial, self.cache_selected(initial, 2)]
+        self.fail_keys = {"Down"}
+        with seam(self.mod, "prompts.program_version", lambda *a: "2.4.1"), self.window(width=100):
+            word, _, _ = self.mod.answer("choose", "ann", 2, "known")
+        self.assertEqual(word, "failed")
+        self.assertEqual(self.keys, ["Down"], "no sequence continues after a failed arrow")
+
+    def test_kimi_cache_keys_move_from_the_current_selection(self):
+        self.assertEqual(self.mod.keys_for("kimi", 3, 1), ["Down", "Down", "Enter"])
+        self.assertEqual(self.mod.keys_for("kimi", 1, 3), ["Up", "Up", "Enter"])
+        self.assertEqual(self.mod.keys_for("kimi", 2, 2), ["Enter"])
+        for n, selected in ((0, 1), (5, 1), (1, 0), (1, 5), (True, 1)):
+            with self.subTest(n=n, selected=selected), self.assertRaises(ValueError):
+                self.mod.keys_for("kimi", n, selected)
+
     def test_a_screen_snapshot_is_the_agents_window_as_text_to_the_persons_topic(self):
         self.asking_room()
         self.screens = ["\x1b[31m❯ \x1b[0mhello\n  ⏸ manual mode on"]
@@ -17924,7 +21071,7 @@ class TelegramTest(Base):
         self.mod.disable()
         self.bot.actions.append({"id": "o1", "kind": "pause", "to": ""})
         self.mod.take_in(state, 0)
-        self.assertEqual(self.bot.answered, {"o1": "off"})
+        self.assertEqual(self.bot.answered, {}, "off starts no action acknowledgement request")
         self.assertFalse(self.mod.load_config().get("paused"))
 
     def sent_file(self, fid: str, data: bytes, name: str, mime: str = "application/octet-stream") -> dict:
@@ -17949,7 +21096,7 @@ class TelegramTest(Base):
         self.assertTrue(m["text"].startswith("check the error\n\nAttached in Telegram"), m["text"])
         self.assertIn(f"screen.png · image/png · 2 KB: {folder / 'file-1.png'}", m["text"])
         self.assertIn("view_image", m["text"], "how to look at an image")
-        self.assertIn("/collab-inbox/", (self.root / ".git" / "info" / "exclude").read_text())
+        self.assertFalse((self.root / ".git" / "info" / "exclude").exists(), "repository metadata is untouched")
         self.assertEqual((self.root / "collab-inbox" / ".gitignore").read_text(), "*\n", "out of git in any layout")
         self.assertEqual(self.bot.acked, ["f1"])
 
@@ -17983,6 +21130,37 @@ class TelegramTest(Base):
         (m,) = [x for x in self.messages() if x.get("tg") == "f4"]
         self.assertEqual(m["text"].count("Attached in Telegram"), 1, "only the room's own")
         self.assertEqual(sorted((self.root / "collab-inbox" / "f4" / n).read_bytes() for n in names), [b"a", b"b", b"c"])
+
+    def test_replacing_the_inbox_during_download_never_writes_outside_the_project(self):
+        self.mod.enable(self.bot.url)
+        away = tempfile.TemporaryDirectory(dir=TEST_ROOTS)
+        self.addCleanup(away.cleanup)
+        outside = Path(away.name)
+        (outside / "file-1.txt").write_bytes(b"original")
+        self.bot.queue.append({"id": "race", "text": "", "files": [self.sent_file("a" * 16, b"new", "x.txt")]})
+        connect = self.mod.connect
+
+        def racing_connect(server):
+            conn = connect(server)
+            response = conn.getresponse
+
+            def getresponse():
+                result = response()
+                folder = self.root / "collab-inbox" / "race"
+                if folder.is_dir() and not folder.is_symlink():
+                    folder.rename(self.root / "saved-inbox")
+                    folder.symlink_to(outside)
+                return result
+
+            conn.getresponse = getresponse
+            return conn
+
+        with seam(self.mod, "telegram.connect", racing_connect):
+            self.mod.take_in(self.mod.load(), 0)
+        self.assertEqual((outside / "file-1.txt").read_bytes(), b"original")
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["file-1.txt"])
+        self.assertEqual(self.bot.acked, [])
+        self.assertFalse(any(m.get("tg") == "race" for m in self.messages()))
 
     def test_a_file_not_whole_or_an_inbox_leading_out_of_the_project_is_not_taken(self):
         self.mod.enable(self.bot.url)
@@ -18219,3 +21397,798 @@ class TelegramTest(Base):
     def test_only_https_or_this_machine(self):
         with self.assertRaises(self.mod.Refused):
             self.mod.call("http://example.org", "GET", "/healthz")
+
+
+class KimiTest(Base):
+    def test_kimi_current_native_quota_error_is_recognized_from_its_shot(self):
+        mod = self.load_kimi()
+        shot = self.kimi_shot(mod, "limit-current")
+        with seam(mod, "tmuxio.tmux", lambda *a, **k: SimpleNamespace(returncode=0, stdout=shot.stdout, stderr="")):
+            self.assertIn("5-hour usage limit", mod.usage_limit("%1", kind="kimi", shot=shot))
+
+    def test_kimi_native_quota_after_tools_is_limited_but_a_quoted_error_is_not(self):
+        mod = self.load_kimi()
+        original = self.kimi_shot(mod, "limit-current")
+        error = "   Error: [provider.api_error] 429 You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends."
+        suffix = " To continue now, purchase extra usage or upgrade your plan:\n https://www.kimi.com/settings/subscription?tab=quota\n   If this persists, run `/export-debug-zip` and share the file with us for diagnosis. Please don't share it publicly."
+        supported = (
+            " ● Used Edit (file.py) · +1",
+            " ● Used Read (example.txt)",
+            " ● Used Write (file.py)",
+            " ● Used Bash",
+            " ● Used TodoList",
+            " ● Read TodoList",
+            " ● Used Search (needle)",
+            " ● Used query · MCP/example",
+            " ● Ran a command · $ probe",
+        )
+        for native in supported:
+            for bullet in ("●", "✗"):
+                marker = native.replace("●", bullet, 1)
+                with self.subTest(marker=marker):
+                    text = original.stdout.replace(error, marker + "\n   tool output\n" + error + suffix)
+                    self.assertTrue(mod.usage_limit("%1", kind="kimi", shot=mod.Shot(0, text, original.guard)))
+                    for quote in ("   > quoted\n", "   ```\n"):
+                        quoted = text.replace(error, quote + error)
+                        self.assertEqual(mod.usage_limit("%1", kind="kimi", shot=mod.Shot(0, quoted, original.guard)), "")
+        for marker in (
+            " ● Example from history:",
+            " ● Using TodoList",
+            " ● Running a command · $ probe",
+            " ● Used TodoList example from history",
+            " ● Ran a commandExample",
+            " ● Read TodoListExample",
+            " ● Truncated TodoList",
+            " ● bash task started in background (probe)",
+            " ● bash task completed in background (probe · exit 0)",
+        ):
+            with self.subTest(marker=marker):
+                text = original.stdout.replace(error, marker + "\n   tool output\n" + error + suffix)
+                self.assertEqual(mod.usage_limit("%1", kind="kimi", shot=mod.Shot(0, text, original.guard)), "")
+
+    def test_kimi_native_quota_after_todolist_uses_the_observed_terminal_error(self):
+        mod = self.load_kimi()
+        # The native tool/error/editor block captured together; the user turn is redacted.
+        text = " ❯ Continue the current task\n\n ● Used TodoList\n   ✓ Зафиксировать retry HEAD/hash/image в новом report\n   ● Выполнить один supervised baseline retry\n   … +2 more (2 pending) · ctrl+o to expand\n   Error: [provider.api_error] 429 You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends. To continue now, purchase extra usage or upgrade your plan:\n https://www.kimi.com/settings/subscription?tab=quota\n   If this persists, run `/export-debug-zip` and share the file with us for diagnosis. Please don't share it publicly.\n\n ╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n │ >                                                                                                                                                                                                                   │\n ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯\n Ask When Needed  K3.1 Pro Highspeed 2x Usage Cost thinking: high  ~/PycharmProjects/collab-room  main [±]                                                        ctrl+o expand | /theme to switch the terminal UI theme\n                                                                                                                                                                                                  context: 16% (160k/1M)\n"
+        shot = mod.Shot(0, text, "")
+        self.assertEqual(mod.kimi_quota_screen(shot)[0], "quota")
+        self.assertIn("5-hour usage limit", mod.usage_limit("%1", kind="kimi", shot=shot))
+        for changed in (
+            text.replace(" ● Used TodoList", " ● Example from history:"),
+            text.replace(" ● Used TodoList", " ● Using TodoList"),
+            text.replace("   Error:", "   > Error:"),
+            text.replace("   Error:", "   ```\n   Error:"),
+            text.replace(
+                "   Error: [provider.api_error] 429 You've reached your 5-hour usage limit.", "   Error: 429 Too many requests."
+            ),
+            text.replace(" https://www.kimi.com/settings/subscription?tab=quota\n", ""),
+        ):
+            with self.subTest(changed=changed[:180]):
+                self.assertEqual(mod.usage_limit("%1", kind="kimi", shot=mod.Shot(0, changed, "")), "")
+
+    def test_kimi_quota_quotes_old_errors_and_plain_429_are_not_current_limits(self):
+        mod = self.load_kimi()
+        for name in ("limit-quote", "limit-recovered", "limit-rate"):
+            with self.subTest(name=name):
+                shot = self.kimi_shot(mod, name)
+                with seam(
+                    mod, "tmuxio.tmux", lambda *a, shot=shot, **k: SimpleNamespace(returncode=0, stdout=shot.stdout, stderr="")
+                ):
+                    self.assertEqual(mod.usage_limit("%1", kind="kimi", shot=shot), "")
+
+    def test_kimi_quota_without_reset_time_holds_without_fabricating_until(self):
+        mod = self.load_kimi()
+        p = {**mod.PRESETS["kimi"], "id": "kimi", "target": "%1", "pane_pid": "123", "joined": True}
+        self.write_config([{"id": "owner"}, p])
+        shot = self.kimi_shot(mod, "limit-current")
+        with seam(mod, "tmuxio.tmux", lambda *a, **k: SimpleNamespace(returncode=0, stdout=shot.stdout, stderr="")):
+            self.assertTrue(mod.hold_for_limit(p, "%1", "idle", mod.load_config(), shot=shot))
+        rec = mod.read_json(mod.room().paths.limits_path)["kimi"]
+        self.assertNotIn("until", rec, "the error supplies no reset timestamp; fifteen minutes is not its end")
+
+    def test_kimi_observed_redacted_quota_structure_is_limited_without_more_reads(self):
+        mod = self.load_kimi()
+        p = {**mod.PRESETS["kimi"], "id": "kimi", "target": "%1", "pane_pid": "123", "joined": True}
+        self.write_config([{"id": "owner"}, p])
+        shot = self.kimi_shot(mod, "limit-observed-redacted")
+        with (
+            seam(mod, "screen.look", lambda *a: shot),
+            seam(mod, "screen.pane_guard", lambda *a, **k: ""),
+            seam(mod, "tmuxio.tmux", mock.Mock(side_effect=AssertionError("no extra screen read"))),
+            seam(mod, "deliver.deliver_to", mock.Mock(side_effect=AssertionError("quota must hold delivery"))),
+        ):
+            self.assertEqual(mod.deliver_one(p, "%1", mod.load_config(), []), "")
+        status = mod.read_status()["kimi"]
+        self.assertEqual(status["state"], "limited")
+        self.assertNotIn("until", status["detail"])
+        self.assertNotIn("until", mod.read_json(mod.room().paths.limits_path)["kimi"])
+
+    def test_kimi_legacy_quota_requires_explicit_clear_not_a_visible_reply(self):
+        mod = self.load_kimi()
+        p = {**mod.PRESETS["kimi"], "id": "kimi", "target": "%1", "pane_pid": "123", "joined": True}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        self.assertTrue(mod.hold_for_limit(p, "%1", "idle", config, self.kimi_shot(mod, "limit-current")))
+        again = self.load_kimi()
+        self.assertTrue(again.hold_for_limit(p, "%1", "working", config, self.kimi_shot(again, "working")))
+        self.assertTrue(again.hold_for_limit(p, "%1", "idle", config, again.Shot(1, "", "")))
+        self.assertTrue(again.hold_for_limit(p, "%1", "idle", config, self.kimi_shot(again, "idle")))
+        quoted = self.kimi_shot(again, "limit-current")
+        quoted.stdout = quoted.stdout.replace("\n\n ╭", "\n   ● Quoted success only.\n\n ╭")
+        self.assertTrue(again.hold_for_limit(p, "%1", "idle", config, quoted))
+        self.assertTrue(again.hold_for_limit(p, "%1", "idle", config, self.kimi_shot(again, "limit-recovered")))
+        self.assertTrue(
+            again.hold_for_limit(p, "%1", "idle", config, self.kimi_shot(again, "limit-current")), "old viewport is old"
+        )
+        self.assertTrue(again.clear_limit("kimi")[1])
+        self.assertFalse(again.hold_for_limit(p, "%1", "idle", config, self.kimi_shot(again, "limit-current")))
+
+    def test_kimi_quota_does_not_transfer_to_another_process_or_its_history(self):
+        mod = self.load_kimi()
+        p = {**mod.PRESETS["kimi"], "id": "kimi", "target": "%1", "pane_pid": "123", "joined": True}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        current = self.kimi_shot(mod, "limit-current")
+        self.assertTrue(mod.hold_for_limit(p, "%1", "idle", config, current))
+        p["pane_pid"] = "999"
+        current.guard = "999\tkimi\t\t" + str(self.root)
+        self.assertFalse(mod.hold_for_limit(p, "%1", "idle", config, current))
+        self.assertFalse(mod.hold_for_limit(p, "%1", "idle", config, current), "the new PID cannot inherit visible old history")
+
+    def test_kimi_unknown_quota_can_be_cleared_explicitly_without_relocking_old_text(self):
+        mod = self.load_kimi()
+        p = {**mod.PRESETS["kimi"], "id": "kimi", "target": "%1", "pane_pid": "123", "joined": True}
+        self.write_config([{"id": "owner"}, p])
+        config = mod.load_config()
+        shot = self.kimi_shot(mod, "limit-current")
+        self.assertTrue(mod.hold_for_limit(p, "%1", "idle", config, shot))
+        self.assertTrue(mod.clear_limit("kimi")[1])
+        self.assertFalse(mod.hold_for_limit(p, "%1", "idle", config, shot))
+
+    def load_kimi(self):
+        mod = _Loader("collab_kimi_" + uuid.uuid4().hex[:6], str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        return mod
+
+    def kimi_shot(self, mod, name):
+        text = (COLLAB.parent / "tests" / "screens" / f"kimi-2.4.1-{name}.txt").read_text()
+        return mod.Shot(0, text, "123\tkimi\t\t" + str(self.root))
+
+    def test_kimi_add_is_a_supported_command(self):
+        result = self.run_collab("add", "kimi")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the room is not running", result.stderr)
+        self.assertNotIn("invalid choice", result.stderr)
+        self.write_config([{"id": "owner"}])
+        opened = []
+        mod = RoomTest._launch_mod(self, "collab_kimi_launch", opened)
+        pid = mod.launch_new_agent(mod.load_config(), "kimi", str(self.root), "Kimi")
+        entry = next(p for p in mod.read_config_raw()["participants"] if p["id"] == pid)
+        self.assertEqual((entry["kind"], entry["joined"]), ("kimi", "pending"))
+        check = next(m for m in self.messages() if m["to"] == [pid])
+        self.assertIn(entry["join_code"], check["text"])
+        mod.append_message("owner", [pid], "connected " + entry["join_code"])
+        mod.append_message(pid, ["all"], "connected wrong-code")
+        mod.confirm_joins(mod.load_config(), mod.read_messages())
+        self.assertEqual(next(p for p in mod.read_config_raw()["participants"] if p["id"] == pid)["joined"], "pending")
+        mod.append_message(pid, ["all"], "connected " + entry["join_code"])
+        mod.confirm_joins(mod.load_config(), mod.read_messages())
+        self.assertIs(next(p for p in mod.read_config_raw()["participants"] if p["id"] == pid)["joined"], True)
+        self.assertNotIn("--auto", mod.agent_command("kimi"))
+        self.assertNotIn("--yolo", mod.agent_command("kimi"))
+        self.assertEqual(mod.setting_problem("use_model", "kimi-code/k3", mod.load_config()), "")
+        self.assertEqual(shlex.split(mod.agent_command("kimi", model="kimi-code/k3"))[-2:], ["--model", "kimi-code/k3"])
+
+    def test_kimi_yolo_choice_is_kept_on_relaunch(self):
+        self.write_config([{"id": "owner"}])
+        mod = RoomTest._launch_mod(self, "collab_kimi_yolo_relaunch", [])
+        commands = []
+
+        def tmux(*argv, **_):
+            if argv[0] == "new-window":
+                commands.append(argv[-1])
+                return SimpleNamespace(stdout=f"%{len(commands) + 10} 4{len(commands)}\n", returncode=0, stderr="")
+            return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        pid = mod.launch_new_agent(mod.load_config(), "kimi", str(self.root), "Kimi")
+        self.assertNotIn("--yolo", commands[-1], "the default stays unchanged")
+        config = mod.read_config_raw()
+        entry = next(p for p in config["participants"] if p["id"] == pid)
+        entry["yolo"] = True
+        mod.write_config(config)
+        mod.relaunch_agent(config.get("session", "collab-room"), entry)
+        self.assertIn("--yolo", commands[-1], "the participant's choice reaches its next process")
+
+    def test_kimi_yolo_add_is_explicit_and_visible_in_proposal(self):
+        self.write_config([{"id": "owner"}])
+        mod = _Loader("collab_kimi_yolo_add", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        self.enterContext(seam(mod, "agents.ensure_agent_cli", lambda *_args, **_kwargs: "/bin/true"))
+        commands = []
+
+        def tmux(*argv, **_):
+            if argv[0] == "new-window":
+                commands.append(argv[-1])
+                return SimpleNamespace(stdout=f"%{len(commands) + 10} 4{len(commands)}\n", returncode=0, stderr="")
+            return SimpleNamespace(stdout="", returncode=0, stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        args = mod.build_parser().parse_args(["add", "kimi", "--name", "Auto"])
+        args.yolo = True
+        mod.cmd_add(args)
+        self.assertEqual(commands, [], "the person's approval precedes the privileged launch")
+        config = mod.read_config_raw()
+        self.assertNotIn("Auto", [p.get("label") for p in config["participants"]])
+        proposal = next(m for m in mod.read_messages() if m.get("proposal"))
+        self.assertIn("routine project commands and edits run automatically", mod.proposal_words(config, proposal["proposal"]))
+        self.assertTrue(mod.build_parser().parse_args(["add", "kimi", "--yolo"]).yolo)
+        mod.deliver_once(mod.load_config(), {})
+        mod.apply_proposal(proposal["id"], "owner")
+        auto = next(p for p in mod.read_config_raw()["participants"] if p.get("label") == "Auto")
+        self.assertIs(auto["yolo"], True)
+        self.assertIn("--yolo", commands[-1])
+
+        before = len(commands)
+        with mock.patch.object(sys, "argv", ["collab", "add", "codex", "--yolo"]), self.assertRaises(SystemExit):
+            mod.main()
+        self.assertEqual(len(commands), before, "another agent kind is refused before launch")
+        self.assertIn("только для Kimi", mod.tr("--yolo is only for Kimi", "ru"))
+
+    def test_kimi_footer_model_and_native_background_counts(self):
+        mod = self.load_kimi()
+        rules = mod.PRESETS["kimi"]
+        for name, count in (
+            ("footer-before", 0),
+            ("footer-one-running", 1),
+            ("footer-one-complete", 0),
+            ("footer-two-running", 2),
+            ("footer-two-running-60", 2),
+            ("footer-two-running-40", 2),
+            ("footer-two-complete", 0),
+        ):
+            with self.subTest(name=name):
+                shot = self.kimi_shot(mod, name)
+                self.assertEqual(mod.screen_model(rules, "%1", shot), "probe")
+                self.assertEqual(mod.screen_count("%1", rules["background"], shot, rules), count)
+                self.assertEqual(mod.screen_state(rules, "%1", shot)[0], "idle")
+
+        complete = self.kimi_shot(mod, "footer-two-complete")
+        for raw in (
+            "Always Ask  stale  [9 tasks running]\n" + complete.stdout,
+            complete.stdout + "Always Ask  false  [9 tasks running]\n",
+        ):
+            shot = mod.Shot(0, raw, complete.guard)
+            self.assertEqual(mod.screen_model(rules, "%1", shot), "probe")
+            self.assertEqual(mod.screen_count("%1", rules["background"], shot, rules), 0)
+        self.assertEqual(mod.screen_model(rules, "%1", mod.Shot(0, "Model: invented\n", "")), "")
+
+    def test_kimi_footer_requires_a_complete_editor_and_context(self):
+        mod = self.load_kimi()
+        rules = mod.PRESETS["kimi"]
+        complete = self.kimi_shot(mod, "footer-two-complete")
+        forged = "Ask When Needed  forged  [9 tasks running]\n context: 1%\n"
+        without_context = "\n".join(line for line in complete.stdout.splitlines() if "context:" not in line) + "\n"
+        latest_partial = self.kimi_shot(mod, "footer-one-running").stdout + " ╭────────────────────╮\n │ >                  │\n"
+        for name, raw in (
+            ("no-editor", "transcript\n──────────\n" + forged),
+            ("partial-editor", " ╭──────╮\n │ >    │\n──────────\n" + forged),
+            ("no-context", without_context.replace("Ask When Needed  probe", "Ask When Needed  forged")),
+            ("stale-complete-latest-partial", latest_partial),
+        ):
+            with self.subTest(name=name):
+                shot = mod.Shot(0, raw, complete.guard)
+                self.assertEqual(mod.screen_model(rules, "%1", shot), "")
+                self.assertEqual(mod.screen_count("%1", rules["background"], shot, rules), 0)
+
+    def test_kimi_footer_reaches_status_and_idle_delivery(self):
+        for name, count in (("footer-two-running", 2), ("footer-two-complete", 0)):
+            with self.subTest(name=name):
+                mod = self.load_kimi()
+                shot = self.kimi_shot(mod, name)
+                entry = {
+                    "id": "kimi",
+                    "kind": "kimi",
+                    "started_by_room": True,
+                    "delivery": "tmux",
+                    "target": "%1",
+                    "joined": True,
+                }
+                config = {"participants": [{"id": "owner"}, entry]}
+                statuses, deliveries = [], []
+                self.enterContext(seam(mod, "screen.look", lambda *a, shot=shot: shot))
+                self.enterContext(seam(mod, "screen.pane_guard", lambda *a, **k: ""))
+                self.enterContext(seam(mod, "screen.write_status", lambda *a, statuses=statuses, **k: statuses.append((a, k))))
+                self.enterContext(seam(mod, "deliver.hold_for_limit", lambda *a: False))
+                self.enterContext(seam(mod, "deliver.watch_for_reply", lambda *a: None))
+                self.enterContext(seam(mod, "deliver.tell_undelivered", lambda *a: None))
+                self.enterContext(seam(mod, "deliver.tell_drafted", lambda *a: None))
+                self.enterContext(seam(mod, "deliver.deliver_to", lambda *a, deliveries=deliveries: deliveries.append(a) or ""))
+                self.enterContext(seam(mod, "tmuxio.tmux", lambda *a: (_ for _ in ()).throw(AssertionError("extra tmux read"))))
+                self.assertEqual(mod.deliver_one(entry, "%1", config, []), "")
+                ((pid, state, detail, source, model), options) = statuses[-1]
+                self.assertEqual((pid, state, source, model), ("kimi", "idle", "screen", "probe"))
+                self.assertEqual(detail, f"background {count}" if count else "")
+                self.assertEqual(options["background"], count)
+                self.assertEqual(deliveries[-1][4], count)
+
+    def test_kimi_real_screens_and_input_acceptance(self):
+        mod = self.load_kimi()
+        rules = mod.PRESETS.get("kimi", {"kind": "kimi"})
+        with seam(mod, "tmuxio.tmux", lambda *a, **k: SimpleNamespace(stdout="", returncode=0)):
+            for name, state in [("idle", "idle"), ("draft", "draft"), ("working", "working"), ("approval", "needs_owner")]:
+                shot = self.kimi_shot(mod, name)
+                self.assertEqual(mod.screen_state(rules, "%1", shot)[0], state, name)
+            draft = self.kimi_shot(mod, "draft")
+            text = "Run the local probe command"
+            self.assertTrue(mod.input_starts(rules, draft, text))
+            self.assertTrue(mod.input_ours(rules, draft, text))
+            self.assertFalse(mod.input_ours(rules, draft, "someone else’s draft"))
+            self.assertFalse(mod.input_free(rules, draft))
+            self.assertTrue(mod.input_free(rules, self.kimi_shot(mod, "idle")))
+            self.assertEqual(mod.token_count(rules, draft, "Runthelocalprobecommand"), 0)
+            for raw in ("Result:\n>\n", draft.stdout.replace("╰", " "), draft.stdout.replace("╭", " ")):
+                broken = mod.Shot(0, raw, "")
+                self.assertEqual(mod.screen_state(rules, "%1", broken)[0], "unknown")
+                self.assertFalse(mod.input_starts(rules, broken, text))
+                self.assertFalse(mod.input_ours(rules, broken, text))
+                self.assertEqual(mod.token_count(rules, broken, "Runthelocalprobecommand"), 0)
+            partial = mod.Shot(0, self.kimi_shot(mod, "idle").stdout.rstrip() + "\n ╭──────────╮\n │ > other  │\n", "")
+            self.assertEqual(mod.screen_state(rules, "%1", partial)[0], "unknown")
+            quoted = mod.Shot(0, ">\n" + draft.stdout, "")
+            self.assertEqual(mod.screen_state(rules, "%1", quoted)[0], "draft")
+            multiline = self.kimi_shot(mod, "multiline")
+            long_text = "START-local-test " + ("данные " * 75) + " END-local-test"
+            self.assertEqual(mod.screen_state(rules, "%1", multiline)[0], "draft")
+            self.assertTrue(mod.input_starts(rules, multiline, long_text))
+            self.assertTrue(mod.input_ours(rules, multiline, long_text))
+            self.assertFalse(mod.input_ours(rules, multiline, long_text + " changed"))
+            self.assertEqual(mod.token_count(rules, multiline, "START-local-test"), 0)
+
+    def test_kimi_multiline_draft_with_empty_first_row_is_not_idle(self):
+        mod = self.load_kimi()
+        rules = mod.PRESETS.get("kimi", {"kind": "kimi"})
+        for continuation in ("user draft", "> quoted draft"):
+            raw = (
+                " ╭────────────────────────╮\n │ >                      │\n │   "
+                + continuation.ljust(21)
+                + "│\n ╰────────────────────────╯\n"
+            )
+            shot = mod.Shot(0, raw, "")
+            self.assertEqual(mod.screen_state(rules, "%1", shot)[0], "draft")
+            self.assertFalse(mod.input_free(rules, shot))
+            self.assertTrue(mod.input_ours(rules, shot, "\n" + continuation))
+            self.assertEqual(mod.token_count(rules, shot, continuation.replace(" ", "")), 0)
+        live = self.kimi_shot(mod, "leading-newline")
+        self.assertEqual(mod.screen_state(rules, "%1", live)[0], "draft")
+        self.assertFalse(mod.input_free(rules, live))
+        self.assertTrue(mod.input_ours(rules, live, "\nuser draft\n> quoted draft"))
+        self.assertTrue(mod.input_free(rules, self.kimi_shot(mod, "idle")))
+
+    def test_kimi_retry_waits_for_safe_owned_draft(self):
+        mod = self.load_kimi()
+        rules = mod.PRESETS["kimi"]
+        text = "Run the local probe command"
+        draft = self.kimi_shot(mod, "draft")
+        at = draft.stdout.rindex(" ╭")
+        busy = mod.Shot(0, draft.stdout[:at] + "  🌑\n" + draft.stdout[at:], draft.guard)
+        entry = {**rules, "id": "kimi", "target": "%1", "pane_pid": "123", "started_by_room": True}
+        calls = []
+        self.enterContext(
+            seam(mod, "tmuxio.tmux", lambda *a, **k: calls.append(a) or SimpleNamespace(returncode=0, stdout="", stderr=""))
+        )
+        self.enterContext(seam(mod, "deliver.not_sent", lambda *a, **k: None))
+        for name, shot, allowed in (
+            ("working", busy, False),
+            ("draft", draft, True),
+            ("scrolled", mod.Shot(0, draft.stdout, draft.guard, True), False),
+            ("reused", mod.Shot(0, draft.stdout, "999\tkimi\t\t" + str(self.root)), False),
+            ("approval", self.kimi_shot(mod, "approval"), False),
+        ):
+            with self.subTest(name=name), seam(mod, "screen.look", lambda *a, shot=shot: shot):
+                mod.LEFT["kimi"] = {
+                    "ids": ["m1"],
+                    "token": "m1",
+                    "before": 0,
+                    "pressed": 0,
+                    "enters": 1,
+                    "changed": False,
+                    "held": False,
+                    "since": time.time(),
+                    "text": text,
+                    "fold": "",
+                }
+                calls.clear()
+                mod.left_since(entry, "%1", "draft", {}, set())
+                self.assertEqual(("send-keys", "-t", "%1", "Enter") in calls, allowed)
+
+    def test_kimi_first_enter_rechecks_state_and_process_after_paste(self):
+        mod = self.load_kimi()
+        rules = mod.PRESETS["kimi"]
+        draft = self.kimi_shot(mod, "draft")
+        idle = self.kimi_shot(mod, "idle")
+        at = draft.stdout.rindex(" ╭")
+        busy = mod.Shot(0, draft.stdout[:at] + "  🌑\n" + draft.stdout[at:], draft.guard)
+        entry = {**rules, "id": "kimi", "target": "%1", "pane_pid": "123", "started_by_room": True}
+        message = {"id": "m1", "from": "room", "to": ["kimi"], "at": mod.now(), "text": "probe"}
+        config = {"participants": [{"id": "owner"}, entry]}
+        self.enterContext(seam(mod, "log.read_log_tick", lambda: [message]))
+        self.enterContext(seam(mod, "log.read_set", lambda *a: set()))
+        self.enterContext(seam(mod, "deliver.undelivered", lambda *a: ([message], set())))
+        self.enterContext(seam(mod, "deliver.delivery_text", lambda *a, **k: "Run the local probe command"))
+        self.enterContext(seam(mod, "deliver.open_tail", lambda *a: ""))
+        self.enterContext(seam(mod, "deliver.gathering", lambda *a: False))
+        self.enterContext(seam(mod, "deliver.keep_left", lambda: None))
+        self.enterContext(seam(mod, "deliver.not_sent", lambda *a, **k: None))
+        self.enterContext(seam(mod, "ledger.woke", lambda *a: None))
+        self.enterContext(seam(time, "sleep", lambda *a: None))
+        for name, after, allowed in (
+            ("working", busy, False),
+            ("draft", draft, True),
+            ("scrolled", mod.Shot(0, draft.stdout, draft.guard, True), False),
+            ("reused", mod.Shot(0, draft.stdout, "999\tkimi\t\t" + str(self.root)), False),
+            ("approval", self.kimi_shot(mod, "approval"), False),
+        ):
+            with self.subTest(name=name):
+                calls, marked = [], []
+                mod.LEFT.clear()
+
+                def tmux(*args, calls=calls, **kwargs):
+                    calls.append(args)
+                    if args[0] == "capture-pane":
+                        return SimpleNamespace(returncode=0, stdout=idle.stdout, stderr="")
+                    if "#{pane_in_mode}" in args:
+                        return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+                    return SimpleNamespace(returncode=0, stdout=draft.guard, stderr="")
+
+                entered = lambda calls=calls: ("send-keys", "-t", "%1", "Enter") in calls
+                with (
+                    seam(mod, "tmuxio.tmux", tmux),
+                    seam(mod, "screen.look", lambda *a, entered=entered, after=after: idle if entered() else after),
+                    seam(mod, "screen.type_text", lambda *a: SimpleNamespace(returncode=0, stderr="")),
+                    seam(mod, "deliver.given", lambda *a, marked=marked, **k: marked.append(a)),
+                ):
+                    mod.deliver_to(entry, "%1", "idle", config)
+                self.assertEqual(entered(), allowed)
+                self.assertEqual(bool(marked), allowed)
+                self.assertEqual("kimi" in mod.LEFT, not allowed)
+
+    def test_kimi_busy_turns_are_not_typed_to(self):
+        mod = self.load_kimi()
+        calls = []
+        shot = mod.Shot(0, "• Working (1s • esc to interrupt)\n› Ask Codex\n", "123\tcodex\t\t")
+        self.enterContext(seam(mod, "screen.look", lambda *a, shot=shot: shot))
+        self.enterContext(seam(mod, "screen.pane_guard", lambda *a, **k: ""))
+        self.enterContext(seam(mod, "deliver.input_holds", lambda *a: True))
+        self.enterContext(seam(mod, "deliver.given", lambda *a: None))
+        self.enterContext(mock.patch.object(time, "sleep", lambda _: None))
+
+        def tmux(*args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        self.enterContext(seam(mod, "tmuxio.tmux", tmux))
+        batch = [{"id": "message1"}]
+        for kind in ("kimi", "codex"):
+            rules = {**mod.PRESETS["codex"], **mod.PRESETS.get(kind, {}), "kind": kind}
+            # Both inputs are free and the turn is running: only Kimi must wait for idle.
+            self.enterContext(seam(mod, "screen.screen_state", lambda *a: ("working", "")))
+            self.enterContext(seam(mod, "deliver.input_free", lambda *a, **k: True))
+            calls.clear()
+            mod.type_busy({"id": kind}, "%1", rules, batch, "hello", {}, set())
+            self.assertEqual(bool(calls), kind == "codex", kind)
+
+    def test_kimi_named_shell_target_is_refused(self):
+        mod = self.load_kimi()
+        entry = {"kind": "kimi", "target": "agent:0"}
+        shell = mod.Shot(0, "", "123\tzsh\t\t")
+        self.assertIn("shell", mod.pane_guard(entry, "agent:0", shot=shell).lower())
+        agent = mod.Shot(0, "", "123\tkimi\t\t")
+        self.assertEqual(mod.pane_guard(entry, "agent:0", shot=agent), "")
+
+    def test_kimi_does_not_bind_a_claude_session(self):
+        self.write_config([{"id": "owner"}, {"id": "kimi", "kind": "kimi"}])
+        mod = self.load_kimi()
+        with seam(mod, "screen.caller_claude_session", lambda: "foreign-session"):
+            mod.bind_claude_session("kimi")
+        self.assertNotIn("claude_session", mod.read_config_raw()["participants"][1])
+        self.write_config([{"id": "owner"}, {"id": "claude", "kind": "claude"}])
+        with seam(mod, "screen.caller_claude_session", lambda: "own-session"):
+            mod.bind_claude_session("claude")
+        self.assertEqual(mod.read_config_raw()["participants"][1]["claude_session"], "own-session")
+
+    def test_kimi_setup_notices_and_saved_team_preview(self):
+        mod = self.load_kimi()
+        self.assertIn("Kimi", mod.tr("No Claude Code, Codex or Kimi installation found.", lang="ru"))
+        self.assertIn("не найдены", mod.tr("No Claude Code, Codex or Kimi installation found.", lang="ru"))
+        cfg = {
+            "version": 2,
+            "language": "ru",
+            "participants": [{"id": "owner"}, {"id": "kimi", "kind": "kimi", "started_by_room": True}],
+        }
+        notice = mod.when_words(cfg, "kimi", "use_model")
+        self.assertIn("следующем запуске", notice)
+        self.assertNotIn("/restart", notice)
+        self.assertFalse(mod.restartable(cfg["participants"][1]))
+        self.assertIsNone(mod.asking(cfg["participants"][1]))
+        self.assertEqual(mod.room_state(cfg)["agents"][0]["program"], "Kimi")
+        scenario = {
+            "title": "Kimi team",
+            "output": "result.md",
+            "seats": [{"seat": "lead", "kind": "kimi", "label": "Kimi", "role": "lead", "topic": "review"}],
+        }
+        path = mod.own_scenario_path("kimi-team")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(scenario))
+        self.assertEqual(mod.scenario_of("own:kimi-team")["title"], "Kimi team")
+        self.assertEqual(mod.scenario_of("own:kimi-team")["output"], "result.md")
+
+
+class RestartUxTest(Base):
+    def mod(self):
+        mod = _Loader("collab_restart_ux", str(COLLAB)).load_module()
+        mod.use_room(str(self.root))
+        return mod
+
+    def test_same_integration_in_a_different_build_does_not_request_agent_restart(self):
+        mod = self.mod()
+        old = self.root / "collab-0000000000000000"
+        old.write_bytes(COLLAB.read_bytes() + b"\n# ordinary build change\n")
+        ctx = SimpleNamespace(
+            stale_chat=lambda: False,
+            told_old=set(),
+            config={
+                "participants": [
+                    {"id": "ann", "label": "Ann", "kind": "codex", "cli": str(old)},
+                ]
+            },
+        )
+        self.assertEqual(mod.chat_old_versions(ctx), [])
+        old.write_text(old.read_text().replace("prefix_rule(pattern=", "prefix_rule(pattern=changed", 1))
+        self.assertTrue(mod.chat_old_versions(ctx), "changed permission rules still need a warning")
+        self.assertEqual(mod.chat_old_versions(ctx), [], "warn once")
+
+    def test_restart_preflights_exact_session_before_confirmation_and_refuses_missing(self):
+        mod = self.mod()
+        q = {"id": "ann", "kind": "codex", "started_by_room": True, "target": "%51", "pane_pid": "321"}
+        self.write_config([{"id": "owner"}, q])
+        events = []
+        ctx = SimpleNamespace(
+            wizard={"step": "restart_pick"},
+            config=mod.load_config(),
+            feed=lambda text: events.append(("feed", text)),
+            refresh_people=lambda: None,
+        )
+
+        def missing(_q):
+            events.append(("lookup", ""))
+            return ""
+
+        with (
+            seam(mod, "screen.agent_session", missing),
+            seam(mod, "agents.restart_agent", lambda *a, **k: self.fail("must preserve process")),
+        ):
+            said = []
+            mod.wizard_step(ctx, "ann", said)
+            self.assertEqual(events[0][0], "lookup")
+            self.assertNotEqual(ctx.wizard.get("step"), "restart_confirm")
+            self.assertNotEqual(ctx.wizard.get("step"), "restart_fresh")
+            self.assertNotIn("same conversation", " ".join(said))
+            self.assertNotIn("new conversation?", " ".join(said))
+
+    def test_restart_confirmation_uses_preflight_session_and_refuses_changed_identity(self):
+        mod = self.mod()
+        q = {"id": "ann", "kind": "codex", "started_by_room": True, "target": "%51", "pane_pid": "321"}
+        self.write_config([{"id": "owner"}, q])
+        sid = "01a14da8-636e-7f72-b641-4efd93e5f7e8"
+        called, said = [], []
+        ctx = SimpleNamespace(
+            wizard={"step": "restart_pick"}, config=mod.load_config(), feed=lambda text: None, refresh_people=lambda: None
+        )
+        with (
+            seam(mod, "screen.agent_session", lambda p: sid),
+            seam(mod, "agents.restart_agent", lambda *a, **k: called.append((a, k))),
+        ):
+            mod.wizard_step(ctx, "ann", said)
+            self.assertEqual(ctx.wizard.get("sid"), sid)
+            mod.wizard_step(ctx, "y", said)
+            self.assertEqual(called[-1][1]["sid"], sid)
+            called.clear()
+            ctx.wizard.update(step="restart_pick")
+            mod.wizard_step(ctx, "ann", said)
+            self.write_config([{"id": "owner"}, {**q, "pane_pid": "999"}])
+            mod.wizard_step(ctx, "y", said)
+            self.assertEqual(called, [], "the confirmation cannot authorize another process")
+
+    def test_native_enveloped_session_checks_are_structural_unique_and_bounded(self):
+        mod = self.mod()
+        logs = self.root / "codex-home" / "sessions"
+        logs.mkdir(parents=True)
+        sid = "01a14da8-636e-7f72-b641-4efd93e5f7e8"
+        other = "01a14da8-0000-7f72-b641-4efd93e5f7e8"
+        q = {"id": "ann", "kind": "codex", "folder": str(self.root), "join_code": "ddeb", "joined_at": mod.now()}
+        text = '[room → ann]09:11\n  ⟦Connection check: reply in the room with "connected ddeb".⟧'
+
+        def write(name, session, record):
+            path = logs / ("rollout-" + name + ".jsonl")
+            path.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": session, "cwd": str(self.root)}})
+                + "\n"
+                + json.dumps(record)
+                + "\n"
+            )
+            return path
+
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(logs.parent)}):
+            for record in (
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "custom_tool_call_output",
+                        "output": [{"type": "text", "text": json.dumps({"output": text})}],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+                },
+                {"type": "response_item", "payload": {"type": "function_call_output", "output": json.dumps({"output": text})}},
+            ):
+                write("own", sid, record)
+                self.assertEqual(mod.agent_session(q), sid)
+                duplicate = write("other", other, record)
+                self.assertEqual(mod.agent_session(q), "", "two matching sessions are ambiguous")
+                duplicate.unlink()
+            for record in (
+                {
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]},
+                },
+                {
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "> " + text}]},
+                },
+                {"text": text.replace("→ ann", "→ other")},
+                {"text": text.replace("ddeb", "beef")},
+            ):
+                write("own", sid, record)
+                self.assertEqual(mod.agent_session(q), "")
+
+    def test_session_checks_survive_completed_tool_transport_wrappers(self):
+        mod = self.mod()
+        logs = self.root / "transport-home" / "sessions"
+        logs.mkdir(parents=True)
+        sid = "01a14da8-636e-7f72-b641-4efd93e5f7e8"
+        other = "01a14da8-0000-7f72-b641-4efd93e5f7e8"
+        q = {"id": "ann", "kind": "codex", "folder": str(self.root), "join_code": "0b3a", "joined_at": mod.now()}
+        check = '[room → ann] 12:43\n  ⟦Connection check: reply in the room with "connected 0b3a".⟧'
+
+        def command(text):
+            return {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "source": "unified_exec_startup",
+                        "status": "completed",
+                        "exit_code": 0,
+                        "aggregated_output": text,
+                    },
+                },
+            }
+
+        def transport(text):
+            chunks = "".join(
+                json.dumps(
+                    {"chunk_id": str(i), "wall_time_seconds": 0.001, "exit_code": 0, "original_token_count": 12, "output": s}
+                )
+                for i, s in enumerate(("first output", "second output", text))
+            )
+            return {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "output": [
+                        {"type": "text", "text": "Script completed"},
+                        {
+                            "type": "text",
+                            "text": "Warning: truncated output (original token count: 19216)\nTotal output lines: 3\n\n" + chunks,
+                        },
+                    ],
+                },
+            }
+
+        def write(name, session, record):
+            path = logs / ("rollout-" + name + ".jsonl")
+            path.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": session, "cwd": str(self.root)}})
+                + "\n"
+                + json.dumps(record)
+                + "\n"
+            )
+            return path
+
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(logs.parent)}):
+            for wrap in (command, transport):
+                with self.subTest(wrapper=wrap.__name__):
+                    write("own", sid, wrap(check))
+                    self.assertEqual(mod.agent_session(q), sid)
+                    duplicate = write("other", other, wrap(check))
+                    self.assertEqual(mod.agent_session(q), "", "two matching sessions remain ambiguous")
+                    duplicate.unlink()
+                    for wrong in (
+                        check.replace("→ ann", "→ other"),
+                        check.replace("0b3a", "beef"),
+                        "> " + check,
+                        "```\n" + check + "\n```",
+                    ):
+                        write("own", sid, wrap(wrong))
+                        self.assertEqual(mod.agent_session(q), "", "a foreign or quoted check is not proof")
+            failed = command(check)
+            failed["payload"]["item"]["status"] = "failed"
+            write("own", sid, failed)
+            self.assertEqual(mod.agent_session(q), "")
+            quoted = transport(check)
+            quoted["payload"]["type"] = "message"
+            quoted["payload"]["role"] = "assistant"
+            quoted["payload"]["content"] = quoted["payload"].pop("output")
+            write("own", sid, quoted)
+            self.assertEqual(mod.agent_session(q), "")
+
+    def test_codex_restart_session_is_owned_by_the_current_process_when_identity_is_known(self):
+        mod = self.mod()
+        logs = self.root / "proof-home" / "sessions"
+        logs.mkdir(parents=True)
+        sid = "01a14da8-636e-7f72-b641-4efd93e5f7e8"
+        other = "01a14da8-0000-7f72-b641-4efd93e5f7e8"
+        check = '[room → ann] 09:11\n  ⟦Connection check: reply in the room with "connected ddeb".⟧'
+        paths = []
+        for ident in (sid, other):
+            path = logs / ("rollout-" + ident + ".jsonl")
+            path.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": ident, "cwd": str(self.root)}})
+                + "\n"
+                + json.dumps({"text": check})
+                + "\n"
+            )
+            paths.append(path)
+        q = {
+            "id": "ann",
+            "kind": "codex",
+            "folder": str(self.root),
+            "join_code": "ddeb",
+            "joined_at": mod.now(),
+            "target": "%51",
+            "pane_pid": "321",
+        }
+        with (
+            mock.patch.dict(os.environ, {"CODEX_HOME": str(logs.parent)}),
+            seam(mod, "tmuxio.tmux", lambda *a, **k: SimpleNamespace(returncode=0, stdout="321\n")),
+            seam(mod, "screen.subprocess.run", lambda *a, **k: SimpleNamespace(returncode=0, stdout="n" + str(paths[0]) + "\n")),
+        ):
+            self.assertEqual(mod.agent_session(q), sid, "another unowned matching session cannot replace this process's")
+        with (
+            mock.patch.dict(os.environ, {"CODEX_HOME": str(logs.parent)}),
+            seam(mod, "tmuxio.tmux", lambda *a, **k: SimpleNamespace(returncode=0, stdout="999\n")),
+        ):
+            self.assertEqual(mod.agent_session(q), "", "reused pane or process is not a resume proof")
+
+    def test_session_lookup_does_not_read_past_its_total_budget(self):
+        mod = self.mod()
+        logs = self.root / "budget-home" / "sessions"
+        logs.mkdir(parents=True)
+        sid = "01a14da8-636e-7f72-b641-4efd93e5f7e8"
+        path = logs / "rollout-huge.jsonl"
+        meta = json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": str(self.root)}})
+        path.write_text(
+            meta
+            + "\n"
+            + " " * 20_000_001
+            + "\n"
+            + json.dumps({"text": '[room → ann] Connection check: reply in the room with "connected ddeb".'})
+            + "\n"
+        )
+        q = {"id": "ann", "kind": "codex", "folder": str(self.root), "join_code": "ddeb", "joined_at": mod.now()}
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(logs.parent)}):
+            self.assertEqual(mod.agent_session(q), "")

@@ -84,8 +84,8 @@ class LedgerTest(LedgerRoom):
         self.use("petya", entry(input=1000, cache_read=10**6))
         self.use("misha", entry(input=1, cache_read=99, answers=1, ctx_max=100))
         t = self.table("agent")
-        self.assertEqual(t["petya"][-3:], ["3", "1333", "3000"])  # (1000 + 3000) / 3
-        self.assertEqual(t["misha"][-3:], ["1", "100", "100"])
+        self.assertEqual(t["petya"][9:12], ["3", "1333", "3000"])  # (1000 + 3000) / 3
+        self.assertEqual(t["misha"][9:12], ["1", "100", "100"])
 
     def test_an_agent_whose_spending_cannot_be_read_is_named_with_why(self):
         # A table without a Claude looked complete: the report says who has no data and why.
@@ -238,7 +238,7 @@ class LedgerTest(LedgerRoom):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(
             r.stdout.splitlines()[0],
-            "group,tasks,input,output,cache read,cache write,cache share,wakeups,per task,answers,mean context,max context",
+            "group,tasks,input,output,cache read,cache write,cache share,wakeups,per task,answers,mean context,max context,coverage,reason,thinking",
         )
         self.assertTrue(r.stdout.splitlines()[1].startswith("petya,0,10,2,"), r.stdout)
 
@@ -252,7 +252,7 @@ class LedgerTickTest(LedgerRoom):
     def spend(self, *entries):
         calls = []
 
-        def fake(p):
+        def fake(p, **kwargs):
             calls.append(p["id"])
             return [dict(e) for e in entries]
 
@@ -332,7 +332,7 @@ class LedgerTickTest(LedgerRoom):
         self.assertEqual(sorted(calls), ["misha", "petya"])
 
     def test_a_counting_error_never_stops_the_tick(self):
-        def broken(p):
+        def broken(p, **kwargs):
             raise OSError("its log is gone\x1b[2J")
 
         self.enterContext(seam(self.mod, "usage.increment", broken))
@@ -366,7 +366,11 @@ class LedgerTickTest(LedgerRoom):
 
         def tmux(*a, **k):
             if a[:1] == ("capture-pane",):
-                return SimpleNamespace(returncode=0, stdout="› Ask Codex to do anything\n", stderr="")
+                # A look after the Enter reads the screen and its process in one call: its mark, then the process.
+                mark = a[-1].split("\t")[0] + "\t" if ";" in a else ""
+                return SimpleNamespace(
+                    returncode=0, stdout="› Ask Codex to do anything\n" + (mark + "0\t111\tcodex\n" if mark else ""), stderr=""
+                )
             if "#{pane_in_mode}" in a:
                 return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
             return SimpleNamespace(returncode=0, stdout="111\tcodex\n", stderr="")

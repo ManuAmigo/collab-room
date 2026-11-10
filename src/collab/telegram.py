@@ -15,7 +15,7 @@ import time
 import urllib.parse
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, cast
 import collab.boot as m_boot
 import collab.text as m_text
 import collab.i18n as m_i18n
@@ -71,12 +71,35 @@ def save(state: dict[str, Any]) -> None:
 
 
 @m_store.room_locked  # read and written in one step: the chat's «off» and the run's cursor never cross
-def update(**fields: Any) -> dict[str, Any]:
+def update(*, expected_sent: str | None = None, expected_generation: int | None = None, **fields: Any) -> dict[str, Any]:
     """Only these fields changed, over the file as it is now: the run's loop held what it read before a long poll,
     and wrote it back over an «off» the chat had set meanwhile."""
-    state = {**load(), **fields}
+    state = load()
+    if expected_sent is not None and (state.get("state") != "on" or state.get("sent", "") != expected_sent):
+        return state
+    if expected_generation is not None and (state.get("state") != "on" or state.get("generation", 0) != expected_generation):
+        return state
+    if fields.get("state") in ("on", "off") and fields["state"] != state.get("state"):
+        fields["generation"] = state.get("generation", 0) + 1
+    if fields.get("state") == "on" and state.get("state") != "on":
+        messages = m_log.read_messages()
+        config = m_store.load_config()
+        skipped = len(outgoing(config, messages, str(state["sent"]))) if state.get("sent") else 0
+        if skipped:
+            m_log.room_line(m_store.people_ids(config), "Skipped {n} messages: Telegram was off.", silent=True, n=skipped)
+        fields["sent"] = messages[-1]["id"] if messages else START
+    state = {**state, **fields}
     save(state)
     return state
+
+
+def telegram_link_current(state: dict[str, Any]) -> bool:
+    current = load()
+    return (
+        current.get("state") == "on"
+        and current.get("generation", 0) == state.get("generation", 0)
+        and all(current.get(key) == state.get(key) for key in ("server", "room_id", "token"))
+    )
 
 
 def connect(server: str) -> http.client.HTTPConnection:
@@ -178,7 +201,7 @@ def room_state(config: dict[str, Any]) -> dict[str, Any]:
             "state": str(status.get(p["id"], {}).get("state") or "unknown")[:40],
             "role": role_shown(config, p["id"]),
             "lead": p["id"] == lead,
-            "program": {"claude": "Claude", "codex": "Codex"}.get(m_screen.agent_kind(p), ""),
+            "program": {"claude": "Claude", "codex": "Codex", "kimi": "Kimi"}.get(m_screen.agent_kind(p), ""),
             "restartable": restartable(p),
         }
         for p in config["participants"]
@@ -215,9 +238,9 @@ def enable(server: str = "") -> tuple[str, float, str]:
         rid, token = str(made.get("room_id") or ""), str(made.get("token") or "")
         if not ROOM_ID.fullmatch(rid) or not TOKEN.fullmatch(token):
             raise Refused(0, "the server's answer is not a room")
-        state = {"server": server or SERVER, "room_id": rid, "token": token, "after": 0, "sent": ""}
-    state["state"] = "on"
-    save(state)
+        state = {"server": server or SERVER, "room_id": rid, "token": token, "after": 0, "sent": "", "state": "off"}
+        save(state)
+    state = update(state="on")
     call(state["server"], "PUT", f"/v1/rooms/{state['room_id']}/state", room_state(config), state["token"])
     got = call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/code", {}, state["token"])
     code = str(got.get("code") or "")
@@ -259,59 +282,72 @@ def file_name(raw: object, n: int) -> tuple[str, str]:
     return f"file-{n}" + (f".{ext}" if re.fullmatch(r"[a-z0-9]{1,10}", ext) else ""), shown
 
 
-def inbox_dir(mid: str) -> Path:
-    """The folder of one message's files: project/collab-inbox/<its id>/ — real folders, never a link out of the
-    project; collab-inbox kept out of git (.git/info/exclude, the person's .gitignore untouched)."""
+@contextlib.contextmanager
+def inbox_dir(mid: str) -> Iterator[tuple[Path, int]]:
+    """Hold real inbox directories throughout a download; reject a replaced public path."""
     root = m_store.room().paths.root
-    inbox = root / INBOX
-    for d in (inbox, inbox / mid):
+    with contextlib.ExitStack() as stack:
+
+        def opened(name: str | Path, parent: int | None = None) -> int:
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            stack.callback(os.close, fd)
+            return fd
+
+        rootfd = opened(root)
+        parent = rootfd
+        held: list[tuple[int, str, int]] = []
+        for name in (INBOX, mid):
+            try:
+                os.mkdir(name, mode=0o700, dir_fd=parent)
+            except FileExistsError:
+                pass
+            child = opened(name, parent)
+            held.append((parent, name, child))
+            parent = child
+        inboxfd = held[0][2]
         try:
-            d.mkdir(mode=0o700)
+            fd = os.open(".gitignore", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=inboxfd)
         except FileExistsError:
             pass
-        if d.is_symlink() or not d.is_dir():
-            raise OSError(f"{d.name} is not a folder of the project")
-    # Kept out of git in any layout — a worktree's .git is a file, a project may sit inside another repository:
-    # an agent's «git add -A» would commit the person's photos and documents.
-    ignore = inbox / ".gitignore"
-    if not ignore.exists() and not ignore.is_symlink():
-        with contextlib.suppress(OSError):
-            fd = os.open(ignore, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write("*\n")
-    exclude = root / ".git" / "info" / "exclude"
-    if exclude.parent.is_dir() and not exclude.is_symlink():
-        lines = exclude.read_text(encoding="utf-8", errors="replace").splitlines() if exclude.exists() else []
-        if f"/{INBOX}/" not in lines:
-            with exclude.open("a", encoding="utf-8") as f:
-                f.write(("\n" if lines and lines[-1] else "") + f"/{INBOX}/\n")
-    return inbox / mid
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                out.write("*\n")
+        yield root / INBOX / mid, parent
+        if not os.path.samestat(os.stat(root, follow_symlinks=False), os.fstat(rootfd)):
+            raise OSError("Project directory changed")
+        for parentfd, name, child in held:
+            if not os.path.samestat(os.stat(name, dir_fd=parentfd, follow_symlinks=False), os.fstat(child)):
+                raise OSError("Inbox directory changed")
 
 
 def receive(state: dict[str, Any], msg: dict[str, Any]) -> list[dict[str, Any]] | None:
     """A message's files, fetched from the bot into its inbox folder: each to a temporary file of its own, its size
     and hash checked, then renamed — an agent is given only a whole file. [] — none; None — not now (the message
     stays the bot's and is handed out again)."""
+    if not telegram_link_current(state):
+        return None
     files = msg.get("files")
     if not files:
         return []
     mid = str(msg.get("id") or "")
     if not isinstance(files, list) or len(files) > 10 or not AGENT_ID.fullmatch(mid):
         return None
-    folder = inbox_dir(mid)
-    got: list[dict[str, Any]] = []
-    for n, f in enumerate(files, 1):
-        fid, size, sha = (f.get(k) for k in ("id", "size", "sha")) if isinstance(f, dict) else (None, None, None)
-        if not (isinstance(fid, str) and FILE_ID.fullmatch(fid) and type(size) is int and 0 <= size <= FILE_MAX
-                and isinstance(sha, str) and SHA.fullmatch(sha)):  # fmt: skip
-            return None
-        disk, shown = file_name(f.get("name") or "file", n)
-        dest = folder / disk
-        mime = m_text.clean_field(str(f.get("mime") or ""), 80)
-        if not (dest.is_file() and not dest.is_symlink() and dest.stat().st_size == size and sha_of(dest) == sha):
-            fetch(state, fid, dest, size, sha)
-        got.append({"path": str(dest), "name": shown, "mime": mime, "size": size})
-    return got
+    with inbox_dir(mid) as (folder, directory):
+        got: list[dict[str, Any]] = []
+        for n, f in enumerate(files, 1):
+            if not telegram_link_current(state):
+                return None
+            fid, size, sha = (f.get(k) for k in ("id", "size", "sha")) if isinstance(f, dict) else (None, None, None)
+            if not (isinstance(fid, str) and FILE_ID.fullmatch(fid) and type(size) is int and 0 <= size <= FILE_MAX
+                    and isinstance(sha, str) and SHA.fullmatch(sha)):  # fmt: skip
+                return None
+            disk, shown = file_name(f.get("name") or "file", n)
+            dest = folder / disk
+            mime = m_text.clean_field(str(f.get("mime") or ""), 80)
+            if sha_of(directory, disk, size) != sha:
+                fetch(state, fid, dest, size, sha, directory=directory)
+            got.append({"path": str(dest), "name": shown, "mime": mime, "size": size})
+        return got
 
 
 COPY_DIR = re.compile(r"[0-9a-f]{16}")
@@ -381,6 +417,8 @@ def upload(state: dict[str, Any], f: dict[str, Any]) -> str:
     try:
         with os.fdopen(fd, "rb") as body:
             size = os.fstat(body.fileno()).st_size
+            if not telegram_link_current(state):
+                raise OSError("Telegram connection changed")
             conn.request("POST", f"/v1/rooms/{state['room_id']}/uploads", body=body, headers={
                 "X-Collab-Version": m_boot.VERSION, "Authorization": f"Bearer {state['token']}",
                 "Content-Length": str(size), "Content-Type": "application/octet-stream",
@@ -397,26 +435,35 @@ def upload(state: dict[str, Any], f: dict[str, Any]) -> str:
     return got if FILE_ID.fullmatch(got) else ""
 
 
-def sha_of(path: Path) -> str:
+def sha_of(directory: int, name: str, size: int) -> str:
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except OSError:
+        return ""
     digest = hashlib.sha256()
-    with path.open("rb") as f:
+    with os.fdopen(fd, "rb") as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size or info.st_nlink != 1:
+            return ""
         while chunk := f.read(1 << 16):
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def fetch(state: dict[str, Any], fid: str, dest: Path, size: int, sha: str) -> None:
+def fetch(state: dict[str, Any], fid: str, dest: Path, size: int, sha: str, *, directory: int) -> None:
     """One file's bytes from the bot, into dest: never more than it said, its hash the bot's."""
     conn = connect(state["server"])
-    part = dest.with_name(f".part-{uuid.uuid4().hex[:12]}")
+    part = f".part-{uuid.uuid4().hex[:12]}"
     try:
+        if not telegram_link_current(state):
+            raise OSError("Telegram connection changed")
         conn.request("GET", f"/v1/rooms/{state['room_id']}/files/{fid}",
                      headers={"X-Collab-Version": m_boot.VERSION, "Authorization": f"Bearer {state['token']}"})  # fmt: skip
         resp = conn.getresponse()
         if resp.status != 200:
             raise Refused(resp.status, "file")
         digest, n = hashlib.sha256(), 0
-        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
         with os.fdopen(fd, "wb") as out:
             while chunk := resp.read(1 << 16):
                 n += len(chunk)
@@ -426,11 +473,11 @@ def fetch(state: dict[str, Any], fid: str, dest: Path, size: int, sha: str) -> N
                 out.write(chunk)
         if n != size or digest.hexdigest() != sha:
             raise Refused(0, "file not whole")
-        os.replace(part, dest)
+        os.replace(part, dest.name, src_dir_fd=directory, dst_dir_fd=directory)
     finally:
         conn.close()
         with contextlib.suppress(OSError):
-            os.unlink(part)
+            os.unlink(part, dir_fd=directory)
 
 
 def attached_words(files: list[dict[str, Any]], lang: str) -> str:
@@ -450,11 +497,16 @@ def attached_words(files: list[dict[str, Any]], lang: str) -> str:
 
 
 @m_store.room_locked
-def take(msg: dict[str, Any], config: dict[str, Any], files: list[dict[str, Any]] | None = None) -> str:
+def take(
+    msg: dict[str, Any], config: dict[str, Any], files: list[dict[str, Any]] | None = None, *, link: dict[str, Any] | None = None
+) -> str:
     """One message from Telegram into the room: from the person, to the agent it was written to — the lead when none
     — signed with the person's key and marked via telegram under the signature, its server id kept: taken twice,
     written once. "taken"; "refused" — its agent is no longer in the room (never another instead); "" — no lead to
     write to yet: it waits."""
+    if load().get("state") != "on" or (link is not None and not telegram_link_current(link)):
+        return ""
+    config = m_store.load_config()
     people = m_store.people_ids(config)
     mid = str(msg.get("id") or "")
     to = str(msg.get("to") or "")
@@ -539,45 +591,184 @@ def outgoing(config: dict[str, Any], messages: list[dict[str, Any]], after: str)
     return out
 
 
+def telegram_outgoing_health() -> dict[str, Any]:
+    """Small private diagnostics, never a server response or message body."""
+    path = m_store.room().paths.state_dir / "telegram-outgoing.json"
+    try:
+        directory, name = m_store.state_dir(path, strict=False, create=False)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        finally:
+            os.close(directory)
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1 or info.st_size > 1024:
+                return {}
+            raw = json.loads(source.read(1025))
+        if not isinstance(raw, dict):
+            return {}
+        data = cast(dict[str, Any], raw)
+        if data.get("state") not in ("blocked", "ready"):
+            return {}
+        phase = data.get("phase")
+        error = data.get("error_class")
+        code = data.get("http_status")
+        return {
+            "state": data["state"],
+            "phase": phase if phase in ("prepare", "upload", "send", "commit", "notices", "idle") else "prepare",
+            "head": data["head"] if isinstance(data.get("head"), str) and re.fullmatch(r"[0-9a-f]{12}", data["head"]) else "",
+            "error_class": error
+            if error in ("", "Refused", "OSError", "HTTPException", "ValueError", "UnexpectedError")
+            else "UnexpectedError",
+            "http_status": code if type(code) is int and 100 <= code <= 599 else 0,
+            "at": data["at"] if isinstance(data.get("at"), str) and re.fullmatch(r"[0-9T:+.\-]{1,40}", data["at"]) else "",
+            "last_success": data["last_success"]
+            if isinstance(data.get("last_success"), str) and re.fullmatch(r"[0-9T:+.\-]{1,40}", data["last_success"])
+            else "",
+            "retry_in": 2 if data["state"] == "blocked" else 0,
+        }
+    except (OSError, ValueError, SystemExit):
+        return {}
+
+
+def note_telegram_outgoing(phase: str, head: str = "", error: Exception | None = None, success: bool = False) -> None:
+    """Best-effort bounded status; its own storage failure must not change sending or retries."""
+    try:
+        previous = telegram_outgoing_health()
+        if error is None and not success and previous.get("state") != "blocked":
+            return
+        category = next(
+            (
+                name
+                for cls, name in (
+                    (Refused, "Refused"),
+                    (OSError, "OSError"),
+                    (http.client.HTTPException, "HTTPException"),
+                    (ValueError, "ValueError"),
+                )
+                if isinstance(error, cls)
+            ),
+            "UnexpectedError" if error is not None else "",
+        )
+        code = error.status if isinstance(error, Refused) else 0
+        noted_at = m_store.now()
+        record = {
+            "state": "blocked" if error is not None else "ready",
+            "phase": phase,
+            "head": head if re.fullmatch(r"[0-9a-f]{12}", head) else "",
+            "error_class": category,
+            "http_status": code if type(code) is int and 100 <= code <= 599 else 0,
+            "at": noted_at,
+            "last_success": noted_at if success else str(previous.get("last_success") or ""),
+            "retry_in": 2 if error is not None else 0,
+        }
+        m_store.write_state(m_store.room().paths.state_dir / "telegram-outgoing.json", json.dumps(record))
+    except (Exception, SystemExit):
+        pass
+
+
 def send_out(state: dict[str, Any]) -> dict[str, Any]:
-    """Each new message for Telegram, once, in order; the cursor moves past one only when the server took it."""
-    config = m_store.load_config()
-    messages = m_log.read_messages()
-    sweep_copies()
-    if not state.get("sent"):
-        state = update(sent=messages[-1]["id"] if messages else START)  # from now: the past is not sent
-    for mid, kind, text, who in outgoing(config, messages, str(state.get("sent") or "")):
-        files = who.pop("files", [])
-        if text.strip():
-            # An agent's files go up first, each by itself; the message names them — sent with it, or not at all.
-            ids = [upload(state, f) for f in files]
-            call(
-                state["server"],
-                "POST",
-                f"/v1/rooms/{state['room_id']}/messages",
-                {"room_msg": mid, "kind": kind, "text": text, **who, **({"files": [i for i in ids if i]} if files else {})},
-                state["token"],
-            )
-        for f in files:  # sent: the copy made when it was said goes
-            drop_copy(f)
-        state = update(sent=mid)
-    return notices(state, config)
+    """Each new message for Telegram, in order; permanent failures are recorded locally."""
+    phase, head = "prepare", ""
+    try:
+        state = load()
+        if state.get("state") != "on":
+            return state
+        config = m_store.load_config()
+        messages = m_log.read_messages()
+        sweep_copies()
+        if not state.get("sent"):
+            state = update(sent=messages[-1]["id"] if messages else START, expected_sent="")
+        for mid, kind, text, who in outgoing(config, messages, str(state.get("sent") or "")):
+            current = load()
+            if not telegram_link_current(state) or current.get("sent") != state.get("sent"):
+                return current
+            head = mid
+            files = who.pop("files", [])
+            try:
+                if text.strip():
+                    encoded = text.encode("utf-16-le", errors="replace")
+                    if len(encoded) > TEXT_MAX * 2:
+                        footer = m_i18n.tr("\n\n[Preview; full text: collab show {id} in the room folder.]", id=mid)
+                        budget = TEXT_MAX * 2 - len(footer.encode("utf-16-le"))
+                        text = encoded[:budget].decode("utf-16-le", errors="ignore") + footer
+                    phase = "upload"
+                    ids = []
+                    for f in files:
+                        current = load()
+                        if not telegram_link_current(state) or current.get("sent") != state.get("sent"):
+                            return current
+                        ids.append(upload(state, f))
+                    current = load()
+                    if not telegram_link_current(state) or current.get("sent") != state.get("sent"):
+                        return current
+                    phase = "send"
+                    call(
+                        state["server"],
+                        "POST",
+                        f"/v1/rooms/{state['room_id']}/messages",
+                        {
+                            "room_msg": mid,
+                            "kind": kind,
+                            "text": text,
+                            **who,
+                            **({"files": [i for i in ids if i]} if files else {}),
+                        },
+                        state["token"],
+                    )
+            except Refused as exc:
+                if not 400 <= exc.status < 500 or exc.status == 429:
+                    raise
+                m_log.room_line(
+                    m_store.people_ids(config),
+                    "Message {id} was not sent to Telegram (HTTP {code}); later messages continue. Full text: collab show {id}.",
+                    silent=True,
+                    id=mid,
+                    code=exc.status,
+                )
+            else:
+                for f in files:
+                    drop_copy(f)
+                note_telegram_outgoing("idle", success=bool(text.strip()))
+            phase = "commit"
+            state = update(sent=mid, expected_sent=str(state.get("sent") or ""), expected_generation=state.get("generation", 0))
+            if state.get("state") != "on" or state.get("sent") != mid:
+                return state
+        phase, head = "notices", ""
+        current = load()
+        if not telegram_link_current(state) or current.get("sent") != state.get("sent"):
+            return current
+        result = notices(state, config)
+        note_telegram_outgoing("idle")
+        return result
+    except Exception as exc:
+        note_telegram_outgoing(phase, head, exc)
+        raise
 
 
 def notices(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """What the room's state says, not a message: an agent that now waits for the person in its window — once each
     time it begins to; today's spend past the person's limit — once a day, with the spend by agent."""
-    post = lambda room_msg, kind, text: call(
-        state["server"],
-        "POST",
-        f"/v1/rooms/{state['room_id']}/messages",
-        {"room_msg": room_msg, "kind": kind, "text": text},
-        state["token"],
-    )
+
+    generation = state.get("generation", 0)
+
+    def post(room_msg: str, kind: str, text: str) -> None:
+        if not telegram_link_current(state):
+            return
+        call(
+            state["server"],
+            "POST",
+            f"/v1/rooms/{state['room_id']}/messages",
+            {"room_msg": room_msg, "kind": kind, "text": text},
+            state["token"],
+        )
+
     waiting = waiting_agents(config)
     before = [str(x) for x in state.get("waiting") or []]
     asked = keep_prompts(waiting)
     for pid in waiting:
+        if not telegram_link_current(state):
+            return load()
         p = next((q for q in config["participants"] if q["id"] == pid), None)
         question = asking(p) if p is not None else None
         if question is not None and prompt_words(question) is None:
@@ -589,12 +780,16 @@ def notices(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
             gen = uuid.uuid4().hex[:12]
             text, options = prompt_words(question) or ("", [])
             body = {"room_msg": f"pr-{pid}-{gen}", "kind": "prompt", "text": text, "options": options, "prompt": gen}
+            if not telegram_link_current(state):
+                return load()
             call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/messages", {**body, **author(config, pid)},
                  state["token"])  # fmt: skip
             set_prompt(pid, {"gen": gen, "print": question["print"]})
         elif pid not in before and question is None:
             post(f"att-{pid}-{uuid.uuid4().hex[:12]}", "attention", m_store.label_of(config, pid))  # each time its own
-    state = update(waiting=waiting) if waiting != before else load()
+    state = update(waiting=waiting, expected_generation=generation) if waiting != before else load()
+    if state.get("generation", 0) != generation or state.get("state") != "on":
+        return state
     limit, today = int(state.get("limit") or 0), m_store.now()[:10]
     if limit and state.get("limit_told") != today:
         spent = spend_today()
@@ -604,36 +799,48 @@ def notices(state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
             lines = [m_i18n.tr("Spent today: {spent} tokens of {limit}.", spent=num(total), limit=num(limit))]
             lines += [f"{name}: {num(n)}" for name, n in sorted(spent.items(), key=lambda x: -x[1])[:10]]
             post(f"limit-{today}", "limit", "\n".join(lines))
-            state = update(limit_told=today)
+            state = update(limit_told=today, expected_generation=generation)
     return state
 
 
-def asking(p: dict[str, Any]) -> dict[str, Any] | None:
+def asking(p: dict[str, Any], deadline: float | None = None) -> dict[str, Any] | None:
     """The question an agent's program asks in its window now, read whole (prompts.read_prompt) — only in a window
     that holds the agent's own process, not scrolled; None — none, or not one the room can answer."""
     pane = str(p.get("target") or "")
-    if not pane or m_screen.agent_kind(p) not in ("claude", "codex"):
+    if not pane or m_screen.agent_kind(p) not in ("claude", "codex", "kimi"):
         return None
-    shot = m_screen.look(p, pane)
-    if shot.returncode != 0 or shot.scrolled or m_screen.pane_guard(p, pane, idle=False, shot=shot):
+    shot = m_screen.look(p, pane, deadline)
+    if m_prompts.deadline_expired(deadline) or shot.returncode != 0 or shot.scrolled:
+        return None
+    if m_screen.pane_guard(p, pane, idle=False, shot=shot, deadline=deadline) or m_prompts.deadline_expired(deadline):
         return None
     pane_pid, program = (shot.guard.split("\t") + ["", ""])[:2]
-    version = m_prompts.program_version(m_screen.agent_kind(p), program, pane_pid)
+    version = m_prompts.program_version(m_screen.agent_kind(p), program, pane_pid, deadline)
+    if m_prompts.deadline_expired(deadline):
+        return None
     # With the lines above the screen: a long command scrolls the program's own title out of view, and a title-like
     # line the agent wrote into the command would then be the only one seen — the dialog would seem to begin there.
-    width = m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_width}", check=False).stdout.strip()
-    if not width.isdigit():
+    width = m_tmuxio.tmux(
+        "display-message", "-p", "-t", pane, "#{pane_width}", check=False, timeout=m_prompts.deadline_left(deadline)
+    ).stdout.strip()
+    if m_prompts.deadline_expired(deadline) or not width.isdigit():
         return None
-    return m_prompts.read_prompt(m_screen.agent_kind(p), version, window_text(pane), int(width))
+    text = window_text(pane, deadline)
+    if m_prompts.deadline_expired(deadline):
+        return None
+    question = m_prompts.read_prompt(m_screen.agent_kind(p), version, text, int(width))
+    return None if m_prompts.deadline_expired(deadline) else question
 
 
 HISTORY = 200  # lines above the screen read with a question
 
 
-def window_text(pane: str) -> str:
+def window_text(pane: str, deadline: float | None = None) -> str:
     """An agent's window as plain text, with the HISTORY lines above its screen, a line the terminal wrapped joined
     again (-J): its continuation is no line of its own; "" — not read."""
-    shown = m_tmuxio.tmux("capture-pane", "-p", "-J", "-S", f"-{HISTORY}", "-t", pane, check=False)
+    shown = m_tmuxio.tmux(
+        "capture-pane", "-p", "-J", "-S", f"-{HISTORY}", "-t", pane, check=False, timeout=m_prompts.deadline_left(deadline)
+    )
     return shown.stdout if shown.returncode == 0 else ""
 
 
@@ -674,11 +881,11 @@ VIDEO_EXT = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi")  # a name's ending
 
 
 @m_store.room_locked
-def prepare_video(action: dict[str, Any]) -> str:
+def prepare_video(action: dict[str, Any], *, link: dict[str, Any] | None = None) -> str:
     """«Prepare for analysis», pressed under a video the room took: the agent it was for is asked to prepare it —
     frames with their times and a manifest, no sound. The room runs nothing on the file: a video from outside is
     opened by the agent, under its own permissions. Asked as the person, from Telegram. "done", or why not."""
-    if load().get("state") != "on":
+    if load().get("state") != "on" or (link is not None and not telegram_link_current(link)):
         return "off"
     mid = str(action.get("prompt") or "")
     if not AGENT_ID.fullmatch(mid):
@@ -753,6 +960,8 @@ def screen_shot(state: dict[str, Any], action: dict[str, Any]) -> str:
         if not fid:
             return "failed"  # never «below» with nothing below
         words = m_i18n.tr("{name}'s screen, as text, at {at}.", m_store.room_language(config), name=name, at=m_store.now()[11:16])
+        if not telegram_link_current(state):
+            return "off"
         call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/messages",
              {"room_msg": f"snap-{action.get('id')}", "kind": "room", "text": words, "files": [fid] if fid else []},
              state["token"])  # fmt: skip
@@ -763,10 +972,13 @@ def screen_shot(state: dict[str, Any], action: dict[str, Any]) -> str:
     return "done"
 
 
-def act(action: dict[str, Any]) -> str:
+def act(action: dict[str, Any], *, link: dict[str, Any] | None = None) -> str:
     """One /control action from Telegram, as the room's own command does it — no key is typed into any window: pause or
     resume delivery, restart an agent the room started with its saved conversation. "done", or why not. Said in the
     room's log as the person's, from Telegram."""
+    link = load() if link is None else link
+    if not telegram_link_current(link):
+        return "off"
     kind, to = str(action.get("kind") or ""), str(action.get("to") or "")
     if kind not in ACTIONS:
         return "failed"
@@ -777,23 +989,49 @@ def act(action: dict[str, Any]) -> str:
         sid = m_screen.agent_session(p) if p is not None and restartable(p) else ""
     if kind in ("choose", "refresh"):
         n = action.get("n")
-        word, p, question = answer(kind, to, n if type(n) is int else 0, str(action.get("prompt") or ""))
+        word, p, question = answer(kind, to, n if type(n) is int else 0, str(action.get("prompt") or ""), link=link)
         if word != "sent" or p is None or question is None:
             return word
         # The look after, out of the room's lock: delivery waits for nobody's second.
         time.sleep(1.0)
         after = asking(p)
         return "unconfirmed" if after is not None and after["print"] == question["print"] else "done"
-    return act_locked(kind, to, sid)
+    return act_locked(kind, to, sid, link=link)
+
+
+KIMI_REDRAW_WAIT = 1.0
+KIMI_REDRAW_INTERVAL = 0.05
+
+
+def wait_for_kimi_selection(p: dict[str, Any], question: dict[str, Any], expected: int, previous: int) -> dict[str, Any] | None:
+    deadline = time.monotonic() + KIMI_REDRAW_WAIT
+    while True:
+        current = asking(p, deadline)
+        if current is None or m_prompts.deadline_expired(deadline):
+            return None
+        if current["lines"] != question["lines"] or current["options"] != question["options"]:
+            return None
+        if current["selected"] == expected and not m_prompts.deadline_expired(deadline):
+            return current
+        if current["selected"] != previous:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(KIMI_REDRAW_INTERVAL, remaining))
 
 
 @m_store.room_locked
-def answer(kind: str, to: str, n: int, gen: str) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
+def answer(
+    kind: str, to: str, n: int, gen: str, *, link: dict[str, Any] | None = None
+) -> tuple[str, dict[str, Any] | None, dict[str, Any] | None]:
     """A question's button pressed in Telegram, under the room's lock — delivery types into windows under it too, so
     nothing is typed between the look and the key. The window is read again now: the same agent's process, the same
-    question its card was made from (its words, options, the one selected) — else no key at all. Then ONE key, the
-    option's digit. "sent" with the agent and the question — the look after is the caller's, out of the lock."""
-    if load().get("state") != "on":
+    question its card was made from (its words, options, the one selected) — else no key at all. Then one action:
+    a digit for Claude/Codex, arrows to the selected Cache option and Enter for Kimi, whose frame and selection are
+    checked after every arrow and before Enter. "sent" with the agent and the question actually checked before Enter — the look
+    after is the caller's, out of the lock."""
+    if load().get("state") != "on" or (link is not None and not telegram_link_current(link)):
         return "off", None, None
     config = m_store.load_config()
     people = m_store.people_ids(config)
@@ -811,22 +1049,38 @@ def answer(kind: str, to: str, n: int, gen: str) -> tuple[str, dict[str, Any] | 
     option = next((o for o in question["options"] if o["n"] == n), None)
     if option is None:
         return "stale", None, None
-    sent = m_tmuxio.tmux("send-keys", "-t", str(p["target"]), "-l", m_prompts.key_for(m_screen.agent_kind(p), n), check=False)
-    if sent.returncode != 0:
-        return "failed", None, None
+    kind = m_screen.agent_kind(p)
+    confirmed = question
+    previous = question["selected"]
+    keys = m_prompts.keys_for(kind, n, question["selected"]) if kind == "kimi" else [m_prompts.key_for(kind, n)]
+    for key in keys:
+        if kind == "kimi":
+            sent = m_tmuxio.tmux("send-keys", "-t", str(p["target"]), key, check=False)
+        else:
+            sent = m_tmuxio.tmux("send-keys", "-t", str(p["target"]), "-l", key, check=False)
+        if sent.returncode != 0:
+            return "failed", None, None
+        if kind == "kimi" and key != "Enter":
+            expected = previous + (1 if key == "Down" else -1)
+            confirmed = wait_for_kimi_selection(p, question, expected, previous)
+            if confirmed is None:
+                return "stale", None, None
+            previous = expected
     set_prompt(to, None)
     who = m_text.visible(m_store.label_of(config, people[0])) if people else ""
     m_log.room_line(people, "{who} chose «{option}» for {name} from Telegram.", who=who,
                     option=m_text.visible(f"{n}. {option['lines'][0]}")[:120], name=m_text.visible(m_store.label_of(config, to)))  # fmt: skip
-    return "sent", p, question
+    return "sent", p, confirmed
 
 
 @m_store.room_locked
-def act_locked(kind: str, to: str, sid: str) -> str:
+def act_locked(kind: str, to: str, sid: str, *, link: dict[str, Any] | None = None) -> str:
     """act's part under the room's lock: the chat's «off» and the action never cross, and the room's file is read
     now — not the one read before a long poll: an agent restarted on the computer meanwhile has a new window, and the
     old one's record would start a second copy of it on the same conversation."""
-    if load().get("state") != "on":  # off in the chat meanwhile: nothing from Telegram is done
+    if load().get("state") != "on" or (
+        link is not None and not telegram_link_current(link)
+    ):  # off in the chat meanwhile: nothing from Telegram is done
         return "off"
     config = m_store.load_config()
     people = m_store.people_ids(config)
@@ -857,6 +1111,9 @@ def act_locked(kind: str, to: str, sid: str) -> str:
 def take_in(state: dict[str, Any], wait: float) -> dict[str, Any]:
     """One long poll: the events first (unlinked — off at once), then each message written into the room and
     acknowledged after it is."""
+    if not telegram_link_current(state):
+        return load()
+    generation = state.get("generation", 0)
     config = m_store.load_config()
     got = call(
         state["server"],
@@ -865,12 +1122,18 @@ def take_in(state: dict[str, Any], wait: float) -> dict[str, Any]:
         None,
         state["token"],
     )
+    if not telegram_link_current(state):
+        return load()
     if any(e.get("kind") == "unlinked" for e in got.get("events") or []):
-        state = update(state="off", after=int(got.get("after") or 0))
+        state = update(state="off", after=int(got.get("after") or 0), expected_generation=generation)
+        if state.get("state") != "off" or state.get("generation", 0) != generation + 1:
+            return state
         m_log.room_line(m_store.people_ids(config), "Telegram is unlinked: the account was unlinked in the bot.", silent=True)
         return state
     acted = dict(state.get("acted") or {})
     for a in got.get("actions") or []:
+        if not telegram_link_current(state):
+            return load()
         aid = str(a.get("id") or "") if isinstance(a, dict) else ""
         if not AGENT_ID.fullmatch(aid):
             continue
@@ -880,23 +1143,39 @@ def take_in(state: dict[str, Any], wait: float) -> dict[str, Any]:
         word = acted.get(aid, "")
         if not word:
             acted = {**dict(list(acted.items())[-49:]), aid: "unknown"}
-            state = update(acted=acted)
+            update(acted=acted, expected_generation=generation)
+            if not telegram_link_current(state):
+                return load()
             try:
                 kind = a.get("kind")
-                word = screen_shot(state, a) if kind == "snapshot" else prepare_video(a) if kind == "prepare" else act(a)
+                word = (
+                    screen_shot(state, a)
+                    if kind == "snapshot"
+                    else prepare_video(a, link=state)
+                    if kind == "prepare"
+                    else act(a, link=state)
+                )
             except Exception:  # noqa: BLE001 — told as unknown; the person looks on the computer
                 word = "unknown"
             acted = {**acted, aid: word}
-            state = update(acted=acted)
+            update(acted=acted, expected_generation=generation)
+            if not telegram_link_current(state):
+                return load()
+        if not telegram_link_current(state):
+            return load()
         try:
             call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/actions", {"id": aid, "word": word}, state["token"])
         except Refused as exc:
             if exc.status != 400 or word != "unknown":
                 raise
+            if not telegram_link_current(state):
+                return load()
             # A bot from before «unknown»: its older word, which it shows as not confirmed.
             call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/actions", {"id": aid, "word": "failed"}, state["token"])
     done: list[tuple[str, str]] = []
     for m in got.get("messages") or []:
+        if not telegram_link_current(state):
+            return load()
         if not isinstance(m, dict):
             continue
         # Its files first, out of the room's lock (up to 20 MB each); not all of them now — not taken, handed out again.
@@ -906,16 +1185,18 @@ def take_in(state: dict[str, Any], wait: float) -> dict[str, Any]:
             files = None
         if files is None:
             continue
-        how = take(m, config, files)
+        how = take(m, config, files, link=state)
         if how == "refused" and files:  # its agent is gone: the files it would have read go too
             with contextlib.suppress(OSError):
                 shutil.rmtree(m_store.room().paths.root / INBOX / str(m["id"]))
         done.append((str(m["id"]), how))
+    if not telegram_link_current(state):
+        return load()
     taken, refused = [i for i, how in done if how == "taken"], [i for i, how in done if how == "refused"]
     if taken or refused:
         body = {"messages": taken, "refused": refused}
         call(state["server"], "POST", f"/v1/rooms/{state['room_id']}/ack", body, state["token"])
-    return update(after=int(got.get("after") or 0))
+    return update(after=int(got.get("after") or 0), expected_generation=generation)
 
 
 def run(wait: float = WAIT) -> None:
@@ -950,6 +1231,8 @@ def run(wait: float = WAIT) -> None:
                 return
             try:
                 current = room_state(m_store.load_config())
+                if not telegram_link_current(state):
+                    continue
                 if current != last_state:
                     call(state["server"], "PUT", f"/v1/rooms/{state['room_id']}/state", current, state["token"])
                     last_state = current
@@ -1036,3 +1319,15 @@ def cmd_telegram(args: argparse.Namespace) -> None:
         print(m_i18n.tr("Telegram is not set up for this room: `collab telegram on`."))
         return
     print(m_i18n.tr("Telegram: {state} · server {server}", state=state.get("state", "off"), server=state.get("server", "")))
+    health = telegram_outgoing_health()
+    if health.get("state") == "blocked":
+        print(
+            m_i18n.tr(
+                "Outgoing blocked · {phase} · message {head} · {error}{http} · retry in {seconds}s",
+                phase=health["phase"],
+                head=health["head"] or "?",
+                error=health["error_class"],
+                http=f" HTTP {health['http_status']}" if health["http_status"] else "",
+                seconds=health["retry_in"],
+            )
+        )

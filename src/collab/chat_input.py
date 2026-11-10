@@ -28,6 +28,8 @@ class ChatInputContext:
     fd: Any
     feed: Any
     history: Any
+    handoff: Any
+    handoff_result: Any
     leave_history: Any
     lock: Any
     menu_items: Any
@@ -50,6 +52,24 @@ def chat_read_keys(ctx: ChatInputContext) -> None:
     in_paste = False
     PASTE_END = "\033[201~"
     while True:
+        if (
+            not pending
+            and not in_paste
+            and not decoder.getstate()[0]
+            and not ctx.wizard
+            and not ctx.after_lock
+            and ctx.ui.reading is None
+            and ctx.ui.viewing is None
+            and ctx.ui.top is None
+        ):
+            token = ctx.handoff()
+            if token is not None:
+                ctx.handoff_result.append(token)
+                return
+        import select
+
+        if not select.select([ctx.fd], [], [], 0.2)[0]:
+            continue
         chunk = os.read(ctx.fd, 1024)
         if not chunk:
             return

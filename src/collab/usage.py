@@ -7,10 +7,14 @@ nothing else of it leaves this module.
 
 from __future__ import annotations
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import stat
+import shlex
+import subprocess
+import uuid
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -126,6 +130,36 @@ def unread(p: dict[str, Any]) -> str:
         if codex_file(p, str(known))[0]:
             return ""
         return f"no log of its session in {m_text.tilde(str(codex_home()))} (found by its connection check)"
+    if kind == "kimi":
+        b = kimi_binding(p)
+        if not b:
+            proof = obj(
+                kimi_state(m_store.room().paths.state_dir / "kimi-launches.json").get(str(p.get("kimi_usage_generation") or ""))
+            )
+            reason = proof.get("reason")
+            if (
+                proof.get("id") == p["id"]
+                and isinstance(reason, str)
+                and reason
+                in (
+                    "native adapter has not been verified; no token data",
+                    "session changed or resumed without a new managed launch",
+                    "managed resume cursor unavailable; no token data",
+                )
+            ):
+                return reason
+            return "no confirmed Kimi session binding (automatic collection is not installed)"
+        fd = open_under(Path("/"), kimi_file(b))
+        if fd is None:
+            return "bound Kimi usage log is unavailable or unsafe"
+        os.close(fd)
+        cursor = obj(kimi_state(m_store.room().paths.state_dir / "kimi-usage-cursor.json").get(p["id"]))
+        signature = hashlib.sha256(json.dumps(b, sort_keys=True).encode()).hexdigest()
+        return (
+            ""
+            if cursor.get("binding") == signature and cursor.get("observed") is True
+            else "no validated Kimi usage records since the binding baseline"
+        )
     return "not a Claude or a Codex: its spending is not read"
 
 
@@ -143,7 +177,8 @@ def open_under(base: Path, path: Path) -> int | None:
             inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = inner
-        f = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+        # Refuse special files after open without waiting for a FIFO writer first.
+        f = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     except (OSError, IndexError):
         return None
     finally:
@@ -298,18 +333,632 @@ class Cursor:
         return cls(r["since"], files, seen, ctx, r["code"] if isinstance(r.get("code"), str) else "")
 
 
-def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
+# This adapter's persisted zeros cannot distinguish missing usage from measured zero.
+KIMI_ADAPTER = "openai-compatible-2.4.1"
+KIMI_NORMALIZED = "kimi-code-2.4.1-normalized"
+KIMI_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+# Native workspace slugs retain dots, including hidden directory basenames.
+# Keep the previous simple-key contract without broadening session/agent IDs.
+KIMI_WORKDIR = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9_-]{0,127}|wd_[a-z0-9._-]{1,40}_[0-9a-f]{12})")
+
+
+def kimi_state(path: Path) -> dict[str, Any]:
+    """Only fixed state names, bounded regular files, no followed components or links."""
+    if path.parent != m_store.room().paths.state_dir or path.name not in (
+        "kimi-launches.json",
+        "kimi-usage-bindings.json",
+        "kimi-usage-cursor.json",
+    ):
+        return {}
+    fd = open_under(Path("/"), path)
+    if fd is None:
+        return {}
+    try:
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if info.st_nlink > 1 or info.st_size > CHUNK:
+                return {}
+            data = source.read(CHUNK + 1)
+            return obj(json.loads(data)) if len(data) <= CHUNK else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def kimi_home() -> Path:
+    return Path(os.environ.get("KIMI_CODE_HOME", "~/.kimi-code")).expanduser().absolute() / "sessions"
+
+
+def kimi_binding(p: dict[str, Any]) -> dict[str, Any]:
+    b = obj(kimi_state(m_store.room().paths.state_dir / "kimi-usage-bindings.json").get(p["id"]))
+    if not p.get("join_code") or any(
+        b.get(k) != str(p.get(v) or "") for k, v in (("generation", "join_code"), ("pane_pid", "pane_pid"), ("target", "target"))
+    ):
+        return {}
+    if b.get("adapter") not in (KIMI_ADAPTER, KIMI_NORMALIZED) or b.get("sessions_root") != str(kimi_home()):
+        return {}
+    if not isinstance(b.get("workdir_key"), str) or not KIMI_WORKDIR.fullmatch(str(b["workdir_key"])):
+        return {}
+    if any(not isinstance(b.get(k), str) or not KIMI_PART.fullmatch(str(b[k])) for k in ("session_id", "agent_id")):
+        return {}
+    if p.get("kimi_usage_generation") and b.get("launch_token") != p["kimi_usage_generation"]:
+        return {}
+    # Subagents and other usage scopes have not been demonstrated by this adapter.
+    return b if b["agent_id"] == "main" else {}
+
+
+def register_kimi_binding(p: dict[str, Any], launch: dict[str, Any], event: dict[str, Any]) -> bool:
+    """Internal handoff from a managed launch, not a hook receiver. `launch` must be the
+    launcher-owned proof, not fields copied from `event`. No live producer is installed here.
+    The caller must have verified pane identity and the SessionStart parent process independently."""
+    if (
+        m_screen.agent_kind(p) != "kimi"
+        or event.get("hook_event_name") != "SessionStart"
+        or event.get("source") != "startup"
+        or event.get("client_type") != "kimi_code_cli"
+    ):
+        return False
+    if str(event.get("parent_pid") or "") != str(launch.get("pane_pid") or ""):
+        return False
+    b = {k: launch.get(k) for k in ("generation", "pane_pid", "target", "sessions_root", "workdir_key", "adapter")}
+    b.update(session_id=event.get("session_id"), agent_id="main")
+    if isinstance(launch.get("token"), str):
+        b["launch_token"] = launch["token"]
+    if not p.get("pane_pid") or not p.get("join_code"):
+        return False
+    if any(
+        b.get(k) != str(p.get(v) or "") for k, v in (("generation", "join_code"), ("pane_pid", "pane_pid"), ("target", "target"))
+    ):
+        return False
+    if b["sessions_root"] != str(kimi_home()) or b["adapter"] not in (KIMI_ADAPTER, KIMI_NORMALIZED):
+        return False
+    if not isinstance(b.get("workdir_key"), str) or not KIMI_WORKDIR.fullmatch(str(b["workdir_key"])):
+        return False
+    if not isinstance(b.get("session_id"), str) or not KIMI_PART.fullmatch(str(b["session_id"])):
+        return False
+    path = m_store.room().paths.state_dir / "kimi-usage-bindings.json"
+    m_store.write_json(path, {**kimi_state(path), p["id"]: b})
+    return True
+
+
+def kimi_resume_binding(p: dict[str, Any], sid: str = "") -> dict[str, Any]:
+    """Only the exact managed session with a durable cursor can survive a new process."""
+    if not p.get("id") or m_screen.agent_kind(p) != "kimi":
+        return {}
+    b = kimi_binding(p)
+    proof = obj(kimi_state(m_store.room().paths.state_dir / "kimi-launches.json").get(str(p.get("kimi_usage_generation") or "")))
+    if not b or not p.get("started_by_room") or (sid and sid != b["session_id"]) or proof.get("reason"):
+        return {}
+    if any(
+        proof.get(k) != b.get(v)
+        for k, v in (
+            ("token", "launch_token"),
+            ("generation", "generation"),
+            ("pane_pid", "pane_pid"),
+            ("target", "target"),
+            ("session_id", "session_id"),
+            ("adapter", "adapter"),
+            ("sessions_root", "sessions_root"),
+            ("workdir_key", "workdir_key"),
+        )
+    ):
+        return {}
+    identity = kimi_process_start(str(p.get("pane_pid") or ""))
+    if (
+        proof.get("id") != p["id"]
+        or proof.get("folder") != os.path.realpath(str(p.get("folder") or ""))
+        or not proof.get("start_identity")
+        or (identity and identity != proof["start_identity"])
+    ):
+        return {}
+    return b if kimi_resume_cursor(p["id"], b) else {}
+
+
+def kimi_resume_cursor(pid: str, b: dict[str, Any]) -> dict[str, Any]:
+    """Validate the old signature and append-only source without copying its contents."""
+    if (
+        b.get("sessions_root") != str(kimi_home())
+        or b.get("adapter") not in (KIMI_ADAPTER, KIMI_NORMALIZED)
+        or b.get("agent_id") != "main"
+    ):
+        return {}
+    if (
+        not isinstance(b.get("workdir_key"), str)
+        or not KIMI_WORKDIR.fullmatch(b["workdir_key"])
+        or not isinstance(b.get("session_id"), str)
+        or not KIMI_PART.fullmatch(b["session_id"])
+    ):
+        return {}
+    cursor = obj(kimi_state(m_store.room().paths.state_dir / "kimi-usage-cursor.json").get(pid))
+    signature = hashlib.sha256(json.dumps(b, sort_keys=True).encode()).hexdigest()
+    if cursor.get("binding") != signature or not stamp(cursor.get("since")) or not isinstance(cursor.get("seen"), dict):
+        return {}
+    at = obj(obj(cursor.get("files")).get("wire"))
+    if any(type(at.get(k)) is not int for k in ("ino", "off", "mid")) or at["off"] < 0 or at["mid"] not in (0, 1):
+        return {}
+    fd = open_under(Path("/"), kimi_file(b))
+    if fd is None:
+        return {}
+    try:
+        info = os.fstat(fd)
+        return cursor if info.st_ino == at["ino"] and info.st_size >= at["off"] else {}
+    finally:
+        os.close(fd)
+
+
+def kimi_file(b: dict[str, Any]) -> Path:
+    return Path(b["sessions_root"]) / b["workdir_key"] / b["session_id"] / "agents" / b["agent_id"] / "wire.jsonl"
+
+
+def kimi_usage_adapter(command: str) -> str:
+    """A launcher-owned compatibility check. No config, credentials, model alias or hook
+    payload chooses a format. Unknown versions are no-data, never a guessed fallback."""
+    try:
+        argv = shlex.split(command)
+        if not argv:
+            return ""
+        result = subprocess.run([argv[0], "--version"], capture_output=True, text=True, timeout=2)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    return KIMI_NORMALIZED if result.returncode == 0 and result.stdout.strip() == "2.4.1" else ""
+
+
+def kimi_process_start(pid: str) -> str:
+    """OS observation of the launch process, never a field from hook JSON."""
+    if not pid.isdecimal() or int(pid) <= 1:
+        return ""
+    try:
+        got = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", pid], capture_output=True, text=True, timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return got.stdout.strip() if got.returncode == 0 else ""
+
+
+def kimi_process_status(pid: str) -> str:
+    if not pid.isdecimal() or int(pid) <= 1:
+        return "unknown"
+    try:
+        got = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", pid], capture_output=True, text=True, timeout=1)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if got.returncode == 0:
+        return "alive" if got.stdout.strip() else "unknown"
+    return "gone" if got.returncode == 1 and not got.stdout.strip() and not got.stderr.strip() else "unknown"
+
+
+def kimi_workdir_key(folder: str) -> str:
+    normalized = folder.replace("\\", "/").rstrip("/")
+    slug = re.sub(r"[^a-z0-9._-]+", "-", normalized.split("/")[-1].lower()).strip("-")[:40].strip("-")
+    if slug in ("", ".", ".."):
+        slug = "workspace"
+    return "wd_" + slug + "_" + hashlib.sha256(normalized.encode()).hexdigest()[:12]
+
+
+def prepare_kimi_launch(pid: str, generation: str, folder: str, adapter: str = "", resume: dict[str, Any] | None = None) -> str:
+    """Launcher-owned metadata. Adapter proof belongs to the caller; normal native launches
+    are unknown until their protocol has been verified, not inferred from hook model names."""
+    token = uuid.uuid4().hex
+    path = m_store.room().paths.state_dir / "kimi-launches.json"
+    proofs = kimi_state(path)
+    # One active launch per participant: old tokens never authorize the next generation.
+    proofs = {k: v for k, v in proofs.items() if resume or obj(v).get("id") != pid}
+    proofs[token] = {
+        "id": pid,
+        "token": token,
+        "generation": generation,
+        "folder": os.path.realpath(folder),
+        "at": m_store.now(),
+        "sessions_root": str(kimi_home()),
+        "workdir_key": kimi_workdir_key(os.path.realpath(folder)),
+        "adapter": adapter,
+    }
+    if resume:
+        proofs[token]["resume_binding"] = resume
+    m_store.write_json(path, proofs)
+    return token
+
+
+def kimi_launch_command(command: str, pid: str, token: str) -> str:
+    # Fixed variable names and quoted values; no credentials or hook payload in the command.
+    return (
+        shlex.join(
+            [
+                "env",
+                "COLLAB_KIMI_ROOM=" + str(m_store.room().paths.root),
+                "COLLAB_KIMI_AGENT=" + pid,
+                "COLLAB_KIMI_GENERATION=" + token,
+                "KIMI_CODE_HOME=" + str(kimi_home().parent),
+            ]
+        )
+        + " "
+        + command
+    )
+
+
+def finish_kimi_launch(p: dict[str, Any], token: str) -> None:
+    path = m_store.room().paths.state_dir / "kimi-launches.json"
+    proofs = kimi_state(path)
+    proof = obj(proofs.get(token))
+    if proof.get("id") != p["id"] or proof.get("generation") != p.get("join_code"):
+        return
+    proof.update(
+        pane_pid=str(p.get("pane_pid") or ""),
+        target=str(p.get("target") or ""),
+        start_identity=kimi_process_start(str(p.get("pane_pid") or "")),
+    )
+    proofs[token] = proof
+    m_store.write_json(path, proofs)
+
+
+@m_store.room_locked
+def collect_kimi_start(event: dict[str, Any]) -> bool:
+    """The trusted hook process observes its own parent. Environment only selects a room's
+    checked state: all authority comes from the current participant and the launch manifest."""
+    token, pid = os.environ.get("COLLAB_KIMI_GENERATION", ""), os.environ.get("COLLAB_KIMI_AGENT", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token) or not pid:
+        return False
+    p = obj(next((q for q in m_store.read_config_raw().get("participants", []) if q.get("id") == pid), None))
+    proof_path = m_store.room().paths.state_dir / "kimi-launches.json"
+    proofs = kimi_state(proof_path)
+    proof = obj(proofs.get(token))
+    parent = str(os.getppid())
+    if (
+        m_screen.agent_kind(p) != "kimi"
+        or p.get("started_by_room") is not True
+        or p.get("kimi_usage_generation") != token
+        or proof.get("id") != pid
+        or proof.get("token") != token
+        or not proof.get("start_identity")
+        or proof.get("start_identity") != kimi_process_start(parent)
+        or proof.get("sessions_root") != str(kimi_home())
+        or any(
+            str(proof.get(k) or "") != str(p.get(v) or "")
+            for k, v in (("pane_pid", "pane_pid"), ("target", "target"), ("generation", "join_code"))
+        )
+        or parent != str(p.get("pane_pid") or "")
+        or proof.get("folder") != os.path.realpath(str(p.get("folder") or ""))
+    ):
+        return False
+    if event.get("hook_event_name") != "SessionStart" or event.get("client_type") != "kimi_code_cli":
+        return False
+    sid = event.get("session_id")
+    if not isinstance(sid, str) or not KIMI_PART.fullmatch(sid):
+        return False
+    if not isinstance(event.get("cwd"), str) or os.path.realpath(event["cwd"]) != proof["folder"]:
+        return False
+    bindings_path = m_store.room().paths.state_dir / "kimi-usage-bindings.json"
+
+    def unbind(reason: str) -> bool:
+        proof["reason"] = reason
+        proofs[token] = proof
+        m_store.write_json(proof_path, proofs)
+        bindings = kimi_state(bindings_path)
+        bindings.pop(pid, None)
+        m_store.write_json(bindings_path, bindings)
+        return False
+
+    if event.get("source") not in ("startup", "resume"):
+        return False
+    resume = obj(proof.get("resume_binding"))
+    managed_resume = bool(resume) and event.get("source") == "resume" and resume.get("session_id") == sid
+    if (
+        (event.get("source") == "resume" and not managed_resume)
+        or (resume and not managed_resume)
+        or (proof.get("session_id") and proof["session_id"] != sid)
+    ):
+        return unbind("session changed or resumed without a new managed launch")
+    if proof.get("reason"):
+        return False  # invalidated generations cannot be revived by replaying an old startup
+    if proof.get("adapter") not in (KIMI_ADAPTER, KIMI_NORMALIZED):
+        return unbind("native adapter has not been verified; no token data")
+    next_binding = {k: proof.get(k) for k in ("generation", "pane_pid", "target", "sessions_root", "workdir_key", "adapter")}
+    next_binding.update(session_id=sid, agent_id="main", launch_token=token)
+    carried = (kimi_resume_cursor(pid, resume) or kimi_resume_cursor(pid, next_binding)) if managed_resume else {}
+    if managed_resume and not proof.get("session_id") and not carried:
+        return unbind("managed resume cursor unavailable; no token data")
+    if not register_kimi_binding(p, proof, {**event, "source": "startup", "parent_pid": int(parent)}):
+        return False
+    # The manifest is created before exec. Start at zero even when the async hook arrives
+    # after the first usage; never baseline at that late EOF. Repeated hooks do not rewind.
+    b = kimi_binding(p)
+    signature = hashlib.sha256(json.dumps(b, sort_keys=True).encode()).hexdigest()
+    cursor = m_store.room().paths.state_dir / "kimi-usage-cursor.json"
+    state = kimi_state(cursor)
+    if not proof.get("session_id") and obj(state.get(pid)).get("binding") != signature:
+        state[pid] = (
+            {**carried, "binding": signature}
+            if managed_resume
+            else {**asdict(Cursor(str(proof["at"]))), "binding": signature, "observed": False}
+        )
+        m_store.write_json(cursor, state)
+    proof["session_id"] = sid
+    proofs = {k: v for k, v in proofs.items() if obj(v).get("id") != pid or k == token}
+    proofs[token] = proof
+    m_store.write_json(proof_path, proofs)
+    return True
+
+
+def _read_records(path: Path, at: dict[str, Any]) -> dict[str, Any] | None:
+    dev, ino, off, mid = at.get("dev"), at.get("ino"), at.get("off"), at.get("mid")
+    if (
+        not isinstance(dev, int)
+        or not isinstance(ino, int)
+        or not isinstance(off, int)
+        or not isinstance(mid, int)
+        or ino < 0
+        or off < 0
+        or mid not in (0, 1)
+    ):
+        return None
+    fd = open_under(Path("/"), path)
+    if fd is None:
+        return None
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if info.st_dev != dev or info.st_ino != ino or info.st_size < off:
+            return None
+        stream.seek(off)
+        data = stream.read(CHUNK)
+    start = 0
+    if mid:
+        first = data.find(b"\n")
+        if first < 0:
+            return {"records": [], "cursor": {"dev": dev, "ino": ino, "off": off + len(data), "mid": 1}, "eof": False}
+        start = first + 1
+    end = data.rfind(b"\n") + 1
+    if end <= start:
+        if start == len(data):
+            return {
+                "records": [],
+                "cursor": {"dev": dev, "ino": ino, "off": off + start, "mid": 0},
+                "eof": len(data) < CHUNK,
+            }
+        if len(data) == CHUNK:
+            return {"records": [], "cursor": {"dev": dev, "ino": ino, "off": off + len(data), "mid": 1}, "eof": False}
+        return {"records": [], "cursor": {"dev": dev, "ino": ino, "off": off + start, "mid": 0}, "eof": False}
+    cursor = {"dev": dev, "ino": ino, "off": off + end, "mid": 0}
+    try:
+        records: list[tuple[dict[str, Any], int]] = []
+        position = off + start
+        for raw in data[start:end].splitlines(keepends=True):
+            position += len(raw)
+            record: Any = json.loads(raw)
+            if not isinstance(record, dict):
+                return None
+            records.append((cast(dict[str, Any], record), position))
+    except ValueError:
+        return None
+    return {"records": records, "cursor": cursor, "eof": len(data) < CHUNK and end == len(data)}
+
+
+def _terminal_event(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    record = cast(dict[str, Any], raw)
+    if record.get("type") == "context.append_loop_event":
+        if record.get("agentId") != "main":
+            return {}
+        event = obj(record.get("event"))
+        return event if event.get("type") in ("step.end", "turn.step.interrupted") else {}
+    if record.get("agentId") != "main" or record.get("type") not in ("step.end", "turn.step.interrupted", "turn.ended"):
+        return {}
+    return record
+
+
+def kimi_quota_boundary(p: dict[str, Any]) -> dict[str, Any]:
+    b = kimi_binding(p)
+    if not b:
+        return {}
+    path = kimi_file(b)
+    fd = open_under(Path("/"), path)
+    if fd is None:
+        return {}
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    start = max(0, info.st_size - CHUNK)
+    at = {"dev": info.st_dev, "ino": info.st_ino, "off": start, "mid": int(start > 0)}
+    latest: tuple[dict[str, Any], int] | None = None
+    step: dict[str, Any] = {}
+    deadline = time.monotonic() + 2
+    for _ in range(32):
+        if time.monotonic() >= deadline:
+            return {}
+        progress = _read_records(path, at)
+        if progress is None:
+            return {}
+        for raw, offset in progress["records"]:
+            event = _terminal_event(raw)
+            if event.get("type") == "step.end" and event.get("finishReason") == "error":
+                step = event
+            if event.get("type") != "turn.ended" or event.get("reason") != "failed":
+                continue
+            error = obj(event.get("error"))
+            if (
+                error.get("name") == "APIProviderQuotaExhaustedError"
+                and obj(error.get("details")).get("statusCode") == 429
+                and isinstance(event.get("turnId"), int)
+            ):
+                latest = (event, offset)
+        if progress["eof"] or not progress["records"]:
+            break
+        at = progress["cursor"]
+    else:
+        return {}
+    if latest is None:
+        return {}
+    event, offset = latest
+    turn = event.get("turnId")
+    if not isinstance(turn, int):
+        return {}
+    return {
+        "binding": hashlib.sha256(json.dumps(b, sort_keys=True).encode()).hexdigest(),
+        "dev": info.st_dev,
+        "ino": info.st_ino,
+        "off": offset,
+        "mid": 0,
+        "turn": turn,
+        "step_uuid": step.get("uuid") if step.get("turnId") == turn else "",
+        "trace_id": event.get("traceId") if isinstance(event.get("traceId"), str) else "",
+        "fsm": {"completed_steps": [], "latest_completed": None},
+    }
+
+
+def kimi_quota_recovery_state(p: dict[str, Any], boundary: dict[str, Any]) -> dict[str, Any]:
+    b = kimi_binding(p)
+    stored_cursor = boundary.get("cursor", boundary)
+    at = cast(dict[str, Any], stored_cursor).copy() if isinstance(stored_cursor, dict) else {}
+    empty = {"done": False, "recovered": False, "cursor": at}
+    if not b:
+        return empty
+    signature = hashlib.sha256(json.dumps(b, sort_keys=True).encode()).hexdigest()
+    if boundary.get("binding") != signature or not isinstance(boundary.get("turn"), int):
+        return empty
+    stored_fsm = obj(at.get("fsm", boundary.get("fsm", {"completed_steps": [], "latest_completed": None})))
+    stored_steps = stored_fsm.get("completed_steps")
+    latest_completed = stored_fsm.get("latest_completed")
+    if not isinstance(stored_steps, list):
+        return empty
+    steps = cast(list[Any], stored_steps)
+    if (
+        any(isinstance(turn, bool) or not isinstance(turn, int) or turn <= boundary["turn"] for turn in steps)
+        or (latest_completed is not None and (isinstance(latest_completed, bool) or not isinstance(latest_completed, int)))
+        or (latest_completed is not None and latest_completed not in steps)
+    ):
+        return empty
+    progress = _read_records(kimi_file(b), at)
+    if progress is None:
+        return empty
+    completed_steps: set[int] = set(steps)
+    for raw, _ in progress["records"]:
+        event = _terminal_event(raw)
+        turn = event.get("turnId")
+        if not isinstance(turn, int):
+            continue
+        kind = event.get("type")
+        if kind == "step.end":
+            if (
+                event.get("finishReason") == "end_turn"
+                and event.get("providerFinishReason") == "completed"
+                and event.get("rawFinishReason") == "stop"
+                and turn > boundary["turn"]
+            ):
+                completed_steps.add(turn)
+            elif event.get("finishReason") == "error":
+                latest_completed = None
+        elif kind == "turn.step.interrupted":
+            latest_completed = None
+        elif kind == "turn.ended":
+            if event.get("reason") == "failed":
+                latest_completed = None
+            elif event.get("reason") == "completed" and turn in completed_steps and turn > boundary["turn"]:
+                latest_completed = turn
+    fsm = {"completed_steps": sorted(completed_steps), "latest_completed": latest_completed}
+    cursor = {key: value for key, value in boundary.items() if key not in ("cursor", "fsm")}
+    return {
+        "done": progress["eof"],
+        "recovered": latest_completed in completed_steps,
+        "cursor": {**cursor, **progress["cursor"], "fsm": fsm},
+        "fsm": fsm,
+    }
+
+
+def kimi_quota_recovered(p: dict[str, Any], boundary: dict[str, Any]) -> bool:
+    progress = kimi_quota_recovery_state(p, boundary)
+    return progress["done"] and progress["recovered"]
+
+
+def save_usage_cursor(path: Path, state: dict[str, Any], updates: dict[str, Any] | None, pid: str, before: Any) -> None:
+    if updates is None:
+        m_store.write_json(path, state)
+    else:
+        updates[path.name] = {"pid": pid, "before": before, "after": state[pid]}
+
+
+def kimi_increment(p: dict[str, Any], *, updates: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    b = kimi_binding(p)
+    if not b:
+        return []
+    path = kimi_file(b)
+    # Opening from / also refuses a link substituted for the sessions root itself.
+    fd = open_under(Path("/"), path)
+    if fd is None:
+        return []
+    os.close(fd)
+    cp = m_store.room().paths.state_dir / "kimi-usage-cursor.json"
+    state = kimi_state(cp)
+    before = state.get(p["id"])
+    signature = hashlib.sha256(json.dumps(b, sort_keys=True).encode()).hexdigest()
+    old = obj(state.get(p["id"]))
+    stored = Cursor.load(old) if old.get("binding") == signature else None
+    fresh = stored is None
+    cur = stored or Cursor(m_store.now())
+    at = cur.files.get("wire", {})
+    lines, after = read_new(Path("/"), path, at, to_end=fresh)
+    out: list[dict[str, Any]] = []
+    for raw in lines:
+        r = parse(raw.decode("utf-8", errors="replace"))
+        if r.get("type") != "usage.record" or r.get("agentId") != b["agent_id"] or r.get("usageScope") != "turn":
+            continue
+        model, ms, u = clean(r.get("model")), r.get("time"), obj(r.get("usage"))
+        if model is None or isinstance(ms, bool) or not isinstance(ms, int):
+            continue
+        try:
+            ts = dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).isoformat(timespec="milliseconds")
+        except (ValueError, OverflowError, OSError):
+            continue
+        names = ("inputOther", "output", "inputCacheRead", "inputCacheCreation")
+        nums = [u.get(k) for k in names]
+        if any(v is not None and (isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 10**15) for v in nums):
+            continue
+        # A durable record has no request id: canonical numeric identity survives copied/reformatted lines.
+        key = hashlib.sha256(json.dumps([ms, model, *nums]).encode()).hexdigest()
+        if key in cur.seen or ts < cur.since:
+            continue
+        cur.seen[key] = ts
+        known = any(isinstance(v, int) and v > 0 for v in nums)
+        vals = dict(zip(FIELDS, nums)) if known else dict.fromkeys(FIELDS)
+        vals["cache_write"] = None
+        out.append(
+            {
+                "model": model,
+                "effort": None,
+                **vals,
+                "thinking": None,
+                "coverage": "partial" if known else "unknown",
+                "reason": "reported-cli 2.4.1; cache-write/thinking unknown" if known else "reported-cli 2.4.1; zero-or-missing",
+                "answers": 1,
+                "ctx_max": None,
+                "ctx_last": None,
+                "from_ts": ts,
+                "to_ts": ts,
+            }
+        )
+    cur.files = {"wire": after}
+    if len(cur.seen) > SEEN_MAX:
+        keep = sorted(cur.seen.items(), key=lambda kv: kv[1])[-SEEN_MAX:]
+        cur.seen, cur.since = dict(keep), keep[0][1]
+    state[p["id"]] = {**asdict(cur), "binding": signature, "observed": bool(out) or (not fresh and old.get("observed") is True)}
+    save_usage_cursor(cp, state, updates, p["id"], before)
+    return out
+
+
+def increment(p: dict[str, Any], *, updates: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """What the agent spent since the last call: one record per model and effort — {model, effort, input,
     output, cache_read, cache_write, answers, ctx_max, ctx_last, from_ts, to_ts}: the answers counted, the
     longest context of one (input + cache read + cache write) and that of the latest, times of the first
     and last answer. Nothing
     new — []. The first call for an agent starts from now: its past is not counted against the task it is
     on. Called under the room's lock by its one writer (delivery's tick); the cursor is in the room's state,
-    so a restart of delivery neither counts again nor loses a piece."""
+    so a restart of delivery neither counts again nor loses a piece.
+    With updates supplied, stage cursor writes there for the journal transaction."""
     kind = m_screen.agent_kind(p)
+    if kind == "kimi":
+        return kimi_increment(p, updates=updates)
     if kind not in ("claude", "codex"):
         return []
     state = m_store.read_json(cursor_path())
+    before = state.get(p["id"])
     stored = Cursor.load(state.get(p["id"]))
     fresh = stored is None
     cur = stored or Cursor(m_store.now())
@@ -373,8 +1022,8 @@ def increment(p: dict[str, Any]) -> list[dict[str, Any]]:
         keep = sorted(cur.seen.items(), key=lambda kv: kv[1])[-SEEN_MAX:]
         cur.seen, cur.since = dict(keep), keep[0][1]
     state[p["id"]] = asdict(cur)
-    m_store.write_json(cursor_path(), state)
+    save_usage_cursor(cursor_path(), state, updates, p["id"], before)
     if compacted:
         seen = m_store.read_json(m_store.compacted_path())
-        m_store.write_json(m_store.compacted_path(), {**seen, p["id"]: compacted[-1]})
+        save_usage_cursor(m_store.compacted_path(), {**seen, p["id"]: compacted[-1]}, updates, p["id"], seen.get(p["id"]))
     return [g for g in groups.values() if any(g[f] for f in FIELDS)]

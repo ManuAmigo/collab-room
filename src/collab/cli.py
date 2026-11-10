@@ -16,16 +16,23 @@ import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.log as m_log
 import collab.tasks as m_tasks
+import collab.activity as m_activity
 import collab.tmuxio as m_tmuxio
 import collab.screen as m_screen
 import collab.installer as m_installer
+import collab.usage as m_usage
 import collab.ledger as m_ledger
 import collab.deliver as m_deliver
 import collab.telegram as m_telegram
 import collab.agents as m_agents
+import collab.vpn_macos_room as m_vpn_macos_room
+import collab.vpn_macos_daemon as m_vpn_macos_daemon
+import collab.vpn_macos_launch as m_vpn_macos_launch
+import collab.vpn_macos_process as m_vpn_macos_process
 import collab.lifecycle as m_lifecycle
 import collab.doctor as m_doctor
 import collab.chat_base as m_chat_base
+import collab.chat_handoff as m_chat_handoff
 import collab.chat as m_chat
 import collab.dm as m_dm
 
@@ -33,6 +40,33 @@ import collab.dm as m_dm
 # One empty line under the input, so it does not sit on the very bottom edge:
 # step down to make the line, then back up to type above it.
 LIFT = "\n\033[1A"
+
+
+def cmd_deliver_services(args: argparse.Namespace) -> None:
+    m_deliver.cmd_deliver(args)
+
+
+def cmd_vpn(args: argparse.Namespace) -> None:
+    try:
+        result = m_vpn_macos_room.mac_vpn_room_action(args.action)
+        print(json.dumps(result, ensure_ascii=True, sort_keys=True))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        m_store.fail(m_i18n.tr("macOS VPN unavailable; check the private account and proxy service."))
+
+
+def cmd_macos_vpn_daemon(args: argparse.Namespace) -> None:
+    try:
+        m_vpn_macos_daemon.mac_proxy_daemon(Path(args.folder), Path(args.binary), Path(args.account))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        m_store.fail(m_i18n.tr("macOS VPN supervisor unavailable or stopped with unconfirmed state"))
+
+
+def cmd_macos_vpn_agent(args: argparse.Namespace) -> None:
+    try:
+        command = args.command[1:] if args.command[:1] == ["--"] else args.command
+        m_vpn_macos_launch.mac_vpn_agent_run(m_vpn_macos_daemon.mac_vpn_folder(), args.kind, tuple(command))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        m_store.fail(m_i18n.tr("macOS VPN agent launch refused; proxy lease unavailable"))
 
 
 def cmd_mute(args: argparse.Namespace) -> None:
@@ -81,6 +115,8 @@ def cmd_add(args: argparse.Namespace) -> None:
     if problem:
         m_store.fail(problem)
     base = m_screen.PRESETS[args.kind]["label"]
+    if args.yolo and args.kind != "kimi":
+        m_store.fail(m_i18n.tr("--yolo is only for Kimi"))
     label = args.name or next(
         n for n in [base] + [f"{base} {i}" for i in range(2, 100)] if not m_store.label_taken(config, "", n)
     )
@@ -90,13 +126,17 @@ def cmd_add(args: argparse.Namespace) -> None:
     if problem:
         m_store.fail(problem)
     own = settings_args(args, config)
-    if own:
-        # An agent's settings are the person's to give: from a command line they are a proposal, applied with Enter
-        # in the chat — whoever runs this, a person or an agent.
-        add = {"kind": args.kind, "label": label, "folder": str(folder.resolve()), **own}
+    if own or args.yolo:
+        # An agent's settings and its permission mode are the person's to give: from a command line they are
+        # a proposal, applied with Enter in the chat — whoever runs this, a person or an agent.
+        add = {"kind": args.kind, "label": label, "folder": str(folder.resolve()), **own, **({"yolo": True} if args.yolo else {})}
         propose(m_text.ROOM, "", {"add": [add]}, config)
         return
-    pid = m_agents.launch_new_agent(config, args.kind, str(folder.resolve()), label, own)
+    try:
+        m_agents.ensure_agent_cli(args.kind, progress=lambda text: print(text))
+        pid = m_agents.launch_new_agent(config, args.kind, str(folder.resolve()), label, own, yolo=args.yolo)
+    except m_agents.AgentCliError as exc:
+        m_store.fail(str(exc))
     # Not typed in a chat: the people learn who came in, and where it works.
     m_log.room_line(
         m_store.people_ids(m_store.load_config()),
@@ -177,19 +217,41 @@ def cmd_inbox(args: argparse.Namespace) -> None:
         acked = m_log.read_set(rp.receipts_dir, args.participant)
         mine = [m for m in mine if m["id"] not in acked]
     mine = mine[-args.limit :]
-    if not mine:
+    # Notes that wake no one — «Taking», the merge queue's «waits», «Merged» — are read here and done with: no
+    # answer is due, and left unread they hung in every inbox among the questions. A line each, marked read now.
+    notes = [m for m in mine if m_deliver.is_quiet(m, config) or m_deliver.is_silent(m, config)]
+    mine = [m for m in mine if m not in notes]
+    if not mine and not notes:
         print(m_i18n.tr("No unacknowledged messages for {participant}.", participant=args.participant))
         return
     me = m_store.participant(config, args.participant)
     # An agent's, with the ready commands under each: a long message's pointer is the inbox command alone.
     hints = me.get("reply_hint", True) and args.participant not in m_store.people_ids(config)
-    print(
-        "\n\n".join(
-            m_chat_base.fmt(m, config=config)
-            + (f"\n  ({hint})" if hints and (hint := m_deliver.answer_hint(me, m, config, check_rule=False)) else "")
-            for m in mine
-        )
-    )
+    blocks = [
+        m_chat_base.fmt(m, config=config)
+        + (f"\n  ({hint})" if hints and (hint := m_deliver.answer_hint(me, m, config, check_rule=False)) else "")
+        for m in mine
+    ]
+    if notes:
+        blocks.append(m_i18n.tr("Notices (no answer due; marked read):") + "".join(f"\n  {note_line(m, config)}" for m in notes))
+        mark_notes_read(args.participant, {m["id"] for m in notes})
+    print("\n\n".join(blocks))
+
+
+NOTE_COLS = 160  # a notice's line in inbox, at most: the whole of it is one `show` away
+
+
+def note_line(m: dict[str, Any], config: dict[str, Any]) -> str:
+    words = " ".join(m_text.visible(str(m.get("text") or "")).split())
+    cut = words if m_text.text_cols(words) <= NOTE_COLS else m_text.cut_cols(words, NOTE_COLS) + "…"
+    who = m_store.label_of(config, m["from"])
+    return f"{m_text.local_hm(str(m.get('at') or ''))} {who}: {cut} ({m['id']})"
+
+
+@m_store.room_locked
+def mark_notes_read(pid: str, ids: set[str]) -> None:
+    rp = m_store.room().paths
+    m_log.write_set(rp.receipts_dir, pid, m_log.read_set(rp.receipts_dir, pid) | ids)
 
 
 @m_store.room_locked
@@ -217,6 +279,21 @@ def cmd_ack(args: argparse.Namespace) -> None:
         print(m_i18n.tr("Closed {p0} message(s) for {participant} without a reply.", p0=len(ids), participant=args.participant))
         return
     print(m_i18n.tr("Acknowledged {p0} message(s) for {participant}.", p0=len(ids), participant=args.participant))
+
+
+def cmd_take(args: argparse.Namespace) -> None:
+    """«Taking: <what, files>» to everyone, as a note that wakes no one — by the command, not by an agent
+    remembering --quiet; with --task, the task is taken too (task take)."""
+    if args.task and not args.kind:
+        m_store.fail(m_i18n.tr("--kind is one of: {p0}", p0=", ".join(m_tasks.KINDS)))
+    what = args.text if args.text != "-" else sys.stdin.read()
+    if not what.strip():
+        m_store.fail(m_i18n.tr("message cannot be empty"))
+    lang = m_store.room_language(m_store.load_config())
+    say = argparse.Namespace(sender=args.sender, to=["all"], re="", quiet=True)
+    m_deliver.post_message(say, m_i18n.tr("Taking: {what}", lang, what=what.strip()))
+    if args.task:
+        m_tasks.task_take(args.sender, args.task, args.kind, args.lane or "", args.by or "")
 
 
 def cmd_task(args: argparse.Namespace) -> None:
@@ -329,6 +406,8 @@ def hook_participant(config: dict[str, Any], pid: str, hook: dict[str, Any]) -> 
         mine = [p["id"] for p in config.get("participants", []) if p.get("claude_session") == sid]
         if mine:
             return mine[0] if len(mine) == 1 else None
+    if sid and config.get("macos_vpn") is True and (owner := m_vpn_macos_process.mac_vpn_bind_hook(sid)):
+        return owner
     bound = next((p.get("claude_session") for p in config.get("participants", []) if p["id"] == pid), None)
     return None if bound and sid else pid
 
@@ -362,10 +441,12 @@ def cmd_status(args: argparse.Namespace) -> None:
         print(m_i18n.tr("{as_}: {state}", as_=args.as_, state=args.state))
         return
     st = m_screen.read_status()
+    activity = m_activity.activity_projection(config)
     messages = m_log.read_messages()
     for p in config["participants"]:
         pid, lang = p["id"], m_store.room_language(config)
         waiting = m_deliver.undelivered_words(p, config, messages, lang)
+        still = "" if pid in m_store.people_ids(config) else m_deliver.open_words(p, config, messages, lang)
         print(
             (
                 m_screen.describe(pid, st[pid], args.stale, lang)
@@ -373,6 +454,8 @@ def cmd_status(args: argparse.Namespace) -> None:
                 else m_i18n.tr("· {pid}: No status yet", lang, pid=pid)
             )
             + (f" · {waiting}" if waiting else "")
+            + (f" · {still}" if still else "")
+            + (f" · {m_activity.activity_words(activity[pid], lang)}" if pid in activity else "")
         )
 
 
@@ -553,6 +636,46 @@ def cmd_brief(args: argparse.Namespace) -> None:
         print("\n" + m_deliver.where_it_was(pid, config, m_log.read_messages()))
 
 
+def cmd_kimi_hook(args: argparse.Namespace) -> None:
+    if args.action == "show":
+        print(m_installer.kimi_hook_fragment(), end="")
+        return
+    try:
+        changed = m_installer.set_kimi_hook(Path(args.config), remove=args.action == "remove")
+    except (OSError, ValueError) as exc:
+        m_store.fail(str(exc))
+    print("Hook config updated." if changed else "Hook config unchanged.")
+
+
+def cmd_kimi_adoption_guard(args: argparse.Namespace) -> None:
+    token, pid = os.environ.get("COLLAB_KIMI_GENERATION", ""), os.environ.get("COLLAB_KIMI_AGENT", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token) or pid != args.agent:
+        m_store.fail(m_i18n.tr("{p0}: no confirmed managed session and cursor; restart refused", p0=args.agent))
+    m_agents.kimi_adoption_poststop(args.agent, token, args.pid, args.session, args.dev, args.ino)
+
+
+def cmd_kimi_start(args: argparse.Namespace) -> None:
+    # No marker: a hook in the ordinary profile does nothing in an unmanaged session.
+    token, root = os.environ.get("COLLAB_KIMI_GENERATION", ""), os.environ.get("COLLAB_KIMI_ROOM", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token) or not root or not os.environ.get("COLLAB_KIMI_AGENT"):
+        return
+    raw = sys.stdin.buffer.read(65537)
+    if len(raw) > 65536:
+        return
+    try:
+        event = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return
+    if not isinstance(event, dict):
+        return
+    m_store.use_room(root)
+    # Hook failures are no-data, never text injected into the model's context.
+    try:
+        m_usage.collect_kimi_start(event)
+    except (OSError, ValueError, SystemExit):
+        pass
+
+
 def cmd_hook_model(args: argparse.Namespace) -> None:
     """For Claude Code hooks: read the hook's JSON on stdin (SessionStart has `model`,
     PostModelSwitch has `to_model`) and put the model next to this participant's name.
@@ -729,6 +852,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("start", help="first time: create the room here; then open it (agents, delivery, chat)")
     s.add_argument("--session")
+    s.add_argument(
+        "--delivery-only", action="store_true", help="restart delivery in an existing room without opening its chat or agents"
+    )
     s.set_defaults(func=m_lifecycle.cmd_start)
 
     s = sub.add_parser("say", aliases=["send"], help="post a message to the room")
@@ -751,6 +877,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("text", help="message text, or - to read stdin")
     s.set_defaults(func=cmd_say)
+
+    s = sub.add_parser("take", help="tell the room what you take («Taking: …»), waking no one; --task takes it too")
+    s.add_argument("--from", dest="sender", required=True)
+    s.add_argument("--task", help="the task's id, e.g. 4.2 or T1: taken as `task take` does")
+    s.add_argument("--kind", choices=m_tasks.KINDS, help="with --task: the kind of work")
+    s.add_argument("--lane", choices=m_tasks.LANES, help="with --task: the lane, A/B/C")
+    s.add_argument("--by", help="with --task: who gave the task (a participant's id)")
+    s.add_argument("text", help="what you take — the task and its files — or - to read stdin")
+    s.set_defaults(func=cmd_take)
 
     s = sub.add_parser("inbox", help="unacknowledged messages for a participant")
     s.add_argument("--for", dest="participant", required=True)
@@ -794,6 +929,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.add_argument("--as", dest="as_", required=True)
     s.add_argument("--interval", type=interval_seconds, default=0.5)
+    s.add_argument("--handoff-token", help=argparse.SUPPRESS)
     s.set_defaults(func=m_dm.cmd_dm)
 
     s = sub.add_parser("chat", help="a person's seat: read the room and write `@id text`")
@@ -802,7 +938,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--stale", type=float, default=30.0, help="minutes after which a self-reported state is shown as stale")
     s.add_argument("--max-lines", type=int, default=12, help="cut longer messages; 0 = never")
     s.add_argument("--plain", action="store_true", help="old one-line format, no colours")
+    s.add_argument("--handoff-token", help=argparse.SUPPRESS)
     s.set_defaults(func=m_chat.cmd_chat)
+
+    s = sub.add_parser("chat-update", help="update this room's chat at a safe input boundary, preserving drafts")
+    s.add_argument("--as", dest="as_", required=True)
+    s.set_defaults(func=lambda args: m_chat_handoff.request_update(args.as_))
 
     for verb, text in (
         ("pause", "pause the room: agents get no messages until resume"),
@@ -848,6 +989,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--topic", help="the part of the task it answers for, one line")
     s.add_argument("--model", help="the model its program runs (default: the program's own)")
     s.add_argument("--reports-to", dest="reports_to", help="«person» or a participant's id (default: the lead)")
+    s.add_argument(
+        "--yolo",
+        action="store_true",
+        help="Kimi only: Ask When Needed — routine project commands and edits run automatically; risky guards stay as configured",
+    )
     s.set_defaults(func=cmd_add)
 
     s = sub.add_parser("name", help="give a participant a name shown in the room")
@@ -881,12 +1027,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     s.set_defaults(func=cmd_status)
 
+    s = sub.add_parser("vpn", help="set up or control the macOS room VPN")
+    s.add_argument("action", choices=("setup", "on", "off", "status"))
+    s.set_defaults(func=cmd_vpn, participant="")
+
+    s = sub.add_parser("vpn-daemon", help=argparse.SUPPRESS)
+    s.add_argument("--folder", required=True)
+    s.add_argument("--binary", required=True)
+    s.add_argument("--account", required=True)
+    s.set_defaults(func=cmd_macos_vpn_daemon)
+
+    s = sub.add_parser("vpn-agent", help=argparse.SUPPRESS)
+    s.add_argument("--kind", choices=("codex", "claude"), required=True)
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(func=cmd_macos_vpn_agent)
+
     s = sub.add_parser("deliver", help="type messages into idle tmux panes of participants with delivery 'tmux'")
     s.add_argument("--interval", type=interval_seconds, default=2.0)
     s.add_argument("--once", action="store_true")
     s.add_argument("--from-now", action="store_true", help="do not deliver messages that existed before start")
     s.add_argument("--idle-ok", action="store_true", help="keep running even if nobody needs tmux delivery yet")
-    s.set_defaults(func=m_deliver.cmd_deliver)
+    s.set_defaults(func=cmd_deliver_services)
 
     s = sub.add_parser("team", help="the room's team: show it, list the ready teams, start one")
     s.add_argument("action", nargs="?", choices=["show", "scenarios", "start", "save"], default="show")
@@ -948,6 +1109,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     u.add_argument("--format", choices=["md", "csv"], default="md")
     u.set_defaults(func=cmd_usage_report)
+    u = usage.add_parser("kimi-hook", help="preview/install/remove one hook in an explicitly chosen config")
+    u.add_argument("action", choices=["show", "install", "remove"])
+    u.add_argument("--config", required=True, help="explicit config.toml; never chosen automatically")
+    u.set_defaults(func=cmd_kimi_hook)
+    u = usage.add_parser("kimi-adoption-guard", help="internal selected-session post-stop guard")
+    u.add_argument("--agent", required=True)
+    u.add_argument("--pid", required=True)
+    u.add_argument("--session", required=True)
+    u.add_argument("--dev", required=True, type=int)
+    u.add_argument("--ino", required=True, type=int)
+    u.set_defaults(func=cmd_kimi_adoption_guard)
+    u = usage.add_parser("kimi-start", help="internal Kimi SessionStart collector")
+    u.set_defaults(func=cmd_kimi_start)
     add_room_option(usage)
     s = sub.add_parser("report", help="commit summary: hash, files, push state")
     s.add_argument("--repo")
@@ -988,9 +1162,10 @@ def repeated_identity(argv: list[str]) -> str:
 
 
 # What a room-started Codex may run through its read-only copy, and the flag that names who runs it: the lead's two
-# commands with the answers' three — each writes only the room's journal or its state, and only as that one id.
+# commands with the answers' four — each writes only the room's journal or its state, and only as that one id.
 IDENTITY_FLAG = {
     "say": ("--from", "sender"),
+    "take": ("--from", "sender"),
     "ack": ("--for", "participant"),
     "inbox": ("--for", "participant"),
     "propose": ("--from", "sender"),
@@ -1063,11 +1238,14 @@ def main() -> None:
     # COLLAB_SAFE_DIR switched the check off). And the check of links runs for every answer, copy
     # or not: for a plain room it costs nothing.
     if re.fullmatch(r"collab-[0-9a-f]{16}", Path(m_boot.SELF).name) and sys.argv[1:2] and sys.argv[1] not in IDENTITY_FLAG:
-        m_store.fail(m_i18n.tr("this copy of collab only answers in a room: say, ack, inbox, propose, goal"))
+        m_store.fail(m_i18n.tr("this copy of collab only answers in a room: say, take, ack, inbox, propose, goal"))
     if sys.argv[1:2] and sys.argv[1] in IDENTITY_FLAG:
         guard_room_state()
     if args.func is m_chat.cmd_chat:
         m_chat.run_chat(args)
+        return
+    if args.func is cmd_kimi_start:
+        args.func(args)
         return
     m_i18n.speak(cli_language())
     args.func(args)

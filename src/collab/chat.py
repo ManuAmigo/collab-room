@@ -21,6 +21,7 @@ import collab.installer as m_installer
 import collab.deliver as m_deliver
 import collab.agents as m_agents
 import collab.chat_base as m_chat_base
+import collab.chat_handoff as m_chat_handoff
 import collab.chat_help as m_chat_help
 import collab.chat_menu as m_chat_menu
 import collab.chat_views as m_chat_views
@@ -42,11 +43,27 @@ def cmd_chat(args: argparse.Namespace) -> None:
     """
     inst = m_boot.paths()
     rp = m_store.room().paths
+    restore: dict[str, Any] = {}
+    token = getattr(args, "handoff_token", None)
+    if token is not None:
+        pane = os.environ.get("TMUX_PANE", "")
+        request = m_chat_handoff.read_request(args.as_, pane)
+        if request is None or "source_pid" not in request:
+            raise m_chat_handoff.HandoffError("chat recovery request is missing")
+        seat = m_chat_handoff.Seat(str(rp.root), args.as_, pane, request["source_pid"], request["generation"])
+        store = m_chat_handoff.HandoffStore(rp.state_dir / "handoff")
+        payload = store.claim(token, seat)
+        restore = {"request": request, "seat": seat, "store": store, "payload": payload, "token": token}
+        rec = m_chat_base.dm_window(args.as_)
+        if rec:
+            ack = m_chat_handoff.read_dm_ack(request, rec["pane"])
+            if ack is not None:
+                restore.update(dm_pane=rec["pane"], dm_ack=ack)
     ui = m_chat_base.ChatState()
     born = m_installer.copy_name()  # the collab this chat runs, by its content
     ui.mine_count = 0  # «● N for you» over the input
     dm_focus = [False, True]  # a /dm panel is open beside this chat; the input is here
-    folded: list[Any] = [None, None]  # the agent whose /dm line is the feed's last, and that line
+    folded: list[Any] = [None, None, []]  # last /dm status block, and each status block's hidden messages
     stale_seen: list[Any] = [0.0, False]
     told_old: set[Any] = set()
     if sys.stdin.isatty() and sys.stdout.isatty():
@@ -242,13 +259,13 @@ def cmd_chat(args: argparse.Namespace) -> None:
         repaint()
         run_wizard_step("/mine")  # back to the list, what is read is gone from it
 
-    def open_dm(pid: str) -> None:
+    def open_dm(pid: str, handoff_token: str | None = None) -> None:
         """Open the panel beside this chat (or switch it) on a tab for `pid`; the focus goes there."""
         rp = m_store.room().paths
         state = m_chat_base.dm_tabs(args.as_)
         m_chat_base.set_dm_tabs(args.as_, state["tabs"] + ([pid] if pid not in state["tabs"] else []), pid)
         rec = m_chat_base.dm_window(args.as_)
-        if m_chat_base.dm_window_alive(args.as_):
+        if handoff_token is None and rec and m_chat_base.dm_window_alive(args.as_):
             m_tmuxio.tmux("select-pane", "-t", rec["pane"], check=False)
             return
         own = os.environ.get("TMUX_PANE", "")
@@ -271,23 +288,23 @@ def cmd_chat(args: argparse.Namespace) -> None:
         # process is itself, and a wrapper running Python as its child (no exec) left every private
         # word of the person marked ⚠.
         cmd = f"{shlex.quote(sys.executable)} {shlex.quote(m_boot.SELF)} dm --as {shlex.quote(args.as_)}"
-        out = m_tmuxio.tmux(
-            "split-window",
-            "-h",
-            "-l",
-            "33%",
-            "-t",
-            own,
-            "-P",
-            "-F",
-            "#{pane_id} #{pane_pid}",
+        if handoff_token is not None:
+            cmd += f" --handoff-token {shlex.quote(handoff_token)}"
+        common = (
             "-c",
             m_tmuxio.tmux_dir(str(rp.root)),
             *m_tmuxio.pane_env(),
             m_tmuxio.in_dir(str(rp.root), cmd),
-            check=False,
         )
-        pane, _, ppid = out.stdout.strip().partition(" ")
+        if handoff_token is not None and rec:
+            out = m_tmuxio.tmux("respawn-pane", "-k", "-t", rec["pane"], *common, check=False)
+            pane = rec["pane"]
+            ppid = m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_pid}", check=False).stdout.strip()
+        else:
+            out = m_tmuxio.tmux(
+                "split-window", "-h", "-l", "33%", "-t", own, "-P", "-F", "#{pane_id} #{pane_pid}", *common, check=False
+            )
+            pane, _, ppid = out.stdout.strip().partition(" ")
         if out.returncode != 0 or not pane:
             feed(m_text.paint(m_i18n.tr("! Could not open the panel: {p0}", p0=out.stderr.strip()), "1;38;5;196"))
             m_chat_base.set_dm_tabs(args.as_, [], "")
@@ -365,7 +382,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
     else:
         setup()
     m_i18n.speak(m_store.room_language(config))  # the chat speaks its room's language
-    welcome = tty and not inst.welcomed_path.exists() and args.as_ in m_store.people_ids(config)
+    welcome = tty and not restore and not inst.welcomed_path.exists() and args.as_ in m_store.people_ids(config)
     feed_context = m_chat_feed.ChatFeedContext(
         STALE_CHAT=m_chat_base.STALE_CHAT,
         args=args,
@@ -375,7 +392,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         dm_focus=dm_focus,
         dm_tabs=m_chat_base.dm_tabs,
         dm_talk=m_chat_base.dm_talk,
-        dm_window_alive=m_chat_base.dm_window_alive,
+        dm_window_available=m_chat_base.dm_window_available,
         draw_bottom=draw_bottom,
         draw_history=draw_history,
         draw_view=draw_view,
@@ -391,6 +408,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
         names=names,
         old_versions=old_versions,
         printed=printed,
+        pump_wizard=lambda: m_chat_wizard.pump_install_job(command_context),  # defined further down
         refresh_people=lambda *a, **k: refresh_people(*a, **k),  # defined further down
         repaint=repaint,
         rows=rows,
@@ -441,6 +459,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
     targets = ["all"] + [pid for pid in known if pid != args.as_]
     ui.redraw_input = lambda: None  # set once the input line exists
     ui.selected = "all"  # the chosen id, not an index: survives participants joining
+    if restore:
+        recipient = restore["payload"].recipient
+        ui.selected = recipient if recipient in targets else None
     wizard: dict[str, Any] = {}
     if welcome:
         wizard.update(
@@ -448,10 +469,10 @@ def cmd_chat(args: argparse.Namespace) -> None:
             prompt=m_i18n.tr("Welcome to your room"),
             options=[(m_i18n.tr("Show me around"), "tour"), (m_i18n.tr("Skip for now"), "skip")],
         )
-    if tty and not welcome and args.as_ in m_store.people_ids(config) and m_chat_wizard.offer_team(config):
+    if not restore and tty and not welcome and args.as_ in m_store.people_ids(config) and m_chat_wizard.offer_team(config):
         # A new room: «What will we do?» first — a ready team, or none (Esc, or «No ready team»).
         m_chat_wizard.open_scenarios_into(wizard, m_store.room_language(config))
-    if tty and args.as_ in m_store.people_ids(config) and m_store.name_asked(args.as_):
+    if not restore and tty and args.as_ in m_store.people_ids(config) and m_store.name_asked(args.as_):
         # Named after the computer's account («Andreynaumov»): asked before anything else, the welcome after.
         mine = m_store.label_of(config, args.as_)
         wizard.update(
@@ -550,7 +571,8 @@ def cmd_chat(args: argparse.Namespace) -> None:
     # The feed's thread starts only now, when all it reads is there: started before, its first tick could
     # come before `popup`, `wizard`, `refresh_people`… — a NameError ended the feed for good, the input
     # still sending; without a terminal it came every time, `popup` being set only further down.
-    threading.Thread(target=pump, daemon=True).start()
+    feed_thread = threading.Thread(target=pump, daemon=True)
+    feed_thread.start()
     if not tty:
         while True:
             try:
@@ -580,8 +602,8 @@ def cmd_chat(args: argparse.Namespace) -> None:
     # Bracketed paste: a pasted block arrives as one message. A blinking bar shows which half the
     # typing goes to, with a /dm panel beside («I can't see which chat I'm in»).
     sys.stdout.write("\033[?2004h" + m_chat_base.CURSOR_BLINK)
-    buf: list[str] = []
-    ui.pos = 0
+    buf: list[str] = list(restore["payload"].text) if restore else []
+    ui.pos = restore["payload"].cursor if restore else 0
     ui.menu_index = 0
     ui.menu_closed = False
     ui.menu_moved = False
@@ -624,9 +646,95 @@ def cmd_chat(args: argparse.Namespace) -> None:
         wizard=wizard,
     )
 
+    handoff_result: list[str] = []
+    handoff_state: dict[str, Any] = {}
+
+    def prepare_handoff() -> str | None:
+        if restore or not tty:
+            return None
+        request = None
+        rec = None
+        try:
+            pane = os.environ.get("TMUX_PANE", "")
+            request = m_chat_handoff.read_request(args.as_, pane)
+            if request is None:
+                return None
+            target = Path(request["target"])
+            command_root = (m_boot.paths().safe_copies / "command").resolve()
+            if (
+                target.is_symlink()
+                or not target.is_file()
+                or command_root not in target.resolve().parents
+                or target.stat().st_uid != os.getuid()
+                or target.stat().st_mode & 0o022
+                or not target.read_bytes().endswith(m_installer.ENTRY)
+            ):
+                raise m_chat_handoff.HandoffError("unsafe chat update target")
+            rec = m_chat_base.dm_window(args.as_)
+            dm_ack = None
+            if rec and not m_chat_base.dm_window_alive(args.as_) and m_chat_base.dm_tabs(args.as_)["tabs"]:
+                raise m_chat_handoff.HandoffError("DM panel is not running")
+            if rec and m_chat_base.dm_window_alive(args.as_):
+                m_chat_handoff.write_dm_request(request, rec["pane"])
+                deadline = time.monotonic() + 2
+                while dm_ack is None and time.monotonic() < deadline:
+                    dm_ack = m_chat_handoff.read_dm_ack(request, rec["pane"])
+                    if dm_ack is None:
+                        time.sleep(0.02)
+                if dm_ack is None:
+                    raise m_chat_handoff.HandoffError("DM checkpoint acknowledgement timed out")
+            request["source_pid"] = os.getpid()
+            m_chat_handoff.write_control(m_chat_handoff.control_path("request", args.as_, pane), request)
+            seat = m_chat_handoff.Seat(str(rp.root), args.as_, pane, os.getpid(), request["generation"])
+            store = m_chat_handoff.HandoffStore(rp.state_dir / "handoff")
+            payload = m_chat_handoff.HandoffPayload("".join(buf), ui.pos, ui.selected)
+            token = store.save_claimed(seat, payload)
+            handoff_state.update(
+                request=request, seat=seat, store=store, token=token, dm_ack=dm_ack, dm_pane=rec["pane"] if rec else None
+            )
+            return token
+        except (OSError, m_chat_handoff.HandoffError) as exc:
+            if request is not None:
+                with contextlib.suppress(Exception):
+                    m_chat_handoff.delete_control(
+                        m_chat_handoff.control_path("request", args.as_, os.environ.get("TMUX_PANE", ""))
+                    )
+                if rec is not None:
+                    with contextlib.suppress(Exception):
+                        m_chat_handoff.write_ready(request, "failed", rec["pane"])
+            feed(m_text.paint(m_i18n.tr("! Chat update was refused: {p0}", p0=str(exc)), "1;38;5;196"))
+            return None
+
+    def finish_restore() -> None:
+        request = restore["request"]
+        restore["store"].complete(restore["token"], restore["seat"])
+        m_chat_handoff.delete_control(m_chat_handoff.control_path("request", args.as_, request["pane"]))
+        if "dm_ack" in restore:
+            ack = restore["dm_ack"]
+            pane = restore["dm_pane"]
+            terminal = m_chat_handoff.read_ready(request, allow_superseded=True, dm_pane=pane)
+            if not m_chat_handoff.current_dm_request(request, pane) or (terminal is not None and terminal["status"] != "ready"):
+                feed(m_text.paint(m_i18n.tr("! DM handoff was superseded; the current DM input is kept."), "38;5;252"))
+            else:
+                known_ids = set(m_store.ids_of(config))
+                tabs = [tab for tab in ack["tabs"] if tab in known_ids]
+                if ack["tabs"] and not tabs:
+                    feed(m_text.paint(m_i18n.tr("! DM recipient is unavailable; its recovery snapshot is kept."), "1;38;5;196"))
+                else:
+                    active = ack["active"] if ack["active"] in tabs else ""
+                    m_chat_base.set_dm_tabs(args.as_, tabs, active)
+                    if not m_chat_base.dm_window_alive(args.as_):
+                        open_dm(active or tabs[0], ack["snapshot_token"])
+                        m_chat_base.set_dm_tabs(args.as_, tabs, active)
+                    m_chat_handoff.write_ready(request, "ready", pane)
+                    m_tmuxio.tmux("select-pane", "-t", pane if ack["focus"] else request["pane"], check=False)
+        restore.clear()
+
     ui.redraw_input = render
     with lock:
         render()
+    if restore:
+        finish_restore()
     input_context = m_chat_input.ChatInputContext(
         after_lock=after_lock,
         args=args,
@@ -640,6 +748,8 @@ def cmd_chat(args: argparse.Namespace) -> None:
         fd=fd,
         feed=feed,
         history=history,
+        handoff=prepare_handoff,
+        handoff_result=handoff_result,
         leave_history=leave_history,
         lock=lock,
         menu_items=menu_items,
@@ -655,7 +765,56 @@ def cmd_chat(args: argparse.Namespace) -> None:
         wizard_back=wizard_back,
     )
     try:
-        m_chat_input.chat_read_keys(input_context)
+        while True:
+            m_chat_input.chat_read_keys(input_context)
+            if not handoff_result:
+                return
+            try:
+                stop.set()
+                feed_thread.join(2)
+                if feed_thread.is_alive():
+                    raise m_chat_handoff.HandoffError("chat feed did not stop")
+                termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                request = handoff_state["request"]
+                command = [
+                    sys.executable,
+                    request["target"],
+                    "chat",
+                    "--as",
+                    args.as_,
+                    "--room",
+                    str(rp.root),
+                    "--interval",
+                    str(args.interval),
+                    "--stale",
+                    str(args.stale),
+                    "--max-lines",
+                    str(args.max_lines),
+                    "--handoff-token",
+                    handoff_state["token"],
+                ]
+                if args.plain:
+                    command.append("--plain")
+                os.execv(sys.executable, command)
+            except (OSError, m_chat_handoff.HandoffError) as exc:
+                with contextlib.suppress(Exception):
+                    handoff_state["store"].discard(handoff_state["token"], handoff_state["seat"])
+                with contextlib.suppress(Exception):
+                    if handoff_state.get("dm_pane"):
+                        m_chat_handoff.write_ready(handoff_state["request"], "failed", handoff_state["dm_pane"])
+                with contextlib.suppress(Exception):
+                    m_chat_handoff.delete_control(
+                        m_chat_handoff.control_path("request", args.as_, os.environ.get("TMUX_PANE", ""))
+                    )
+                stop.clear()
+                feed_thread = threading.Thread(target=pump, daemon=True)
+                feed_thread.start()
+                termios.tcsetattr(fd, termios.TCSANOW, attrs)
+                handoff_result.clear()
+                handoff_state.clear()
+                feed(
+                    m_text.paint(m_i18n.tr("! Chat update failed; continuing the current chat: {p0}", p0=str(exc)), "1;38;5;196")
+                )
     except KeyboardInterrupt:
         return
     finally:

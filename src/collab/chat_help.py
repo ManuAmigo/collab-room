@@ -127,6 +127,7 @@ def HELP(me: str, full: bool = False, ids: list[str] | None = None, lang: str = 
             ("/name", "Rename yourself or an agent: choose whom, type the new name"),
             ("/remove", "Disconnect a participant; the agent keeps running in its window"),
             ("/telegram", "Write to the room's lead from Telegram: connect, turn off, unlink"),
+            ("/vpn", "Agent VPN: on, off and status"),
             ("/language", "The room's language: Russian or English"),
             ("/clear", "Clear the history for everyone; old messages move to an archive"),
             ("/stop", "Stop the room: its windows and the agents it started close; history stays"),

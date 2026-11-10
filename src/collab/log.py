@@ -38,7 +38,7 @@ def parse_lines(text: str, first: int = 1) -> list[dict[str, Any]]:
     """The messages of the log's lines, numbered from `first` for the warning about a bad one."""
     out: list[dict[str, Any]] = []
     # errors="replace" when read: one line of bad bytes made every reader fail.
-    for n, line in enumerate(text.splitlines(), first):
+    for n, line in enumerate(text.split("\n"), first):
         if not line.strip():
             continue
         m: Any
@@ -145,7 +145,7 @@ def tick_read(j: Journal) -> list[dict[str, Any]]:
     try:
         fd, name = m_store.state_dir(rp.messages_path, strict=False, create=False)
         try:
-            f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+            f = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
         finally:
             os.close(fd)
     except FileNotFoundError:
@@ -178,6 +178,7 @@ def append_message(
     to: list[str],
     text: str,
     re_: str = "",
+    re_auto: bool = False,
     sign: bool = False,
     quiet: bool = False,
     silent: bool = False,
@@ -194,6 +195,8 @@ def append_message(
     record: dict[str, Any] = {"id": uuid.uuid4().hex[:12], "at": m_store.now(), "from": sender, "to": to, "text": text}
     if re_:
         record["re"] = re_
+    if re_ and re_auto:
+        record["re_auto"] = True  # set by say itself, the only one open: it closes, it hands no work in (deliver.trim_due)
     if quiet:
         record["quiet"] = True  # a note that wakes no one (is_quiet)
     if urgent:
@@ -510,7 +513,7 @@ def request_of(m: dict[str, Any], config: dict[str, Any], messages: list[dict[st
 def held_count() -> int:
     rp = m_store.room().paths
     try:
-        return len(rp.held_path.read_text(encoding="utf-8", errors="replace").splitlines())
+        return sum(bool(line) for line in rp.held_path.read_text(encoding="utf-8", errors="replace").split("\n"))
     except OSError:
         return 0
 
@@ -551,15 +554,16 @@ def archive_history() -> Path:
 
 def answered(w: dict[str, Any], pid: str, messages: list[dict[str, Any]]) -> bool:
     """Every delivered message is closed by the agent — an answer that names it
-    (`say --re ID`), or an explicit «no reply needed» (`ack --no-reply --id ID`). A plain answer
-    to the sender without --re still counts, so older habits do not raise alarms."""
+    (`say --re ID`; a plain say to the sender gets that id when it is the only one open), or an explicit
+    «no reply needed» (`ack --no-reply --id ID`). A plain word to the sender or to everyone answers
+    nothing more: it closed every message of the sender at once, and the inbox and a resend never saw it."""
     rp = m_store.room().paths
     if w["id"] in read_set(rp.noreply_dir, pid):
         return True
     for m in messages:
         if m.get("from") != pid or m.get("at", "") < w["at"]:
             continue
-        if m.get("re") == w["id"] or (not m.get("re") and (w["from"] in m.get("to", []) or "all" in m.get("to", []))):
+        if m.get("re") == w["id"]:
             return True
     return False
 

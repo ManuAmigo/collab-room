@@ -13,6 +13,47 @@ LANGS = ("en", "ru")
 LANG_NAMES = {"en": "English", "ru": "Русский"}
 
 CATALOG: dict[str, dict[str, Any]] = {
+    "t.6d928ed03e": {
+        "en": "Message {id} was not sent to Telegram (HTTP {code}); later messages continue. Full text: collab show {id}.",
+        "ru": "Письмо {id} не отправлено в Telegram (HTTP {code}); следующие письма отправляются. Полный текст: collab show {id}.",
+    },
+    "t.98ba5615c6": {
+        "en": "\n\n[Preview; full text: collab show {id} in the room folder.]",
+        "ru": "\n\n[Предпросмотр; полный текст: collab show {id} в папке комнаты.]",
+    },
+    "t.0b0d909d5e": {"en": "Skipped {n} messages: Telegram was off.", "ru": "Пропущено {n} писем: Telegram был выключен."},
+    "t.442d066bb0": {
+        "en": "Container VPN is frozen; remove legacy container settings before starting the room.",
+        "ru": "Контейнерный VPN заморожен; удалите старые настройки контейнера перед запуском комнаты.",
+    },
+    "t.bb5cee6adb": {
+        "en": "macOS VPN unavailable; check the private account and proxy service.",
+        "ru": "VPN macOS недоступен; проверьте приватную учётку и службу прокси.",
+    },
+    "t.64add66357": {
+        "en": "macOS VPN supervisor unavailable or stopped with unconfirmed state",
+        "ru": "Служба VPN macOS недоступна либо остановлена с неподтверждённым состоянием",
+    },
+    "t.39869c4eb6": {
+        "en": "macOS VPN agent launch refused; proxy lease unavailable",
+        "ru": "Запуск агента через VPN macOS отклонён: нет подтверждённого подключения к прокси",
+    },
+    "t.eb38366476": {"en": "macos_vpn must be a boolean", "ru": "macos_vpn должен быть логическим значением"},
+    "t.80bbeeb3c6": {
+        "en": "Starting {label} in room window {pid}; inbox-only, automatic delivery is not enabled yet.",
+        "ru": "Запуск {label} в окне комнаты {pid}; сообщения доступны через inbox, автоматическая доставка пока не включена.",
+    },
+    "t.bce566d02d": {
+        "en": "Outgoing blocked · {phase} · message {head} · {error}{http} · retry in {seconds}s",
+        "ru": "Исходящие заблокированы · {phase} · сообщение {head} · {error}{http} · повтор через {seconds} с",
+    },
+    "t.e9370168b8": {"en": "Delivery could not be restarted.", "ru": "Не удалось перезапустить доставку."},
+    "activity.waiting": {"en": "waiting in queue", "ru": "ждёт очередь"},
+    "activity.checking": {"en": "check running", "ru": "идёт проверка"},
+    "activity.finishing": {"en": "finishing merge", "ru": "завершает влитие"},
+    "activity.done": {"en": "merge completed", "ru": "влитие завершено"},
+    "activity.failed": {"en": "merge failed", "ru": "ошибка влития"},
+    "activity.stale": {"en": "activity data stale", "ru": "данные об активности устарели"},
     # The first run: both languages at once, before anything else.
     "lang.choose": {"en": "Выберите язык / Choose language", "ru": "Выберите язык / Choose language"},
     "lang.room": {"en": "Room language: {language}", "ru": "Язык комнаты: {language}"},
@@ -59,13 +100,72 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "talk privately with an agent in a panel beside the chat",
         "ru": "личный разговор с агентом в панели рядом с чатом",
     },
-    "cmd.restart": {"en": "restart an agent, its conversation continues", "ru": "перезапустить агента, разговор продолжится"},
+    "cmd.chat-update": {
+        "en": "update this room's chat at a safe input boundary, preserving drafts",
+        "ru": "обновить чат на безопасной границе ввода с сохранением черновиков",
+    },
+    "t.9f34031656": {
+        "en": "! Chat update was refused: {p0}",
+        "ru": "! Обновление чата отклонено: {p0}",
+    },
+    "t.328f31ae19": {
+        "en": "! Chat update failed; continuing the current chat: {p0}",
+        "ru": "! Не удалось обновить чат; продолжаем текущий: {p0}",
+    },
+    "t.c07cbf6013": {
+        "en": "! DM recipient is unavailable; its recovery snapshot is kept.",
+        "ru": "! Получатель DM недоступен; снимок для восстановления сохранён.",
+    },
+    "t.a4385f851d": {
+        "en": "! DM handoff was superseded; the current DM input is kept.",
+        "ru": "! Передача DM была заменена более новой; текущий ввод DM сохранён.",
+    },
+    "cmd.restart": {
+        "en": "restart an agent after checking its conversation",
+        "ru": "перезапустить агента после проверки разговора",
+    },
     "cmd.team": {"en": "the team: see it, or start a ready one", "ru": "команда: посмотреть, изменить или запустить готовую"},
     "cmd.stop": {
         "en": "stop the room: close its windows and agents",
         "ru": "остановить комнату: закрыть её окна и остановить запущенных ею агентов",
     },
     "cmd.exit": {"en": "close this chat panel", "ru": "закрыть этот чат, агенты продолжат работу"},
+    "t.3c49d9cc3c": {"en": "running", "ru": "работает"},
+    "t.da7a687343": {"en": "off", "ru": "выключен"},
+    "t.9493af057b": {"en": "starting", "ru": "подключается"},
+    "t.5f5f8758f5": {"en": "failed", "ru": "упал"},
+    "t.3199122390": {"en": "Turn agent VPN on", "ru": "Включить VPN агентов"},
+    "t.1cf5fc2c95": {
+        "en": "Turn agent VPN off (stops protected agents)",
+        "ru": "Выключить VPN агентов (защищённые агенты остановятся)",
+    },
+    "t.c2e1df7db6": {
+        "en": "Agent VPN is off. Protected agents are stopped.",
+        "ru": "VPN агентов выключен. Защищённые агенты остановлены.",
+    },
+    "t.799eb08bda": {
+        "en": "Agent VPN did not become ready. Protected agents remain blocked.",
+        "ru": "VPN агентов не подключился. Защищённые агенты остаются заблокированы.",
+    },
+    "t.83a29b66f1": {
+        "en": "VPN account is missing or invalid: ~/.config/collab-vpn/agents.json. Add a valid private account file, then try again.",
+        "ru": "Файл учётки VPN отсутствует или некорректен: ~/.config/collab-vpn/agents.json. Добавьте корректный закрытый файл учётки и повторите включение.",
+    },
+    "t.391da07468": {"en": "Could not change agent VPN: {error}", "ru": "Не удалось переключить VPN агентов: {error}"},
+    "help.658e7370fc": {"en": "Agent VPN: on, off and status", "ru": "VPN агентов: включение, выключение и состояние"},
+    "t.30c5ae2031": {
+        "en": "Checking agent VPN… Closing this menu does not stop a request already started.",
+        "ru": "Проверяем VPN агентов… Закрытие меню не останавливает уже начатый запрос.",
+    },
+    "t.52db5904cc": {
+        "en": "Agent VPN: {state}. {n} running Codex/Claude agents still without confirmed VPN — use /restart. Shared across enabled rooms.",
+        "ru": "VPN агентов: {state}. Работающих Codex/Claude без подтверждённого VPN: {n} — перезапустите их через /перезапустить. VPN общий для комнат, где он включён.",
+    },
+    "t.2d4b220207": {
+        "en": "Agent VPN is running. {n} running Codex/Claude agents are still without confirmed VPN — restart them with /restart.",
+        "ru": "VPN агентов работает. Уже запущенных Codex/Claude без подтверждённого VPN: {n} — перезапустите их через /перезапустить.",
+    },
+    "cmd.vpn": {"en": "agent VPN: on, off and status", "ru": "VPN агентов: вкл, выкл и состояние"},
     "cmd.telegram": {"en": "write to the lead from Telegram", "ru": "писать ведущему из Telegram"},
     "cmd.language": {"en": "the room's language", "ru": "язык комнаты"},
     # The scenarios' picker and preview.
@@ -220,8 +320,8 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "Открыть окно агента в новой вкладке терминала, чтобы ответить ему",
     },
     "help.09e3feee8b": {
-        "en": "Restart an agent the room started; its conversation continues (new rules too)",
-        "ru": "Перезапустить агента комнаты; разговор продолжится (и с новыми правилами)",
+        "en": "Restart an agent the room started after checking its saved conversation",
+        "ru": "Перезапустить агента комнаты после проверки сохранённого разговора",
     },
     "help.91954ad89f": {
         "en": "What is for you: agents waiting for you, then unread messages to you and answers to yours",
@@ -387,6 +487,18 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "A model takes effect when the program starts: /restart {p0} — its conversation goes on.",
         "ru": "Модель начинает действовать при запуске программы: /перезапустить {p0} — разговор продолжится.",
     },
+    "add.install": {"en": "Install {label}", "ru": "Установить {label}"},
+    "add.install.prompt": {
+        "en": "{label} is not installed. Install it into the room's isolated directory?",
+        "ru": "{label} не установлен. Установить его в изолированный каталог комнаты?",
+    },
+    "add.install.retry": {
+        "en": "! {exc} Choose Install to retry or Cancel.",
+        "ru": "! {exc} Выберите «Установить» ещё раз или «Отмена».",
+    },
+    "add.download": {"en": "Downloading the official {kind} installer…", "ru": "Скачивается официальный установщик {kind}…"},
+    "add.verify": {"en": "Verifying {kind}…", "ru": "Проверяется {kind}…"},
+    "add.running": {"en": "Installing… Esc to cancel.", "ru": "Идёт установка… Esc для отмены."},
     "t.c52ad2e5f1": {"en": "Add an agent. ", "ru": "Добавить агента. "},
     "t.997b30ba7d": {
         "en": "All marked as read. Only what comes from now on counts.",
@@ -472,7 +584,12 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "Агент: {p0}. Введите новое имя (Enter — сохранить, Esc — назад):",
     },
     "t.816c52fd2b": {"en": "No", "ru": "Нет"},
-    "t.1f363e895e": {"en": "No Claude Code or Codex installation found.", "ru": "Claude Code и Codex не найдены."},
+    "kimi.model_launch": {
+        "en": "The model takes effect on its next launch. Kimi conversation continuation is not supported by the room yet.",
+        "ru": "Модель применится при следующем запуске. Продолжение беседы Kimi комната пока не поддерживает.",
+    },
+    "t.0780d4249d": {"en": "--yolo is only for Kimi", "ru": "--yolo предназначен только для Kimi"},
+    "t.a4f4fe1bce": {"en": "No Claude Code, Codex or Kimi installation found.", "ru": "Claude Code, Codex и Kimi не найдены."},
     "t.2d7a2dd5fd": {
         "en": "No agent the room started. Add one with /add.",
         "ru": "Нет агентов, запущенных комнатой. Добавьте агента через /добавить.",
@@ -505,6 +622,15 @@ CATALOG: dict[str, dict[str, Any]] = {
     "t.c6850787d1": {"en": "Proposal: {p0}", "ru": "Предложение: {p0}"},
     "t.5d83b770c0": {"en": "Rename whom?", "ru": "Кого переименовать?"},
     "t.655fe3daa8": {"en": "Reports to", "ru": "Кому отвечает"},
+    "t.0afd1d103e": {"en": "Restart whom?", "ru": "Кого перезапустить?"},
+    "t.3b464827e2": {
+        "en": "A model takes effect when the program starts: /restart {p0} checks whether its conversation can resume.",
+        "ru": "Модель применяется при запуске: /restart {p0} проверит возможность продолжить разговор.",
+    },
+    "t.b09c3247d5": {
+        "en": "{p0}: its conversation could not be confirmed. The running program was left unchanged.",
+        "ru": "{p0}: не удалось подтвердить его разговор. Работающая программа оставлена без изменений.",
+    },
     "t.825467676e": {"en": "Restart whom? The conversation continues", "ru": "Кого перезапустить? Разговор продолжится"},
     "t.c1c6e4bb38": {"en": "Restart {p0}?", "ru": "Перезапустить агента? Агент: {p0}."},
     "t.32ef885ec8": {
@@ -778,6 +904,11 @@ CATALOG: dict[str, dict[str, Any]] = {
         "ru": "Доставка после лимита возобновлена вручную. Агент: {label}.",
     },
     "t.810fc1560d": {"en": "{name} connected.", "ru": "Агент подключён: {name}."},
+    "t.bce47a6a0b": {"en": "reset time unknown", "ru": "время восстановления неизвестно"},
+    "t.c49960aaa9": {
+        "en": "{who} is out of its usage limit; reset time is unknown. Messages to it wait for confirmed recovery.",
+        "ru": "Агент {who} исчерпал лимит; время восстановления неизвестно. Сообщения ждут подтверждённого восстановления.",
+    },
     "t.f8efdc6c87": {"en": "{name} is back from its usage limit.", "ru": "Лимит закончился. Агент: {name}."},
     "t.b7f319b247": {
         "en": "{name} is in the room's settings but not running: the room was running already, and start only returned to it — collab stop, then collab start starts it (history stays).",
@@ -806,6 +937,22 @@ CATALOG: dict[str, dict[str, Any]] = {
     "t.192ff5a06c": {
         "en": "{who} has not got your message of {hm}: even a pointer to its inbox is longer than can be typed into its window ({n} bytes) — the room's path is too long. It waits in its inbox.",
         "ru": "Агент: {who}. Ваше сообщение от {hm} не доставлено: даже указатель на его входящие длиннее, чем можно напечатать в его окно ({n} байт), — путь комнаты слишком длинный. Оно ждёт во входящих агента.",
+    },
+    "t.d2ae7490ed": {
+        "en": "{who} has not got the room's message of {hm}: even a pointer to its inbox is longer than can be typed into its window ({n} bytes) — the room's path is too long. It waits in its inbox.",
+        "ru": "Агент: {who}. Сообщение комнаты от {hm} не доставлено: даже указатель на его входящие длиннее, чем можно напечатать в его окно ({n} байт), — путь комнаты слишком длинный. Оно ждёт во входящих агента.",
+    },
+    "t.51edabe099": {
+        "en": "{who} has an unsent text in its input: the room types nothing more into its window until that text is sent or cleared there. Messages waiting in its inbox: {n}.",
+        "ru": "Агент: {who}. В его поле ввода остался неотправленный текст: комната больше ничего не печатает в его окно, пока этот текст там не отправят или не сотрут. Сообщений ждёт во входящих агента: {n}.",
+    },
+    "t.59638117ca": {
+        "en": "{who} has not got your message of {hm}: its input holds an unsent text, and the room types nothing over it. It waits in its inbox until that text is sent or cleared in its window.",
+        "ru": "Агент: {who}. Ваше сообщение от {hm} не доставлено: в его поле ввода остался неотправленный текст, и комната не печатает поверх него. Сообщение ждёт во входящих агента, пока этот текст в его окне не отправят или не сотрут.",
+    },
+    "t.01e791b593": {
+        "en": "{who} has not got {n} of your messages since {hm}: its input holds an unsent text, and the room types nothing over it. They wait in its inbox until that text is sent or cleared in its window.",
+        "ru": "Агент: {who}. Ваши сообщения не доставлены (сообщений: {n}, первое — в {hm}): в его поле ввода остался неотправленный текст, и комната не печатает поверх него. Они ждут во входящих агента, пока этот текст в его окне не отправят или не сотрут.",
     },
     "t.d1346f70b5": {
         "en": "{who} has not got your message of {hm} yet: it is busy, and the room could not give it — its input was not free, or taking it was not seen. It waits in its inbox.",
@@ -998,6 +1145,26 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "Proposed {p0}: {p1}. The person applies it with Enter in the chat.",
         "ru": "Предложение {p0}: {p1}. Пользователь применяет его клавишей Enter в чате.",
     },
+    "t.952dc39a0b": {
+        "en": "It answers {re}, the only one open from {who}.",
+        "ru": "Это ответ на {re}: единственное открытое письмо от {who}.",
+    },
+    "t.0eaf50b375": {
+        "en": "Open from {who}: {ids} — none of them is closed by this; say --re <id> or ack --no-reply --id <id>.",
+        "ru": "Открыты письма от {who}: {ids}. Это сообщение ни одно не закрыло: say --re <id> или ack --no-reply --id <id>.",
+    },
+    "t.0842074895": {
+        "en": "open: {n}, the oldest {minutes} min",
+        "ru": "открыто: {n}, старейшее {minutes} мин",
+    },
+    "t.b6d0a4a411": {
+        "en": "(still open with you: {ids}{more} — say --re <id> or ack --no-reply --id <id>)",
+        "ru": "(у вас ещё открыты: {ids}{more} — say --re <id> или ack --no-reply --id <id>)",
+    },
+    "t.4403dc06c3": {
+        "en": "Still open with you: {ids}{more}. Answer each with say --re <id>, or close it with ack --no-reply --id <id>; read them: {cmd}",
+        "ru": "У вас ещё открыты: {ids}{more}. Ответьте на каждое через say --re <id> или закройте через ack --no-reply --id <id>; прочитать: {cmd}",
+    },
     "t.d4f9f0162b": {
         "en": "Queued {p0} from {sender} to {p2}.",
         "ru": "Сообщение {p0} поставлено в очередь. Отправитель: {sender}. Получатели: {p2}.",
@@ -1157,10 +1324,12 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "Act — nudge, give a task, check, ask the person — or answer «going» in one line. Goal reached: {cmd}",
         "ru": "Действуйте — подтолкните, дайте задачу, проверьте, спросите пользователя — или ответьте одной строкой «идёт». Цель достигнута: {cmd}",
     },
-    "t.d64c5c8568": {
-        "en": "this copy of collab only answers in a room: say, ack, inbox, propose, goal",
-        "ru": "эта копия collab только отвечает в комнате: say, ack, inbox, propose, goal",
+    "t.2d0e5e6501": {
+        "en": "this copy of collab only answers in a room: say, take, ack, inbox, propose, goal",
+        "ru": "эта копия collab только отвечает в комнате: say, take, ack, inbox, propose, goal",
     },
+    "t.2274562ca9": {"en": "Taking: {what}", "ru": "Беру: {what}"},
+    "t.ab886bad24": {"en": "Notices (no answer due; marked read):", "ru": "Уведомления (ответ не нужен, отмечены прочитанными):"},
     "t.425df923a9": {
         "en": "{who} paused delivery from Telegram.",
         "ru": "{who}: доставка приостановлена из Telegram.",
@@ -1457,9 +1626,29 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "collab doctor --fix asks before each change: run it in a terminal.",
         "ru": "collab doctor --fix спрашивает перед каждой правкой: запустите его в терминале.",
     },
+    "t.0805c2e5ed": {
+        "en": "Delivery-only start requires an existing room; open it normally first.",
+        "ru": "Для перезапуска только доставки нужна существующая комната; сначала откройте её обычным способом.",
+    },
+    "t.b49206ef25": {
+        "en": "The room is not running; delivery was not restarted.",
+        "ru": "Комната не запущена; доставка не перезапускалась.",
+    },
+    "t.c6e55123eb": {
+        "en": "This session is not marked as this room's; delivery was not restarted.",
+        "ru": "Эта сессия не отмечена как сессия этой комнаты; доставка не перезапускалась.",
+    },
+    "t.f60661954f": {
+        "en": "Delivery runs outside this room's window; it was not restarted.",
+        "ru": "Доставка работает вне окна этой комнаты; она не перезапускалась.",
+    },
     "t.4a39097f01": {
         "en": "The room's chat is open on collab {old}; this is {new} — its menu lacks what came since.",
         "ru": "Чат комнаты открыт на collab {old}; это {new} — в его меню нет того, что появилось с тех пор.",
+    },
+    "t.9f3c92a086": {
+        "en": "The room's chat runs a different build of collab {v}; reopen it to use this build.",
+        "ru": "Чат комнаты работает на другой сборке collab {v}; откройте его заново, чтобы использовать эту сборку.",
     },
     "t.1700cd6cd8": {
         "en": "Restart the chat on collab {new}? Its history stays.",
@@ -1735,6 +1924,10 @@ CATALOG: dict[str, dict[str, Any]] = {
     "t.5948ef2674": {"en": "{p0}: could not restart it: {p1}", "ru": "{p0}: не удалось перезапустить: {p1}"},
     "t.89a84f46f7": {"en": "{p0}: could not start it again: {p1}", "ru": "{p0}: не удалось запустить снова: {p1}"},
     "t.95028d8f09": {"en": "{p0}: its conversation was not found", "ru": "{p0}: его разговор не найден"},
+    "t.3681f0829e": {
+        "en": "{p0}: no confirmed managed session and cursor; restart refused",
+        "ru": "{p0}: нет подтверждённой управляемой сессии и курсора; перезапуск отменён",
+    },
     "t.a814dabffb": {
         "en": "{p0}: only an agent the room started can be restarted",
         "ru": "{p0}: перезапустить можно только агента, запущенного комнатой",
@@ -2013,6 +2206,10 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "- To change the team — a model, a topic, memory, one more agent — propose it, and the person applies it with Enter: {cmd} --set ID.KEY=VALUE (or --add KIND:NAME:ROLE:TOPIC).",
         "ru": "- Чтобы изменить команду — модель, тему, память, добавить агента, — предложите это, и пользователь применит предложение клавишей Enter: {cmd} --set ID.KEY=VALUE (или --add KIND:NAME:ROLE:TOPIC).",
     },
+    "brief.take": {
+        "en": "- Before changing shared files, tell the room what you take — it wakes no one: {cmd} '<task, files>'.",
+        "ru": "- Перед правкой общих файлов сообщите комнате, что берёте, — это никого не будит: {cmd} '<задача, файлы>'.",
+    },
     "brief.team": {
         "en": "- Your team: {team}. Give each its part, have the result checked, gather it — do not do their parts yourself.",
         "ru": "- Ваша команда: {team}. Распределите работу, организуйте проверку и соберите итог. Не выполняйте чужие части работы сами.",
@@ -2108,6 +2305,7 @@ COMMANDS: list[tuple[str, str]] = [
     ("/exit", "/выход"),
     ("/quit", "/выйти"),
     ("/telegram", "/телеграм"),
+    ("/vpn", "/впн"),
     ("/language", "/язык"),
 ]
 SUBCOMMANDS: dict[str, dict[str, str]] = {"/dm": {"закрыть": "close"}, "/team": {"сохранить": "save"}}

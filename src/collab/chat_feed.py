@@ -8,7 +8,6 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 import collab.text as m_text
 import collab.i18n as m_i18n
@@ -16,6 +15,7 @@ import collab.store as m_store
 import collab.tmuxio as m_tmuxio
 import collab.log as m_log
 import collab.screen as m_screen
+import collab.activity as m_activity
 import collab.installer as m_installer
 
 
@@ -58,7 +58,7 @@ class ChatFeedContext:
     dm_focus: Any
     dm_tabs: Any
     dm_talk: Any
-    dm_window_alive: Any
+    dm_window_available: Any
     draw_bottom: Any
     draw_history: Any
     draw_view: Any
@@ -74,6 +74,7 @@ class ChatFeedContext:
     names: Any
     old_versions: Any
     printed: Any
+    pump_wizard: Any
     refresh_people: Any
     repaint: Any
     rows: Any
@@ -114,17 +115,20 @@ def chat_append(ctx: ChatFeedContext, text: str, remember: bool = True) -> None:
 
 
 def chat_old_versions(ctx: ChatFeedContext) -> list[str]:
-    """Said once each: this chat runs an older collab — what it starts would get
-    yesterday's rules; a Codex runs an older copy — a restart gives it the new one."""
+    """Warn about an old chat or changed start-time agent rules, not every new build."""
     lines = []
     if ctx.stale_chat() and "chat" not in ctx.told_old:
         ctx.told_old.add("chat")
         lines.append(ctx.STALE_CHAT)
     with contextlib.suppress(OSError):
-        now_name = m_installer.current_name()
         for q in ctx.config.get("participants", []):
             cli = str(q.get("cli") or "")
-            if q.get("kind") == "codex" and cli and Path(cli).name != now_name and (q["id"], cli) not in ctx.told_old:
+            if (
+                q.get("kind") == "codex"
+                and cli
+                and (q["id"], cli) not in ctx.told_old
+                and m_installer.agent_integration_changed(cli)
+            ):
                 ctx.told_old.add((q["id"], cli))
                 who = m_store.label_of(ctx.config, q["id"])
                 lines.append(m_i18n.tr("· {who} runs an older collab — /restart {who_} when convenient.", who=who, who_=who))
@@ -137,6 +141,7 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
     out, parts, cells = [], [], []
     out += [m_text.paint(x, "38;5;214") for x in ctx.old_versions()]
     st = m_screen.read_status()
+    queue_activity = m_activity.activity_projection(ctx.config)
     # The chat's ticks counted for the blink below: its colour turns about once a second, or every tick when the interval is longer.
     ctx.ui.ticks += 1
     blink = ctx.ui.ticks // max(1, round(1 / ctx.args.interval)) % 2
@@ -163,13 +168,16 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
         right = st[pid].get("detail", "") if state == "limited" else st[pid].get("model", "")
         bg = re.fullmatch(r"background (\d+)", str(st[pid].get("detail", "")))
         fill = BAR_FILL.get(short, 250)
-        if bg and short == "Ready":
+        queue_background = queue_activity.get(pid) in ("waiting", "checking", "finishing")
+        if (bg or queue_background) and short == "Ready":
             # Ready for messages, its own commands run in the background: green, and
             # how many by the mark; the model stays where it is («it hid the model»). The
             # spinner too — work goes on — and the clock does not stop: it counts from the earliest
             # background command still running (bg_since), not from when it became Ready.
-            mark = SPINNER[int(time.time() * 4) % len(SPINNER)] + " " + bg.group(1)
-            since = m_text.age(st[pid].get("bg_since") or st[pid].get("since", ""))
+            # A queue lease proves activity, not how many native commands run or when they started.
+            # Keep a native count/clock once when both sources describe background work.
+            mark = SPINNER[int(time.time() * 4) % len(SPINNER)] + (" " + bg.group(1) if bg else "")
+            since = m_text.age(st[pid].get("bg_since") or st[pid].get("since", "")) if bg else ""
             # And the badge turns green and yellow by turns, about once a second: Ready, and work goes on. Not
             # the terminal's blink — most terminals drop it. Without colours it stays as it is.
             fill = BAR_FILL["Working"] if blink else BAR_FILL["Ready"]
@@ -187,14 +195,16 @@ def chat_states(ctx: ChatFeedContext) -> list[str]:
     if m_store.load_config().get("paused"):
         n = m_log.held_count()
         parts.insert(0, m_text.paint(m_i18n.tr("Paused") + (m_i18n.tr(" · {n} waiting", n=n) if n else ""), "1;38;5;214"))
-    rows_ = ctx.status_bar_rows(cells, parts, shutil.get_terminal_size((100, 24)))
+    size = shutil.get_terminal_size((100, 24))
+    activity = m_activity.activity_lines(ctx.config, size.columns)
+    rows_ = ctx.status_bar_rows(cells, parts, size, activity=activity) if activity else ctx.status_bar_rows(cells, parts, size)
     ctx.ui.extra_rows = len(rows_) - 1
     ctx.ui.bar = "\n".join(rows_)
     return out
 
 
 def chat_fold_into_dm(ctx: ChatFeedContext, m: dict[str, Any]) -> bool:
-    """While an agent's /dm tab is open, its strictly private letters to the person go there; the
+    """While an agent's /dm panel is available beside the chat, its strictly private letters go there; the
     feed keeps one line that is updated, not repeated: «· Ann ⇄ Bob in /dm · 3 new».
     Never a letter to others too, never one «from the person» the chat did
     not sign — that one is shown whole with its ⚠."""
@@ -223,11 +233,33 @@ def chat_fold_into_dm(ctx: ChatFeedContext, m: dict[str, Any]) -> bool:
         ctx.folded[1][:] = [text]
         del ctx.feed_log[-old:]
         ctx.feed_log.append(text)
+        ctx.folded[2][-1][1].append(m)
         ctx.repaint()
     else:
         ctx.feed(text)
         ctx.folded[0], ctx.folded[1] = agent, ctx.blocks[-1] if ctx.blocks else None
+        ctx.folded[2].append((ctx.folded[1], [m]))
     return True
+
+
+def chat_restore_folded(ctx: ChatFeedContext) -> None:
+    current = {m["id"] for m in m_log.read_messages()}
+    replacements = {}
+    seen = set()
+    for block, messages in ctx.folded[2]:
+        restored = []
+        for message in messages:
+            if message["id"] in current and message["id"] not in seen:
+                seen.add(message["id"])
+                restored.append(ctx.show(message).split("\n"))
+        replacements[id(block)] = restored
+    blocks = []
+    for block in ctx.blocks:
+        blocks.extend(replacements.get(id(block), [block]))
+    ctx.blocks[:] = blocks
+    ctx.feed_log[:] = [line for block in blocks for line in block]
+    ctx.folded[:] = [None, None, []]
+    ctx.repaint()
 
 
 def chat_pump(ctx: ChatFeedContext) -> None:
@@ -241,11 +273,15 @@ def chat_pump(ctx: ChatFeedContext) -> None:
 
     while not ctx.stop.wait(ctx.args.interval):
         with ctx.lock:
+            if ctx.pump_wizard() and ctx.tty:
+                ctx.ui.redraw_input()
             if ctx.refresh_people() and ctx.tty:
                 ctx.ui.redraw_input()
             with contextlib.suppress(Exception):
                 seen_focus = list(ctx.dm_focus)
-                ctx.dm_focus[0] = ctx.dm_window_alive(ctx.args.as_)
+                ctx.dm_focus[0] = ctx.dm_window_available(ctx.args.as_)
+                if seen_focus[0] and not ctx.dm_focus[0]:
+                    chat_restore_folded(ctx)
                 ctx.dm_focus[1] = (
                     m_tmuxio.tmux(
                         "display-message", "-p", "-t", os.environ.get("TMUX_PANE", ""), "#{pane_active}", check=False

@@ -5,7 +5,7 @@
 #                         processes at once by default (scripts/ci_parallel.py)
 #   scripts/ci --serial   the same with the suite in one process, as unittest discover runs it
 #   scripts/ci --quick    lint, format, types only — seconds, for while you work
-#   scripts/ci --linux    the full suite in a Linux container (Docker), Python 3.11–3.13, and the
+#   scripts/ci --linux [--from ID --room ROOM]    the full suite in a Linux container (Docker), Python 3.11–3.13, and the
 #                         Python 3.9 checks: the program must still parse and start install there
 # The suite runs on its own tmux server in a temporary folder (tests/_isolation.py); nothing here
 # touches a running room or the person's files.
@@ -87,10 +87,18 @@ linux() {
     fi
     for version in 3.11 3.12 3.13; do
         echo "== Linux, Python $version"
-        docker run --rm --network none "${mounts[@]}" "$image" "$version" suite || failed="$failed $version"
+        local tracked=()
+        if [ -n "${COLLAB_CI_CONTAINER_DIR:-}" ] && [ -n "${COLLAB_CI_RUN:-}" ]; then
+            tracked=(--cidfile "$COLLAB_CI_CONTAINER_DIR/$version.cid" --label "collab.ci.run=$COLLAB_CI_RUN")
+        fi
+        docker run --rm --network none "${tracked[@]}" "${mounts[@]}" "$image" "$version" suite || failed="$failed $version"
     done
     echo "== Linux, Python 3.9: syntax and install start"
-    docker run --rm --network none "${mounts[@]}" "$image" 3.9 py39 || failed="$failed 3.9"
+    local tracked=()
+    if [ -n "${COLLAB_CI_CONTAINER_DIR:-}" ] && [ -n "${COLLAB_CI_RUN:-}" ]; then
+        tracked=(--cidfile "$COLLAB_CI_CONTAINER_DIR/3.9.cid" --label "collab.ci.run=$COLLAB_CI_RUN")
+    fi
+    docker run --rm --network none "${tracked[@]}" "${mounts[@]}" "$image" 3.9 py39 || failed="$failed 3.9"
     if [ -n "$failed" ]; then echo "Linux: red on Python$failed" >&2; return 1; fi
     echo "Linux: green on 3.11, 3.12, 3.13; 3.9 starts"
 }
@@ -98,7 +106,8 @@ linux() {
 case "${1:-}" in
     --quick) lint ;;
     --serial) lint; serial ;;
-    --linux) linux ;;
+    --linux) shift; python3 scripts/ci_activity.py "$@" ;;
+    --linux-worker) linux ;;
     "") lint; suite ;;
     *) echo "usage: scripts/ci [--quick | --serial | --linux]" >&2; exit 2 ;;
 esac

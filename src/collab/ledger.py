@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, Callable, TypeVar, cast
@@ -67,7 +68,11 @@ def usage_line(
         "split": bool(split),
     }
     for name in (*USAGE_FIELDS, *ANSWER_FIELDS):
-        line[name] = int(entry.get(name) or 0)
+        line[name] = (
+            None if entry.get("coverage") in ("partial", "unknown") and entry.get(name) is None else int(entry.get(name) or 0)
+        )
+    if entry.get("coverage") in ("partial", "unknown"):
+        line.update(coverage=entry["coverage"], reason=str(entry.get("reason") or ""), thinking=entry.get("thinking"))
     return line
 
 
@@ -85,7 +90,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     except OSError:
         return []
     out: list[dict[str, Any]] = []
-    for line in text.splitlines():
+    for line in text.split("\n"):  # not splitlines(): a U+2028 written as it is inside a record is not its end
         with contextlib.suppress(ValueError):
             record: object = json.loads(line)
             if isinstance(record, dict):
@@ -96,7 +101,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 SCHEMA = """
 CREATE TABLE usage (at TEXT, pid TEXT, agent TEXT, agent_kind TEXT, model TEXT, effort TEXT, t_from TEXT,
     t_to TEXT, input INTEGER, output INTEGER, cache_read INTEGER, cache_write INTEGER, wakeups INTEGER,
-    task TEXT, task_kind TEXT, lane TEXT, task_by TEXT, split INTEGER, answers INTEGER, ctx_max INTEGER);
+    task TEXT, task_kind TEXT, lane TEXT, task_by TEXT, split INTEGER, answers INTEGER, ctx_max INTEGER, coverage TEXT, reason TEXT, thinking INTEGER);
 CREATE TABLE task_events (at TEXT, event TEXT, pid TEXT, task TEXT, kind TEXT, lane TEXT, by TEXT, commit_sha TEXT);
 CREATE TABLE runs (at TEXT, by TEXT, what TEXT, who TEXT, exit INTEGER, seconds REAL, red INTEGER, said TEXT);
 """
@@ -125,11 +130,19 @@ def cell(v: object) -> str | int | float | None:
     return None
 
 
-def counts(u: dict[str, Any]) -> tuple[int, ...] | None:
+def counts(u: dict[str, Any]) -> tuple[int | None, ...] | None:
     """A usage line's numbers, or None: a field that is not a count — not a number, below 0, past the limit —
     leaves the line out, as a broken line is — never the whole report."""
-    out: list[int] = []
+    out: list[int | None] = []
     for name in (*USAGE_FIELDS, "wakeups", *ANSWER_FIELDS):
+        if (
+            u.get("agent_kind") == "kimi"
+            and u.get("coverage") in ("partial", "unknown")
+            and name in (*USAGE_FIELDS, "ctx_max")
+            and u.get(name) is None
+        ):
+            out.append(None)
+            continue
         v = u.get(name) or 0
         if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= TOKENS_LIMIT:
             return None
@@ -154,12 +167,15 @@ def build_base(
         with contextlib.closing(sqlite3.connect(tmp)) as db:
             db.executescript(SCHEMA)
             db.executemany(
-                "INSERT INTO usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 [
                     (
                         *(cell(u.get(k)) for k in ("at", "pid", "agent", "agent_kind", "model", "effort", "from", "to")),
                         *n[:5], *(cell(u.get(k)) for k in ("task", "task_kind", "lane", "task_by")), int(bool(u.get("split"))),
                         *n[5:],
+                        u.get("coverage") if u.get("coverage") in ("partial", "unknown") else "complete",
+                        m_text.clean_field(str(u.get("reason") or ""), 160),
+                        cell(u.get("thinking")),
                     )
                     for u in usage
                     if (n := counts(u)) is not None
@@ -195,31 +211,58 @@ GROUPS = {"kind": "task_kind", "agent": "agent", "model": "model", "lane": "lane
 
 
 def report_rows(db: sqlite3.Connection, by: str, since: str = "") -> list[tuple[Any, ...]]:
-    """Per group: tasks, tokens in, out, cache read, cache write, cache share of what was read, wakeups,
-    tokens per task — input + output + cache write; cache reads, cheap, are not in it; the model's answers,
-    the mean and the longest context of one — the mean over the lines that counted answers. «(no task)» where
-    nothing was taken. `since` is compared as text with the journal's UTC times (2026-10-19, or with «+00:00»)."""
+    """Grouped counts; a sum containing an unknown metric remains unknown."""
     column = GROUPS[by]
+
+    def total(name: str) -> str:
+        return f"CASE WHEN COUNT({name})=COUNT(*) THEN SUM({name}) END"
+
     query = f"""
-        SELECT COALESCE({column}, '(no task)') AS g, COUNT(DISTINCT task), SUM(input), SUM(output), SUM(cache_read),
-               SUM(cache_write), SUM(wakeups), SUM(answers), MAX(ctx_max),
-               SUM(CASE WHEN answers > 0 THEN input + cache_read + cache_write ELSE 0 END)
-        FROM usage WHERE t_to >= ? GROUP BY g ORDER BY SUM(input + output + cache_write) DESC
+        SELECT COALESCE({column}, '(no task)'), COUNT(DISTINCT task),
+          {total("input")}, {total("output")}, {total("cache_read")}, {total("cache_write")},
+          SUM(wakeups), SUM(answers),
+          CASE WHEN COUNT(ctx_max)=COUNT(*) THEN MAX(ctx_max) END,
+          CASE WHEN COUNT(input + cache_read + cache_write)=COUNT(*)
+               THEN SUM(CASE WHEN answers > 0 THEN input + cache_read + cache_write ELSE 0 END) END,
+          CASE WHEN MIN(coverage)='complete' AND MAX(coverage)='complete' THEN 'complete'
+               WHEN MIN(coverage)='unknown' AND MAX(coverage)='unknown' THEN 'unknown' ELSE 'partial' END,
+          GROUP_CONCAT(DISTINCT reason), {total("thinking")}
+        FROM usage WHERE t_to >= ? GROUP BY 1 ORDER BY SUM(input + output + COALESCE(cache_write, 0)) DESC
     """
     rows: list[tuple[Any, ...]] = []
-    for g, tasks, inp, out, cread, cwrite, wakeups, answers, ctx_max, ctx_sum in db.execute(query, (since,)):
-        read = inp + cread + cwrite
-        share = round(100 * cread / read) if read else 0
-        spent = inp + out + cwrite
-        per_task = round(spent / tasks) if tasks else spent
-        mean = round(ctx_sum / answers) if answers else 0
-        rows.append((g, tasks, inp, out, cread, cwrite, f"{share}%", wakeups, per_task, answers, mean, ctx_max))
+    for g, tasks, inp, out, cread, cwrite, wakeups, answers, ctx_max, ctx_sum, coverage, reason, thinking in db.execute(
+        query, (since,)
+    ):
+        read = inp + cread + cwrite if all(v is not None for v in (inp, cread, cwrite)) else None
+        share = f"{round(100 * cread / read) if read else 0}%" if read is not None else None
+        spent = inp + out + cwrite if all(v is not None for v in (inp, out, cwrite)) else None
+        per_task = round(spent / tasks) if spent is not None and tasks else spent
+        mean = (round(ctx_sum / answers) if answers else 0) if ctx_sum is not None else None
+        rows.append(
+            (
+                g,
+                tasks,
+                inp,
+                out,
+                cread,
+                cwrite,
+                share,
+                wakeups,
+                per_task,
+                answers,
+                mean,
+                ctx_max,
+                coverage,
+                reason or "",
+                thinking,
+            )
+        )
     return rows
 
 
 HEADER = (
     "group", "tasks", "input", "output", "cache read", "cache write", "cache share", "wakeups", "per task",
-    "answers", "mean context", "max context",
+    "answers", "mean context", "max context", "coverage", "reason", "thinking",
 )  # fmt: skip
 
 
@@ -227,6 +270,8 @@ def shown(v: object, fmt: str) -> str:
     """A cell as the person's terminal or spreadsheet gets it: text through the white list
     — no control codes, no invisible format characters, one line, 80 columns at most; in markdown no «|»
     to break the table; in csv a leading = + - @ made text, not a formula."""
+    if v is None:
+        return "unknown"
     if not isinstance(v, str):
         return str(v)
     text = m_text.clean_field(v, 80)
@@ -308,27 +353,94 @@ def woke(pid: str) -> None:
     WAKEUPS[pid] = WAKEUPS.get(pid, 0) + 1
 
 
-@m_store.room_locked  # usage.increment moves its cursor in the room's state
+USAGE_WAKE_OWNER = uuid.uuid4().hex
+USAGE_WAKE_STATE = {"committed": ""}
+
+
+def commit_usage_cursors(updates: dict[str, Any], pid: str) -> None:
+    allowed = {m_usage.cursor_path().name, "kimi-usage-cursor.json", m_store.compacted_path().name}
+    if not set(updates) <= allowed:
+        raise ValueError("usage checkpoint rejected")
+    for name, change in updates.items():
+        if not isinstance(change, dict) or set(change) != {"pid", "before", "after"} or change["pid"] != pid:
+            raise ValueError("usage cursor change rejected")
+        path = m_store.room().paths.state_dir / name
+        state = m_store.read_json(path)
+        if state.get(pid) == change["before"]:
+            state[pid] = change["after"]
+            m_store.write_json(path, state)
+
+
+def finish_usage(batch: dict[str, Any], recovering: bool) -> None:
+    """Finish the saved portion before collecting another; replay only missing journal IDs."""
+    rp = m_store.room().paths
+    updates, lines = batch["updates"], batch["lines"]
+    if (
+        not isinstance(lines, list)
+        or not lines
+        or not all(isinstance(line, dict) and isinstance(line.get("id"), str) for line in lines)
+    ):
+        raise ValueError("usage portion rejected")
+    if recovering:
+        existing = {line.get("id") for line in read_jsonl(usage_path()) if isinstance(line.get("id"), str)}
+        lines = [line for line in lines if line["id"] not in existing]
+        try:
+            text = m_store.read_state_text(usage_path())
+        except FileNotFoundError:
+            text = ""
+        if text and not text.endswith("\n"):
+            m_store.write_state(usage_path(), "\n", append=True)
+    if lines:
+        append_usage(lines)
+    commit_usage_cursors(updates, batch["pid"])
+    contexts = m_store.read_json(context_path())
+    contexts[batch["pid"]] = batch["context"]
+    m_store.write_json(context_path(), contexts)
+    token = batch["lines"][0]["id"]
+    if batch["owner"] == USAGE_WAKE_OWNER and USAGE_WAKE_STATE["committed"] != token:
+        WAKEUPS[batch["pid"]] = max(0, WAKEUPS.get(batch["pid"], 0) - batch["wakeups"])
+        USAGE_WAKE_STATE["committed"] = token
+    (rp.state_dir / "usage-pending.json").unlink()
+
+
+@m_store.room_locked
 def record(p: dict[str, Any]) -> int:
-    """The agent's spending since the last look as lines of usage.jsonl, each put down to the task at its end
-    (split: the task changed inside the stretch); the wakes counted since go with the first. Nothing spent —
-    nothing written, and the wakes wait for the spending they cause."""
-    entries = m_usage.increment(p)
+    """Persist a replayable portion before its journal, and commit cursors only after the journal."""
+    rp = m_store.room().paths
+    pending = rp.state_dir / "usage-pending.json"
+    try:
+        batch = json.loads(m_store.read_state_text(pending, "strict"))
+    except FileNotFoundError:
+        batch = None
+    if batch is not None:
+        finish_usage(batch, recovering=True)
+        if batch["pid"] == p["id"]:
+            return len(batch["lines"])
+    updates: dict[str, Any] = {}
+    entries = m_usage.increment(p, updates=updates)
     if not entries:
+        commit_usage_cursors(updates, p["id"])
         return 0
     pid = p["id"]
-    wakes, events = WAKEUPS.pop(pid, 0), m_tasks.task_events()
+    wakes, events = WAKEUPS.get(pid, 0), m_tasks.task_events()
     lines: list[dict[str, Any]] = []
+    token = uuid.uuid4().hex
     for i, e in enumerate(entries):
         task = task_at(events, pid, str(e.get("to_ts") or ""))
         began = task_at(events, pid, str(e.get("from_ts") or ""))
         split = (began or {}).get("id") != (task or {}).get("id")
-        lines.append(usage_line(pid, p.get("label") or pid, m_screen.agent_kind(p), e, task, wakes if i == 0 else 0, split))
-    append_usage(lines)
+        line = usage_line(pid, p.get("label") or pid, m_screen.agent_kind(p), e, task, wakes if i == 0 else 0, split)
+        lines.append({**line, "id": f"{token}:{i}"})
     latest = max(entries, key=lambda e: str(e.get("to_ts") or ""))
-    contexts = m_store.read_json(context_path())
-    contexts[pid] = {"ctx": int(latest.get("ctx_last") or 0), "at": str(latest.get("to_ts") or "")}
-    m_store.write_json(context_path(), contexts)
+    context = {
+        "ctx": None
+        if latest.get("coverage") in ("partial", "unknown") and latest.get("ctx_last") is None
+        else int(latest.get("ctx_last") or 0),
+        "at": str(latest.get("to_ts") or ""),
+    }
+    batch = {"pid": pid, "lines": lines, "updates": updates, "context": context, "wakeups": wakes, "owner": USAGE_WAKE_OWNER}
+    m_store.write_json(pending, batch)
+    finish_usage(batch, recovering=False)
     return len(lines)
 
 

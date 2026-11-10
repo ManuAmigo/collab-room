@@ -16,6 +16,7 @@ import collab.text as m_text
 import collab.i18n as m_i18n
 import collab.store as m_store
 import collab.tmuxio as m_tmuxio
+import collab.vpn_macos_process as m_vpn_macos_process
 
 STATES = {"joining", "working", "idle", "needs_owner", "draft", "unknown", "lost", "limited", "scrolled"}
 
@@ -47,8 +48,8 @@ PRESETS: dict[str, dict[str, Any]] = {
         # it goes as a pointer; a fold still on screen after Enter gets one more Enter.
         "paste_limit": 1000,
         "paste_fold": "^› \\[Pasted Content \\d+ chars\\]",
-        # Words of a mode may follow the effort: «GPT-6.1-Sol low fast ·» (no model was shown).
-        "model": "^\\s+(\\S+) (?:default|minimal|low|medium|high|xhigh)(?: [a-z]+)* ·",
+        # Words of a mode may follow the effort: «GPT-6.1-Sol low fast ·», «GPT-6.1-Sol default Fast ·».
+        "model": "^\\s+(\\S+) (?:default|minimal|low|medium|high|xhigh)(?: [a-z]+)*(?: Fast)? ·",
         # While it works, a line typed with Enter goes into the running turn after its next tool call: shown
         # under «• Messages to be submitted after next tool call», and its input is empty again (codex 0.164).
         "input": "^›",
@@ -99,6 +100,32 @@ PRESETS: dict[str, dict[str, Any]] = {
         # Typed as keys, a text past about a kilobyte lost its first ~1022 bytes on the way into the input, before
         # the Enter — 6 or 7 times in 10 (Claude Code 2.1.310). As one bracketed paste none of 20 did.
         "bracketed_paste": True,
+    },
+    "kimi": {
+        "label": "Kimi",
+        "command": ["kimi"],
+        "delivery": "tmux",
+        # Kimi Code's editor is boxed; normalize only its frame before reading its input.
+        # A running turn keeps an empty editor visible. Never steer it through that editor.
+        "kind": "kimi",
+        "boxed_input": True,
+        "idle_only": True,
+        "idle": r"^>\s*$",
+        "input": r"^>",
+        "input_empty": r"^>\s*$",
+        "draft": r"^>\s+\S",
+        "busy": r"^\s{1,3}[🌑🌒🌓🌔🌕🌖🌗🌘⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?:\s|$)",
+        # The live footer: «Ask When Needed  probe  [2 tasks running]». A narrow pane shortens it to
+        # «[2 tasks runn…». Only this area is read, never a matching line quoted in the transcript.
+        "model": r"^\s*(?:Always Ask|Ask When Needed|Never Ask) +(\S+)(?: +|$)",
+        "background": r"^\s*(?:Always Ask|Ask When Needed|Never Ask) +\S+ +\[(\d+) tasks? (?:running\b|runn…)",
+        "attention": r"^\s*(?:↑↓ navigate · Enter select · Esc (?:exit|cancel)|↑/↓ select · .+ choose · ↵ confirm.*|esc back to approval|Type feedback · ↵ submit\.)\s*$",
+        "attention_title": r"(?:Trust this folder\?|Run this command\?|Sign in to Kimi Code|Cache expired)",
+        # No queued-turn delivery is enabled. This impossible pattern still lets idle delivery
+        # check that its Enter emptied the editor instead of trusting a successful keypress.
+        "queued": r"(?!)",
+        "bracketed_paste": True,
+        "paste_limit": 1000,
     },
 }
 
@@ -155,6 +182,8 @@ def brief_owner(config: dict[str, Any], sid: object) -> str:
     bound = [p["id"] for p in config["participants"] if p.get("claude_session") == sid]
     if bound:
         return bound[0] if len(bound) == 1 else ""
+    if config.get("macos_vpn") is True and (owner := m_vpn_macos_process.mac_vpn_bind_hook(sid)):
+        return owner
     home = Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser()
     mine = [
         p["id"]
@@ -168,9 +197,6 @@ def brief_owner(config: dict[str, Any], sid: object) -> str:
     return mine[0] if len(mine) == 1 else ""
 
 
-# Between the room's head «[room → codex]» and its text in a Codex log: the time and the line break,
-# as JSON writes them («09:17\\n  »), or nothing (older versions). Not a «[»: no other head fits in.
-CHECK_GAP = r"(?: \d\d:\d\d)?(?:\\+n)?[ ]*"
 SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
@@ -198,36 +224,182 @@ def agent_session(p: dict[str, Any]) -> str:
         return ""
     since = m_text.at_time(p.get("joined_at", "")) - 60
     logs = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "sessions"
+    deadline = time.monotonic() + 2
     try:
-        found = sorted(
-            (f for f in logs.rglob("rollout-*.jsonl") if f.stat().st_mtime >= since),
-            key=lambda f: f.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
+        if p.get("target") and p.get("pane_pid"):
+            # The current process's open rollout is stronger than hints in another log.
+            current = m_tmuxio.tmux("display-message", "-p", "-t", p["target"], "#{pane_pid}", check=False)
+            if current.returncode or current.stdout.strip() != str(p["pane_pid"]) or not str(p["pane_pid"]).isdigit():
+                return ""
+            opened = subprocess.run(["lsof", "-a", "-p", str(p["pane_pid"]), "-Fn"], capture_output=True, text=True, timeout=1)
+            if opened.returncode or len(opened.stdout) > 1_000_000:
+                return ""
+            candidates: list[Path] = []
+            for row in opened.stdout.splitlines():
+                if row.startswith("n"):
+                    path = Path(row[1:])
+                    if path.name.startswith("rollout-") and path.suffix == ".jsonl" and logs.resolve() in path.resolve().parents:
+                        candidates.append(path)
+        else:
+            # Legacy entries have no process identity. Never guess among two checks.
+            candidates = []
+            for path in logs.rglob("rollout-*.jsonl"):
+                if len(candidates) >= 5000 or time.monotonic() > deadline:
+                    return ""
+                candidates.append(path)
+        dated: list[tuple[float, Path]] = []
+        for path in set(candidates):
+            if time.monotonic() > deadline:
+                return ""
+            modified = path.stat().st_mtime
+            if modified >= since:
+                dated.append((modified, path))
+        found = [path for _, path in sorted(dated, reverse=True)]
+    except (OSError, ValueError, subprocess.TimeoutExpired):
         return ""
-    # What only this agent was given: the room's check addressed to it, «[room → <id>] … connected <code>».
-    # Its answer goes to everyone, so another Codex in the same folder has that line too.
-    # Only «→»: the room's own header. In a message's text «→» is drawn as «->», so «->» — and a
-    # typed «\\u2192» — could be written by another agent into this folder's other Codex.
-    # Matched as delivery writes it now — «[room → codex] 09:17», then the text on the next line
-    # (glued into one, /restart of a Codex said «not found»): the head, then only its time and line
-    # break, then the check with this agent's code; quotes as the log escapes them, once or twice.
-    check = re.escape(ping_text(p["join_code"])).replace('"', r'\\*"')
-    asked = re.compile(re.escape(f"[room → {p['id']}]") + CHECK_GAP + check)
+    check = re.escape(ping_text(p["join_code"]))
+    asked = re.compile(
+        r"(?m)^"
+        + re.escape(f"[room → {p['id']}]")
+        + r"(?:[ \t]*\d\d:\d\d)?[ \t]*(?:\n[ \t]*)?(?:⟦"
+        + check
+        + "⟧|"
+        + check
+        + r")(?=\n|$)"
+    )
+    matches: set[str] = set()
+    budget = 20_000_000
     for f in found[:50]:
+        if time.monotonic() > deadline or budget <= 0:
+            return ""
         try:
             with f.open(encoding="utf-8", errors="replace") as fh:
-                meta: dict[str, Any] = json.loads(fh.readline()).get("payload") or {}
-                text = fh.read(20_000_000)
-                if os.path.realpath(str(meta.get("cwd", ""))) != folder or not asked.search(text):
+                header = fh.readline(65_537)
+                if len(header) > 65_536:
                     continue
+                first = json.loads(header)
+                meta: dict[str, Any] = first.get("payload") or {}
+                if first.get("type") != "session_meta" or os.path.realpath(str(meta.get("cwd", ""))) != folder:
+                    continue
+                sid = str(meta.get("id", ""))
+                if not SESSION_ID.fullmatch(sid):
+                    continue
+                text = fh.read(budget)
+                budget -= len(header) + len(text)
+                for line in text.splitlines():
+                    if time.monotonic() > deadline:
+                        return ""
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    for content, tool in codex_check_texts(record):
+                        for match in asked.finditer(content):
+                            prefix = content[: match.start()]
+                            if not tool and prefix:
+                                continue
+                            if tool and prefix and prefix.splitlines() and prefix.splitlines()[-1].strip():
+                                continue
+                            if sum(row.lstrip().startswith("```") for row in prefix.splitlines()) % 2:
+                                continue
+                            matches.add(sid)
+                    if sid in matches:
+                        break
         except (OSError, ValueError, AttributeError):
             continue
-        sid = str(meta.get("id", ""))
-        if SESSION_ID.fullmatch(sid):
-            return sid
-    return ""
+    return next(iter(matches)) if len(matches) == 1 else ""
+
+
+def codex_check_texts(record: Any) -> list[tuple[str, bool]]:
+    """Only user input and actual tool output can carry a room connection check."""
+    if not isinstance(record, dict):
+        return []
+    record = cast(dict[str, Any], record)
+    raw_payload: Any = record.get("payload")
+    payload = cast(dict[str, Any], raw_payload) if isinstance(raw_payload, dict) else {}
+    tool = False
+    if record.get("type") == "response_item":
+        if payload.get("type") in ("function_call_output", "custom_tool_call_output"):
+            value = payload.get("output")
+            tool = True
+        elif payload.get("type") == "message" and payload.get("role") == "user":
+            value = payload.get("content")
+        else:
+            return []
+    elif record.get("type") == "event_msg" and payload.get("type") == "user_message":
+        value = payload.get("message")
+    elif record.get("type") == "event_msg" and payload.get("type") == "item_completed":
+        item = cast(dict[str, Any], payload.get("item")) if isinstance(payload.get("item"), dict) else {}
+        if (
+            item.get("type") != "CommandExecution"
+            or item.get("source") != "unified_exec_startup"
+            or item.get("status") != "completed"
+            or item.get("exit_code") != 0
+        ):
+            return []
+        value = item.get("aggregated_output")
+        tool = True
+    elif set(record) == {"text"}:  # legacy delivery record
+        value = record["text"]
+    else:
+        return []
+    texts: list[tuple[str, bool]] = []
+
+    def chunks(text: str) -> list[dict[str, Any]] | None:
+        # The tool transport can concatenate complete exec results under its truncation header.
+        # Decode only that framing, never search prose or quoted examples for embedded JSON.
+        header = re.match(r"Warning: truncated output \(original token count: \d+\)\nTotal output lines: \d+\n\n", text)
+        rest = text[header.end() :] if header else text
+        decoder = json.JSONDecoder()
+        out: list[dict[str, Any]] = []
+        while rest.strip() and len(out) < 64:
+            rest = rest.lstrip()
+            try:
+                raw, end = decoder.raw_decode(rest)
+            except ValueError:
+                return None
+            if not isinstance(raw, dict):
+                return None
+            chunk = cast(dict[str, Any], raw)
+            if (
+                not {"chunk_id", "wall_time_seconds", "output"} <= chunk.keys()
+                or not chunk.keys()
+                <= {"chunk_id", "wall_time_seconds", "output", "exit_code", "original_token_count", "session_id"}
+                or not isinstance(chunk["chunk_id"], str)
+                or not isinstance(chunk["output"], str)
+                or type(chunk["wall_time_seconds"]) not in (int, float)
+            ):
+                return None
+            out.append(chunk)
+            rest = rest[end:]
+        return out if out and not rest.strip() else None
+
+    def walk(item: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(item, str):
+            try:
+                decoded = json.loads(item)
+            except ValueError:
+                framed = chunks(item) if tool else None
+                if framed is None:
+                    texts.append((item, tool))
+                else:
+                    for chunk in framed:
+                        walk(chunk["output"], depth + 1)
+            else:
+                if decoded != item:
+                    walk(decoded, depth + 1)
+        elif isinstance(item, list):
+            for child in cast(list[Any], item)[:64]:
+                walk(child, depth + 1)
+        elif isinstance(item, dict):
+            for key in ("text", "output", "content"):
+                if key in item:
+                    walk(item[key], depth + 1)
+
+    walk(value)
+    return texts
 
 
 SCREEN_KEYS = (
@@ -247,6 +419,8 @@ SCREEN_KEYS = (
     "queued",
     "bracketed_paste",
     "starting",
+    "boxed_input",
+    "idle_only",
 )
 
 
@@ -283,11 +457,13 @@ class Shot:
         return "\n".join(line.rstrip() for line in SGR.sub("", self.stdout).split("\n"))
 
 
-def look(p: dict[str, Any], pane: str) -> Shot:
+def look(p: dict[str, Any], pane: str, deadline: float | None = None) -> Shot:
     """The window's screen and its process, session and room in ONE tmux call (a
     tick took three captures and a display-message per agent). Both commands are tmux's own, on the same
     target — resolved exactly as when they went one by one. Between them a mark no window can type: it is
     new for every look. Not found, or no mark: a failed look — the window is lost, as before."""
+    if deadline is not None and time.monotonic() >= deadline:
+        return Shot(1, "", "")
     mark = secrets.token_hex(8)
     hints = ["-e"] if p.get("dim_is_hint") else []
     shown = m_tmuxio.tmux(
@@ -303,6 +479,7 @@ def look(p: dict[str, Any], pane: str) -> Shot:
         pane,
         f"{mark}\t#{{pane_in_mode}}\t{GUARD_FORMAT}",
         check=False,
+        timeout=None if deadline is None else deadline - time.monotonic(),
     )
     screen, found, guard = (shown.stdout or "").rpartition(mark + "\t")
     if shown.returncode != 0 or not found:
@@ -311,7 +488,14 @@ def look(p: dict[str, Any], pane: str) -> Shot:
     return Shot(0, screen, guard, in_mode == "1")
 
 
-def pane_guard(p: dict[str, Any], pane: str, idle: bool = True, root: Path | None = None, shot: Shot | None = None) -> str:
+def pane_guard(
+    p: dict[str, Any],
+    pane: str,
+    idle: bool = True,
+    root: Path | None = None,
+    shot: Shot | None = None,
+    deadline: float | None = None,
+) -> str:
     """Why this window is not the agent's, or "" when nothing says so. What the screen shows is a
     guess; this is the structure behind it (a shell prompt «❯ » read as an idle
     Claude, the message typed into the shell and run). Two checks:
@@ -321,12 +505,24 @@ def pane_guard(p: dict[str, Any], pane: str, idle: bool = True, root: Path | Non
       person named, or one started by an older version), a shell is not it. Checked only when the screen
       says idle: while an agent runs a command, that command may hold the terminal for a moment.
       Not by the program's name: Claude Code names its process by its version («2.1.302»)."""
+    if "container" in p:
+        return "Container VPN is frozen; launch and delivery refused."
+    if deadline is not None and time.monotonic() >= deadline:
+        return "Screen check timed out."
     rp = m_store.room().paths
     if shot is not None:
         # The same answer tmux gave the tick's one look at this window (look()): the same target, the same moment.
         returncode, answer = shot.returncode, shot.guard
     else:
-        shown = m_tmuxio.tmux("display-message", "-p", "-t", pane, GUARD_FORMAT, check=False)
+        shown = m_tmuxio.tmux(
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            GUARD_FORMAT,
+            check=False,
+            timeout=None if deadline is None else deadline - time.monotonic(),
+        )
         returncode, answer = shown.returncode, shown.stdout
     if returncode != 0:
         return "Agent window not found."
@@ -334,7 +530,9 @@ def pane_guard(p: dict[str, Any], pane: str, idle: bool = True, root: Path | Non
     if not its_root and group:
         # The window is in a view /open made (unmarked; it names the room's session, or is grouped with
         # it): tmux may name that one for it — every agent read as another room's.
-        its_root = m_tmuxio.session_room(group)
+        its_root = m_tmuxio.session_room(group, deadline)
+        if deadline is not None and time.monotonic() >= deadline:
+            return "Screen check timed out."
     # Whose session the window is in (room_options marks each room's): after a tmux restart another room
     # took its old «%1»…«%6» — this room's agents' windows — for its own and typed into them.
     # An agent the room started lives only in the room's session; no agent is in another's.
@@ -344,7 +542,9 @@ def pane_guard(p: dict[str, Any], pane: str, idle: bool = True, root: Path | Non
     if p.get("pane_pid"):
         # Started by the room with `exec`: the window's process IS the agent, and the window
         # closes when it ends — the same process is all there is to check.
-        return "" if pid == str(p["pane_pid"]) else "Its window now runs another program (the window was reused)."
+        if pid != str(p["pane_pid"]):
+            return "Its window now runs another program (the window was reused)."
+        return ""
     if str(p.get("target", "")).startswith("%"):
         # A bare «%N» with no process to check it by: after a tmux restart it is any window, in a
         # session no room marks too. The room never writes one so; a window the
@@ -357,14 +557,35 @@ def pane_guard(p: dict[str, Any], pane: str, idle: bool = True, root: Path | Non
         return f"A shell ({m_text.clean_field(program, 20)}) is in its window: a seat without a command has no agent."
     # A window the room opens itself from the participant's command is made anew by every start;
     # only a window named by `target` can be someone's shell.
-    if idle and "target" in p and agent_kind(p) in ("claude", "codex") and program.lstrip("-") in SHELLS:
+    if idle and "target" in p and agent_kind(p) in PRESETS and program.lstrip("-") in SHELLS:
         return f"A shell ({m_text.clean_field(program, 20)}), not the agent, is in its window."
     return ""
+
+
+def boxed_editor(text: str) -> str:
+    """Read only a complete Kimi editor frame. A bare quoted `>` or half a redraw is no input.
+    Other screen text stays visible for busy/attention detection, but cannot become an input line."""
+    lines = SGR.sub("", text).splitlines()
+    shown = [" " + line if line.startswith(">") else line for line in lines]
+    at = max((i for i, line in enumerate(lines) if re.match(r" ?│ > ", line)), default=-1)
+    top = at - 1
+    bottom = next((i for i in range(at + 1, len(lines)) if re.fullmatch(r" ?╰─+╯ *", lines[i])), -1)
+    if at > 0 and bottom > at and re.fullmatch(r" ?[╭├]─+[╮┤] *", lines[top]):
+        body = lines[at:bottom]
+        if len(lines[top].rstrip()) == len(lines[bottom].rstrip()) and all(re.fullmatch(r" ?│ .*│ *", line) for line in body):
+            shown[top] = shown[bottom] = "──────────"
+            content = [re.sub(r"^ ?│ (.*?) ?│ *$", r"\1", line).rstrip() for line in body]
+            # One logical input row: an empty first row followed by a draft is still a draft,
+            # and a quoted `>` on a continuation must never become another input marker.
+            shown[at:bottom] = ["> " + "".join([content[0][2:], *content[1:]])]
+    return "\n".join(shown)
 
 
 def screen_tail_text(p: dict[str, Any], text: str, whole: bool = False) -> str:
     """The bottom lines of a screen (whole: all of it) as its state is read from them: no hints, no chips, no colour
     codes."""
+    if p.get("boxed_input"):
+        text = boxed_editor(text)
     if p.get("dim_is_hint"):
         # Claude Code puts a suggested next prompt into its input in dim text. It is not a
         # draft: the agent is idle. Read as one, it painted an agent red and stopped delivery
@@ -379,20 +600,105 @@ def screen_tail_text(p: dict[str, Any], text: str, whole: bool = False) -> str:
     return "\n".join(line.rstrip() for line in (lines if whole else lines[-args_tail() :]))
 
 
+KIMI_CACHE_RULE = re.compile(r"^ ─{20,}$")
+KIMI_CACHE_FOOTER = "↑↓ navigate · Enter select · Esc cancel"
+KIMI_CACHE_OPTION = re.compile(r"^  (?: (❯) |   )(\S.*?)\s*$")
+KIMI_CACHE_OPTIONS = (
+    ("Compact and continue", "one-time compact cost · cheapest way to keep this topic"),
+    ("Start a new session", "zero context cost · best for a new task"),
+    ("Continue as-is", "full history kept · highest cost per turn"),
+    ("Don't ask me again", ""),
+)
+KIMI_CACHE_TITLE = re.compile(r"This session has been idle for .+? and is ~(?:\d+|\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?[kM]) tokens\.")
+KIMI_CACHE_BODY = "Cache expired — the next message re-sends the entire history at full price."
+KIMI_CACHE_STATUS_FOOTER = re.compile(
+    r"^ Ask When Needed  K3\.1 Pro Highspeed 2x Usage Cost thinking: high  [~/].+? {2,}ctrl\+o expand$"
+)
+KIMI_CACHE_CONTEXT_FOOTER = re.compile(r"^ +context: (?:100|\d{1,2})% \(\d+(?:\.\d+)?[kM]?/\d+(?:\.\d+)?[kM]?\)$")
+
+
+def kimi_cache_dialog(screen: str, width: int = 0) -> dict[str, Any] | None:
+    """The current Cache expired frame; complete says its text is not truncated."""
+    lines = screen.rstrip("\n").splitlines()
+    last = max((i for i, line in enumerate(lines) if line.strip()), default=-1)
+    rules = [i for i, line in enumerate(lines) if KIMI_CACHE_RULE.fullmatch(line)]
+    if len(rules) < 2:
+        return None
+    top, bottom = rules[-2], rules[-1]
+    if bottom != last:
+        trailing = [line for line in lines[bottom + 1 : last + 1] if line.strip()]
+        if (
+            len(trailing) != 2
+            or not KIMI_CACHE_STATUS_FOOTER.fullmatch(trailing[0])
+            or not KIMI_CACHE_CONTEXT_FOOTER.fullmatch(trailing[1])
+        ):
+            return None
+    if len(lines[top]) != len(lines[bottom]) or (width and len(lines[top]) != width - 1):
+        return None
+    title, body = "", ""
+    options: list[dict[str, Any]] = []
+    selected = 0
+    footer = False
+    complete = True
+    for line in lines[top + 1 : bottom]:
+        text = line.strip()
+        if not text:
+            continue
+        if not title:
+            title = text
+            continue
+        if not footer:
+            if text != KIMI_CACHE_FOOTER:
+                return None
+            footer = True
+            continue
+        if not body:
+            body = text
+            continue
+        match = KIMI_CACHE_OPTION.fullmatch(line)
+        if not match or len(options) >= len(KIMI_CACHE_OPTIONS):
+            return None
+        label, description = KIMI_CACHE_OPTIONS[len(options)]
+        content = match.group(2)
+        if not content.startswith(label):
+            return None
+        detail = content[len(label) :].strip()
+        prefix = detail[:-3] if detail.endswith("...") else detail
+        if not description.startswith(prefix):
+            return None
+        complete = complete and detail == description
+        options.append({"n": len(options) + 1, "lines": [label, *([detail] if detail else [])]})
+        if match.group(1):
+            if selected:
+                return None
+            selected = len(options)
+    if not title.startswith("This session has been idle for ") or " and is ~" not in title:
+        return None
+    prefix = body[:-3] if body.endswith("...") else body
+    if not body.startswith("Cache expired —") or not KIMI_CACHE_BODY.startswith(prefix):
+        return None
+    complete = complete and bool(KIMI_CACHE_TITLE.fullmatch(title)) and body == KIMI_CACHE_BODY
+    if len(options) != len(KIMI_CACHE_OPTIONS) or not selected:
+        return None
+    return {"lines": [title, body], "options": options, "selected": selected, "complete": complete}
+
+
 def screen_state(p: dict[str, Any], pane: str, shot: Shot | None = None) -> tuple[str, str]:
-    """What the participant's screen says, from its bottom lines only.
+    """What the participant's screen says, from its bottom lines or a complete current Kimi Cache modal.
 
     needs_owner — the screen asks the person for something (approve a command, pick an option);
     working — `busy` matches (an agent's prompt can stay visible while it works: Codex shows `›`
     and `Working (…)` at the same time, and typing then would queue or steer the turn);
     idle — `idle` matches, safe to type; unknown — none matched; lost — the pane is gone.
-    Only the bottom: quoted text higher up (a delivered message mentioning "Working (") must not
-    change the state — found in a live run.
+    Ordinary states use only the bottom: quoted text higher up must not change the state. A Kimi Cache
+    modal is read whole only as the last visible frame, never when a current editor follows it.
     """
     hints = bool(p.get("dim_is_hint"))
     shown = shot or m_tmuxio.tmux("capture-pane", "-p", *(["-e"] if hints else []), "-t", pane, check=False)
     if shown.returncode != 0:
         return "lost", "Agent window not found."
+    if agent_kind(p) == "kimi" and not getattr(shown, "scrolled", False) and kimi_cache_dialog(shown.stdout):
+        return "needs_owner", "Cache expired"
     tail = screen_tail_text(p, shown.stdout)
     if p.get("attention") and re.search(p["attention"], tail, re.MULTILINE):
         # The question itself may sit above the bottom lines in a long menu: look for its title
@@ -414,6 +720,11 @@ def screen_state(p: dict[str, Any], pane: str, shot: Shot | None = None) -> tupl
     # mix texts. Say so — "unknown" left the person guessing why the agent fell silent.
     if p.get("draft") and re.search(p["draft"], tail, re.MULTILINE):
         return "draft", ""
+    # Or its input box grew taller than the bottom lines (a long text in a narrow window): its first row is higher.
+    whole = screen_tail_text(p, shown.stdout, whole=True).split("\n")
+    at = input_line(p, whole) if p.get("draft") and p.get("input") else -1
+    if at >= 0 and re.match(p["draft"], whole[at]):
+        return "draft", ""
     return "unknown", ""
 
 
@@ -429,10 +740,10 @@ def fold_left(rules: dict[str, Any], pane: str, typed: str = "") -> bool:
     shown = m_tmuxio.tmux("capture-pane", "-p", "-t", pane, check=False)
     if shown.returncode != 0:
         return False
-    tail = "\n".join(line.rstrip() for line in (shown.stdout or "").rstrip("\n").splitlines()[-args_tail() :])
+    lines = [line.rstrip() for line in (shown.stdout or "").rstrip("\n").splitlines()]
+    tail = "\n".join(lines[-args_tail() :])
     prompt = rules["paste_fold"].lstrip("^")[:1]  # «›» Codex, «❯» Claude: the input line's first sign
-    lines = tail.splitlines()
-    at = max((i for i, line in enumerate(lines) if line.startswith(prompt)), default=-1)
+    at = input_line({**rules, "input": re.escape(prompt)}, lines)
     fold = re.match(rules["paste_fold"].lstrip("^").rstrip("$"), lines[at]) if at >= 0 else None
     if fold is None:
         return False
@@ -457,6 +768,8 @@ def type_text(rules: dict[str, Any], pane: str, text: str) -> subprocess.Complet
     buffer = f"collab-{secrets.token_hex(8)}"
     loaded = m_tmuxio.tmux("set-buffer", "-b", buffer, "--", text, check=False)
     if loaded.returncode != 0:
+        # Not answered in time, the server may still have set it: the message's text is not left there either.
+        m_tmuxio.tmux("delete-buffer", "-b", buffer, check=False)
         return loaded
     pasted = m_tmuxio.tmux("paste-buffer", "-p", "-d", "-b", buffer, "-t", pane, check=False)
     if pasted.returncode != 0:
@@ -465,45 +778,91 @@ def type_text(rules: dict[str, Any], pane: str, text: str) -> subprocess.Complet
     return pasted
 
 
-def wait_started(rules: dict[str, Any], pane: str, limit: float = 20.0) -> bool:
-    """Its screen no longer says it is starting — or it never did; False when still starting after the limit."""
+def still_starting(rules: dict[str, Any], pane: str) -> bool:
+    """Its screen says it is starting — one look, no wait: the deliverer looks again next tick, not holding the
+    room's lock meanwhile (say and ack waited for it up to 20 s)."""
     if not rules.get("starting"):
-        return True
-    until = time.time() + limit
-    while True:
-        shown = m_tmuxio.tmux("capture-pane", "-p", "-t", pane, check=False)
-        if shown.returncode != 0 or not re.search(rules["starting"], screen_tail_text(rules, shown.stdout), re.MULTILINE):
-            return True
-        if time.time() >= until:
-            return False
-        time.sleep(0.5)
+        return False
+    shown = m_tmuxio.tmux("capture-pane", "-p", "-t", pane, check=False)
+    return shown.returncode == 0 and bool(re.search(rules["starting"], screen_tail_text(rules, shown.stdout), re.MULTILINE))
+
+
+def is_rule(line: str) -> bool:
+    """A line of «─», as Claude draws above and below its input."""
+    return line.lstrip().startswith("─")
+
+
+def input_line(rules: dict[str, Any], lines: list[str]) -> int:
+    """The last input line of a screen's lines, or -1: in the bottom lines, or the first row of an input box between
+    its rules that ends there — a long text in a narrow window wraps to more rows than the bottom lines hold."""
+    at = max((i for i, line in enumerate(lines) if re.match(rules["input"], line)), default=-1)
+    bottom = len(lines) - args_tail()
+    if at < 0 or at >= bottom:
+        return at
+    below = next((i for i in range(at + 1, len(lines)) if is_rule(lines[i])), -1)
+    return at if at > 0 and is_rule(lines[at - 1]) and below >= bottom else -1
 
 
 def input_starts(rules: dict[str, Any], shot: Shot, text: str) -> bool:
-    """The last input line begins with the text's start, or is its fold — not with its middle: what came in
-    lost its start, and an Enter would send the rest as the whole message. No input line on the screen at all (a
-    seat with a screen of its own) is nothing to judge by: it goes as before."""
-    lines = shot.plain.rstrip("\n").split("\n")[-args_tail() :]
-    at = max((i for i, line in enumerate(lines) if re.match(rules["input"], line)), default=-1)
+    """The last input line is the text's start — the whole of what it shows, not only its first signs (the
+    room's head, the same in every message) — or is its fold and nothing else: not its middle (what came in lost
+    its start, and an Enter would send the rest as the whole message), and not a screen with no input line to
+    judge by. Or the box is as tall as it grows and shows the text's end (box_shows_end): a text that lost its
+    start came in short, a box with its tail only."""
+    lines = (screen_tail_text(rules, shot.stdout, whole=True) if rules.get("boxed_input") else shot.plain.rstrip("\n")).split(
+        "\n"
+    )
+    at = input_line(rules, lines)
     if at < 0:
-        return True
-    if rules.get("paste_fold") and re.match(rules["paste_fold"], lines[at]):
-        return True
-    shown = "".join(re.sub(rules["input"], "", lines[at], count=1).split())
-    return bool(shown) and "".join(text.split()).startswith(shown[:16])
+        return False
+    fold = re.match(rules["paste_fold"], lines[at]) if rules.get("paste_fold") else None
+    if fold:
+        return not lines[at][fold.end() :].strip()
+    whole = "".join(text.split())
+    shown = "".join(re.sub(rules["input"], "", lines[at], count=1).split()).rstrip("…")
+    return bool(shown and whole.startswith(shown)) or box_shows_end(rules, shot, lines, at, text)
 
 
-def screen_count_any(pane: str, pattern: str) -> bool:
-    """Does a bottom line of the screen match (no group needed)?"""
-    shown = m_tmuxio.tmux("capture-pane", "-p", "-t", pane, check=False)
-    lines = [line.rstrip() for line in (shown.stdout or "").rstrip("\n").splitlines()[-args_tail() :]]
-    return shown.returncode == 0 and bool(re.search(pattern, "\n".join(lines), re.MULTILINE))
+def box_shows_end(rules: dict[str, Any], shot: Shot, lines: list[str], at: int, text: str) -> bool:
+    """The input box at line `at` is as tall as it grows and shows the text's end, not all of it: scrolled to it,
+    its first row marked as the input line — Claude Code in its full screen keeps its input to max(3, rows // 2 - 5)
+    rows (2.1.311). What is hidden above its first row is not seen."""
+    whole = "".join(text.split())
+    below = next((i for i in range(at + 1, len(lines)) if is_rule(lines[i])), -1)
+    if below < 0 or not is_rule(lines[at - 1] if at else "") or below - at < max(3, shot.stdout.count("\n") // 2 - 5):
+        return False
+    box = "".join("".join([re.sub(rules["input"], "", lines[at], count=1), *lines[at + 1 : below]]).split())
+    return bool(box) and len(box) < len(whole) and whole.endswith(box)
 
 
-def screen_count(pane: str, pattern: str, shot: Shot | None = None) -> int:
-    """The number the bottom lines of the screen give in the pattern's group («· 2 shells» → 2); 0 — none."""
+def footer_lines(p: dict[str, Any], text: str) -> list[str]:
+    """The footer after a complete current editor and before its required context row."""
+    lines = SGR.sub("", text).splitlines()
+    at = max((i for i, line in enumerate(lines) if re.match(r" ?│ > ", line)), default=-1)
+    top = at - 1
+    bottom = next((i for i in range(at + 1, len(lines)) if re.fullmatch(r" ?╰─+╯ *", lines[i])), -1)
+    body = lines[at:bottom] if bottom > at else []
+    if (
+        at > 0
+        and bottom > at
+        and re.fullmatch(r" ?[╭├]─+[╮┤] *", lines[top])
+        and len(lines[top].rstrip()) == len(lines[bottom].rstrip())
+        and all(re.fullmatch(r" ?│ .*│ *", line) for line in body)
+    ):
+        below = lines[bottom + 1 :]
+        end = next((i for i, line in enumerate(below) if re.match(r"^\s*context:", line)), -1)
+        return below[:end] if end >= 0 else []
+    return []
+
+
+def screen_count(pane: str, pattern: str, shot: Shot | None = None, rules: dict[str, Any] | None = None) -> int:
+    """The number the current footer gives in the pattern's group («· 2 shells» → 2); 0 — none."""
     returncode, text = (shot.returncode, shot.plain) if shot else plain_capture(pane)
-    lines = [line.rstrip() for line in text.rstrip("\n").splitlines()[-args_tail() :]]
+    lines = (
+        footer_lines(rules, text)
+        if rules and rules.get("boxed_input")
+        else [line.rstrip() for line in text.rstrip("\n").splitlines()[-args_tail() :]]
+    )
     found = re.search(pattern, "\n".join(lines), re.MULTILINE) if returncode == 0 else None
     return int(found.group(1)) if found and found.group(1).isdigit() else 0
 
@@ -547,7 +906,8 @@ def screen_model(p: dict[str, Any], pane: str, shot: Shot | None = None) -> str:
     returncode, text = (shot.returncode, shot.plain) if shot else plain_capture(pane)
     # The last one: the footer is at the bottom, and a line of the talk above it may match too
     # («  Risk: low · ok» read as the model).
-    hits = list(re.finditer(p["model"], text, re.MULTILINE)) if returncode == 0 else []
+    area = "\n".join(footer_lines(p, text)) if p.get("boxed_input") else text
+    hits = list(re.finditer(p["model"], area, re.MULTILINE)) if returncode == 0 else []
     return hits[-1].group(1) if hits else ""
 
 
@@ -803,7 +1163,9 @@ def limit_of(limits: dict[str, Any], pid: str) -> dict[str, Any]:
     return {
         k: v
         for k, v in cast("dict[str, Any]", rec).items()
-        if (k in ("until", "over", "at") and number(v)) or (k == "line" and isinstance(v, str))
+        if (k in ("until", "over", "at") and number(v))
+        or (k in ("line", "quota_code", "quota_turn", "pane_pid") and isinstance(v, str))
+        or (k == "recovery" and isinstance(v, dict))
     }
 
 
@@ -838,9 +1200,87 @@ def agent_kind(p: dict[str, Any]) -> str:
     return p.get("kind") or ("claude" if "❯" in p.get("idle", "") else "codex" if "Ask Codex" in p.get("idle", "") else "")
 
 
+KIMI_QUOTA_CODE = "kimi-5h-quota"
+KIMI_QUOTA_LINE = "Kimi 5-hour usage limit exhausted; reset time unknown"
+KIMI_QUOTA_ERROR = re.compile(
+    r"^   Error: \[provider\.api_error\] 429 You[’']ve reached your 5-hour usage limit\."
+    r" Your quota will reset when the current 5-hour window ends\."
+    r"(?: To continue now, purchase extra usage or upgrade your plan:)?$"
+)
+
+
+def kimi_quota_screen(shot: Shot | None) -> tuple[str, str, set[str]]:
+    """Current visible native turn only. No history read; uncertain frames/quotes give no evidence.
+
+    The hashes identify visible user-turn boundaries without persisting their text. A reply is
+    recovery evidence only when the saved error's turn is visible before this later completed turn.
+    """
+    if not shot or shot.returncode or shot.scrolled or not footer_lines(PRESETS["kimi"], shot.stdout):
+        return "", "", set()
+    lines = shot.plain.splitlines()
+    editor = max((i for i, line in enumerate(lines) if re.match(r" ?│ > ", line)), default=-1) - 1
+    turns = [i for i, line in enumerate(lines[:editor]) if line.startswith(" ❯ ")]
+    if not turns:
+        return "", "", set()
+    errors: set[str] = set()
+    latest, latest_key = "", ""
+    for n, start in enumerate(turns):
+        end = turns[n + 1] if n + 1 < len(turns) else editor
+        body = [line.rstrip() for line in lines[start + 1 : end] if line.strip()]
+        key = hashlib.sha256(lines[start].encode("utf-8")).hexdigest()
+        # A completed response has a separate blank-delimited native marker. The failure path
+        # instead follows wrapped user-input rows directly (there need not be a blank separator).
+        separated = start + 1 < end and not lines[start + 1].strip()
+        # User prompts wrap onto indented rows before the native error. Any native response,
+        # tool event or quotation/code marker makes attribution ambiguous, so do not scan past it.
+        quota = bool(any(KIMI_QUOTA_ERROR.fullmatch(line) for line in body))
+        quota = quota and not any(re.match(r"^ ?[●✗]|^\s*[>│]|^\s*```", line) for line in body)
+        if not quota:
+            # A provider failure can terminate a turn after completed tool events. Require
+            # the native terminal help block, not an error quoted in an assistant reply.
+            markers = [i for i, line in enumerate(body) if re.match(r"^ [●✗] ", line)]
+            failures = [i for i, line in enumerate(body) if KIMI_QUOTA_ERROR.fullmatch(line)]
+            if markers and failures and markers[-1] < failures[-1]:
+                # Completed generic headers carry the tool's name, not a fixed list of tools.
+                # Todo-list reads and shell commands have their own completed wording.
+                tool = bool(
+                    re.match(
+                        r"^ [●✗] (?:(?:Used [A-Za-z][A-Za-z0-9_]*|Read TodoList)(?:$| \(| ·)|Ran a command(?:$| ·))",
+                        body[markers[-1]],
+                    )
+                )
+                tail = body[failures[-1] + 1 :]
+                unquoted = not any(re.match(r"^\s*(?:>|│|```)", line) for line in body[markers[-1] + 1 : failures[-1]])
+                quota = (
+                    tool
+                    and unquoted
+                    and tail
+                    == [
+                        " https://www.kimi.com/settings/subscription?tab=quota",
+                        "   If this persists, run `/export-debug-zip` and share the file with us for diagnosis. Please don't share it publicly.",
+                    ]
+                )
+        if quota:
+            errors.add(key)
+        if n + 1 == len(turns):
+            latest_key = key
+            if quota:
+                latest = "quota"
+            elif (
+                separated
+                and body
+                and re.match(r"^ ● (?!Ran a command|Bash\b|bash task\b|Task\b)\S", body[0])
+                and not any("Error: [provider.api_error]" in line or "```" in line for line in body)
+            ):
+                latest = "reply"
+    return latest, latest_key, errors
+
+
 def usage_limit(pane: str, kind: str = "", shot: Shot | None = None) -> str:
     """The agent's own «out of limit» line, if it is among the bottom lines of its screen; with its
     kind known, only that kind's notice counts."""
+    if kind == "kimi":
+        return KIMI_QUOTA_LINE if kimi_quota_screen(shot)[0] == "quota" else ""
     # Every notice LIMIT_RE takes says «limit»; on the tick's look, a wrapped one is cut by a line end.
     if shot and shot.returncode == 0 and "limit" not in shot.plain.replace("\n", "").lower():
         return ""
@@ -989,7 +1429,7 @@ def bind_claude_session(pid: str) -> None:
     data = m_store.read_config_raw()
     entry = next((p for p in data["participants"] if p["id"] == pid), None)
     # A Claude speaking under a Codex's id is not that Codex: bound, it would pass for the Codex lead's own session.
-    if entry is None or entry.get("claude_session") == sid or agent_kind(entry) == "codex":
+    if entry is None or entry.get("claude_session") == sid or agent_kind(entry) in ("codex", "kimi"):
         return
     entry["claude_session"] = sid
     m_store.write_config(data)

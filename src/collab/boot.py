@@ -262,7 +262,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.29"
+VERSION = "0.1.31"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:
@@ -551,6 +551,7 @@ else:
 # ── commands ───────────────────────────────────────────────────────────────────
 
 SELF = str(Path(__file__).resolve())
+PROGRAM_FILE = SELF
 
 
 TEMP_PREFIXES: tuple[str, ...] = tuple(os.environ.get("COLLAB_TEMP_PREFIXES", ":".join(TEMP_FOLDERS)).split(":"))

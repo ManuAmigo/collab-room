@@ -1,0 +1,36 @@
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                │
+ │  ▐█████▌  Send /help for help information.                                                     │
+ │                                                                                                │
+ │  Directory: /tmp/project                                                   │
+ │  Session:                                                                                      │
+ │  Model:     probe                                                                              │
+ │  Version:   2.4.1                                                                              │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+ ✦ Kimi K3.1 Pro is ready - use the model in a fresh session for the best results
+   Standard: Plus/Moderato and above; Highspeed: Pro/Allegretto and above
+
+   No session yet — one will be created on your first message.
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys on` to
+ ~/.tmux.conf and restart tmux.
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │ > Run the local probe command                                                                  │
+ │                                                                                                │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────╯
+ probe  /tmp/project                                       /model: switch model
+                                                                               context: 0% (0/256k)
+
+
+
+
+
+
+
+
+
+

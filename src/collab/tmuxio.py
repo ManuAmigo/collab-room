@@ -5,6 +5,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 import collab.text as m_text
 import collab.i18n as m_i18n
@@ -14,9 +15,21 @@ import collab.store as m_store
 VIEW_OF = "@collab_view_of"  # a view's mark (/open): the session of the room whose window it shows
 
 
-def session_room(session: str) -> str:
+def session_room(session: str, deadline: float | None = None) -> str:
     """The real path of the room a running tmux session was started for ("" — not marked: older)."""
-    r = tmux("show-options", "-v", "-t", f"={session}:", "@collab_root", check=False)
+    if deadline is not None and time.monotonic() >= deadline:
+        return ""
+    r = tmux(
+        "show-options",
+        "-v",
+        "-t",
+        f"={session}:",
+        "@collab_root",
+        check=False,
+        timeout=None if deadline is None else deadline - time.monotonic(),
+    )
+    if deadline is not None and time.monotonic() >= deadline:
+        return ""
     return (r.stdout or "").strip() if r.returncode == 0 else ""
 
 
@@ -98,11 +111,12 @@ def tmux_install_hint() -> str:
     return "install Homebrew first (the one-line command on https://brew.sh), then: brew install tmux"
 
 
-def tmux(*argv: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def tmux(*argv: str, check: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     """A tmux command, never waiting forever: typing into a scrolled window without a client hung
     tmux — and the deliverer with it."""
     try:
-        r = subprocess.run([TMUX, *argv], text=True, capture_output=True, timeout=TMUX_TIMEOUT)
+        limit = TMUX_TIMEOUT if timeout is None else min(TMUX_TIMEOUT, max(0.001, timeout))
+        r = subprocess.run([TMUX, *argv], text=True, capture_output=True, timeout=limit)
     except FileNotFoundError:
         # No tmux at all: pause, resume and stop died with a traceback. Asked in
         # passing, it is «no room running»; needed, it is one line saying what to install.

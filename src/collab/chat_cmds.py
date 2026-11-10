@@ -49,6 +49,9 @@ def chat_wizard_back(ctx: m_chat_wizard.ChatCommandContext) -> None:
         if m_chat_wizard.offer_team(m_store.load_config()):
             m_chat_wizard.open_scenarios(ctx)  # as «Skip for now» does: a new room's question comes next
         return
+    if ctx.wizard.get("step") == "install_running":
+        ctx.wizard["cancel"].set()
+        ctx.wizard["install_result"]["cancel_requested"] = True
     ctx.wizard.clear()
     if back:
         ctx.wizard.update(back[-1])
@@ -131,7 +134,7 @@ def chat_submit(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
 # The menu with nothing counted yet; /clear, /stop and /exit close it whatever the counts (menu_order).
 MENU_COMMANDS = (
     "/open", "/dm", "/mine", "/answer", "/view", "/team", "/restart", "/add", "/pause", "/resume", "/rest",
-    "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/language", "/clear", "/stop", "/exit",
+    "/help", "/mute", "/unmute", "/unlimit", "/name", "/remove", "/telegram", "/vpn", "/language", "/clear", "/stop", "/exit",
 )  # fmt: skip
 MENU_LAST = ("/clear", "/stop", "/exit")
 
@@ -160,6 +163,7 @@ def chat_handle(ctx: m_chat_wizard.ChatCommandContext, line: str) -> None:
             "/add",
             "/team",
             "/telegram",
+            "/vpn",
             "/language",
             "/remove",
             "/stop",

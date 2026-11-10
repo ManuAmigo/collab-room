@@ -42,7 +42,7 @@ but does not delete the room or stop the agents.
 The `collab` examples below show subcommands and arguments. To communicate, an agent
 copies the whole prefix from the delivery: interpreter, flags and CLI path. A room-managed Codex
 may receive an absolute interpreter with `-I -S` and a restricted copy; that copy supports
-only say/ack/inbox, and the lead's propose/goal. Other permitted actions use the regular CLI
+only say/take/ack/inbox, and the lead's propose/goal. Other permitted actions use the regular CLI
 with the normal approval. Do not remove `-I -S` and do not replace the path with a short PATH alias.
 
 An agent selects the room explicitly, with `--room` after the subcommand:
@@ -197,8 +197,8 @@ proves that a task is progressing; do not present the animation as confirmation 
 - The author and recipients are shown in the block's header. Do not repeat signatures
   (`[Codex]`, `[Claude]`) or `To: …` in the text: routing is set by the `from`/`to` fields,
   not by words in the message.
-- `inbox` shows addressed messages not yet marked through `ack` or a successful reply with `--re`; `watch` shows new ones. A plain `collab ack --for codex --id MESSAGE_ID` means "read", not task completion, and does not clear the expected reply.
-- A reply to a message is sent with `collab say --from codex --to <author> --re MESSAGE_ID 'reply'`. `--re` links the reply to a specific message and clears the expected reply only for the replying participant. If the original message was addressed to them personally or through `all`, a successful reply also marks it read in their inbox: no separate `ack` is needed. A reply to a message addressed only to others does not change read marks. Other messages and the other recipients' inboxes are not affected. A reply held by a room pause is not yet sent: the output `Held` is not `Queued`. A reply only in the agent's window is not forwarded to the room.
+- `inbox` shows addressed messages not yet marked through `ack` or a successful reply with `--re`; `watch` shows new ones. Notes that wake no one (quiet ones — «Taking» — and the room's own, such as the merge queue's) come last, a line each under «Notices», and are marked read as shown: they need neither `ack` nor an answer. A plain `collab ack --for codex --id MESSAGE_ID` means "read", not task completion, and does not clear the expected reply.
+- A reply to a message is sent with `collab say --from codex --to <author> --re MESSAGE_ID 'reply'`. `--re` links the reply to a specific message and clears the expected reply only for the replying participant. If the original message was addressed to them personally or through `all`, a successful reply also marks it read in their inbox: no separate `ack` is needed. A reply to a message addressed only to others does not change read marks. Other messages and the other recipients' inboxes are not affected. A `say` to one participant by name without `--re` (not to `all`, not `--quiet`) answers the one message from them still open for the sender — not read, answered or closed — as `--re` would; with several open it closes none and lists their ids. A `say` held by a pause is matched so when it goes out. A message to `all` without `--re` answers nothing. A reply held by a room pause is not yet sent: the output `Held` is not `Queued`. A reply only in the agent's window is not forwarded to the room.
 - If no reply is needed (for example, to a thank-you), the participant runs `collab ack --for codex --no-reply --id MESSAGE_ID`: this clears the expected reply without a message in the feed. This mark must not be used instead of answering a question or finishing an incomplete task. Commands use the participant's own ID and the original message's ID.
 - An agent does not receive its own messages. Unsigned messages under the person's name are shown in their chat with a marker. A reply and a task's completion are separate messages.
 
@@ -280,8 +280,8 @@ the ready commands under each of an agent's messages. A command is never cut sho
 even the `inbox` command does not fit, the message is not typed, and its sender is told the room's path is too long. The
 same rule is in each agent's assignment, which it receives at start.
 
-A service message that expects no reply is written with `say --quiet`: «Taking», «machine is free»,
-«done checking». Such a message does not wake the agent. It sits in its `inbox` and goes to the window together
+A service message that expects no reply is written with `say --quiet`: «machine is free», «done checking»;
+«Taking» goes by its own command, `collab take --from <id> '<task, files>'`, which marks it so. Such a message does not wake the agent. It sits in its `inbox` and goes to the window together
 with the next regular message, as one summary. Every wake-up rereads the agent's whole context.
 A reply (`--re`) is never quiet: `say` refuses. Programs that write to the room themselves may put this mark
 on their notifications. The mark is a field of the record, not words
@@ -297,7 +297,9 @@ wake. Only a Claude: a Codex keeps its conversation (the room finds it by its co
 
 A ready team's «clear» memory is `{"do": "clear", "after": "handoff"}`: once the agent has handed in its work — its
 answer (`say --re`) to a task from whom it reports to — it is given `/clear` at its next idle moment, if it owes no
-answer; a note on the way is not handing in. «Compact» goes by a threshold.
+answer; a note on the way is not handing in, nor is a `say` without `--re` that closed the task's message by itself: that message still keeps `/clear` away until it is answered with `--re` or closed with `--no-reply`. «Compact» goes by a threshold.
+
+A message to an agent by name that it has neither answered (`say --re`) nor closed (`ack --no-reply`) for `open_minutes` (in `.collab.json`, 30 by default) is open: `collab status` and `/team` show «open: N, the oldest M min»; the next message typed to the agent ends with their ids; an idle agent with nothing to be typed is told once for each. Only its current context counts — since the last `/clear` the room gave it, within a day.
 
 A room can also cut a long context: `"context_trim": {"at": 150000, "do": "compact"}` in `.collab.json`; `false` in
 the room or the agent — never. The built-in one is off for now. A Codex is off whatever they say: its `/clear` starts
@@ -427,7 +429,7 @@ answering each other without the person can spend more than the work itself.
 - Write to another agent only when the work cannot go on without it. With a team, tasks come from the
   coordinator; the others report to it, not to each other.
 - One task — one message: the goal, the files, what to send back. Then three reports at most:
-  «Taking», «for review», «Merged» (with what is not proven). «Taking» and other notices — `say --quiet`.
+  «Taking», «for review», «Merged» (with what is not proven). «Taking» — `collab take`; other notices — `say --quiet`.
   So is «Merged» or «done» that asks nothing: the merge queue's own note already tells the person, and the
   coordinator reads the report in its `inbox` with its next message. A report that needs a decision wakes.
 - No «got it», «thanks», «agreed»: `ack --no-reply`. No retelling of what the recipient can read: give
@@ -437,9 +439,9 @@ answering each other without the person can spend more than the work itself.
 
 ## Work ownership
 
-Before changing shared files, a participant posts `Taking: <task or files>` (with `say --quiet`: «Taking» gets no reply). Another participant does not start the same work until the owner releases it or the team reassigns the task. A question addressed to a specific role does not require duplicate replies from the others; the address `all` means a reply is expected from the team.
+Before changing shared files, a participant runs `collab take --from <own id> '<task or files>'`: it posts `Taking: …` to everyone as a note that wakes no one («Taking» gets no reply). Another participant does not start the same work until the owner releases it or the team reassigns the task. A question addressed to a specific role does not require duplicate replies from the others; the address `all` means a reply is expected from the team.
 
-Together with «Taking», run `collab task take <id> --as <own id> --kind <kind> [--lane A|B|C] [--by <who assigned it>]`; together with «Merged» or «done», run `collab task done <id> --as <own id> [--commit <hash>]`. This way the room knows which task a participant is on, and token usage is counted per task. The id is any short task name: `4.2`, `T1`, `fix-12`. The kind is one of: refactor, fix, review, diagnosis, research, tests, docs, coordination. A participant has one current task: a second-opinion check in the middle of one's own work is also a `take`, and one's own task is then put aside, not finished. To see who is doing what: `collab task show`. Codex agents replying through the restricted copy do not have this command: the coordinator sets their task — `collab task take <id> --as <Codex id> --kind <kind> --by <own id>`.
+Together with «Taking», take the task: `collab take --from <own id> --task <id> --kind <kind> [--lane A|B|C] [--by <who assigned it>] '<task or files>'`, or `collab task take <id> --as <own id> --kind <kind> …` alone; together with «Merged» or «done», run `collab task done <id> --as <own id> [--commit <hash>]`. This way the room knows which task a participant is on, and token usage is counted per task. The id is any short task name: `4.2`, `T1`, `fix-12`. The kind is one of: refactor, fix, review, diagnosis, research, tests, docs, coordination. A participant has one current task: a second-opinion check in the middle of one's own work is also a `take`, and one's own task is then put aside, not finished. To see who is doing what: `collab task show`. Codex agents replying through the restricted copy have `take` but not `task`: the coordinator sets their task otherwise — `collab task take <id> --as <Codex id> --kind <kind> --by <own id>`.
 
 ## Completion and the Git summary
 

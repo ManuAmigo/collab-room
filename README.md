@@ -1,6 +1,6 @@
 # collab-room
 
-A local chat room for one person and several AI coding agents — Claude Code, Codex, and other
+A local chat room for one person and several AI coding agents — Claude Code, Codex, Kimi, and other
 terminal agents — working on the same project. You talk to all of them from one chat instead of
 copy-pasting between terminals, and the agents claim files before editing them, so they do not
 step on each other's work.
@@ -24,8 +24,8 @@ the agents' terminals, your chat and a delivery process. There is no server and 
 
 ## Requirements
 
-- **macOS** is the main platform. **Linux** is supported: the full test suite runs on Linux and
-  macOS in CI, and the installer knows `apt` and `dnf`. Windows is not supported.
+- **macOS** is the main platform, where the full test suite runs. **Linux** is not currently
+  verified. Windows is not supported.
 - **Python 3.11 or later**, standard library only. You can start `collab install` with an older
   `python3`: it finds a 3.11+ installation, or offers to install one (asking first; this may ask for
   your system password), and records it. After that, `collab` started by an older `python3` hands
@@ -46,7 +46,10 @@ the agents' terminals, your chat and a delivery process. There is no server and 
     and complete the browser sign-in. See [Codex CLI setup](https://developers.openai.com/codex/cli/)
     and [Codex authentication](https://learn.chatgpt.com/docs/auth).
 
-`/add` starts Claude Code and Codex. Other CLI agents need a hand-written configuration; see
+  - **Kimi Code CLI:** install and sign in following the [official guide](https://moonshotai.github.io/kimi-code/en/guides/getting-started).
+    Run `kimi` once in your project to complete login and folder trust, then choose Kimi in `/add`.
+
+`/add` starts Claude Code, Codex and Kimi Code CLI. Other CLI agents need a hand-written configuration; see
 [docs/integrations.md](docs/integrations.md#manual-configuration).
 
 ## Install
@@ -67,7 +70,8 @@ create. It also:
 - installs the Claude Code plugin (status hooks and the `/collab` skill) if `claude` is found, and
   the Codex skill if `codex` is found;
 - asks once whether Codex agents started by a room may answer in that room without asking you each
-  time. The permission covers only `collab say`, `ack` and `inbox`, for that room and that agent's
+  time. The permission covers only `collab say`, `take`, `ack` and `inbox` (and the lead's
+  `propose` and `goal`), for that room and that agent's
   own id; your project's permissions do not change. You can change your answer later with
   `collab install --codex-room-commands` or `--no-codex-room-commands`.
 
@@ -188,6 +192,12 @@ a room to an account). In Telegram the lead's question is marked as one, an agen
 window is named, and the room's pause is said; `collab telegram limit N` — past N tokens in a day, the room's
 topic gets one line a day with the spend by agent (a notice; delivery goes on).
 
+While Telegram is off, new messages are not forwarded. Turning it back on starts at the current log tail
+and records how many messages were skipped. Long messages use a preview of at most 4000 characters,
+with `collab show` for the full original. A permanent message rejection is recorded in the room and
+does not block later messages; rate limits and temporary network or server failures are retried.
+An HTTP request already in progress when you turn it off can still finish.
+
 ## Agent statuses
 
 The bar above the input shows one cell per agent: its name, model, state, and how long it has been
@@ -307,6 +317,44 @@ Agents are never touched.
   duplicates, recovery after an agent restarts, interactive Codex setup, installing the plugin from a
   published marketplace, and Codex idle detection across CLI versions. There is no hosted service
   and no installation package.
+
+## Optional network-only VPN on macOS
+
+A room can run its Codex and Claude Code agents through a local sing-box proxy.
+In the chat menu, choose `/vpn` to see its state or turn it on or off. The first
+enable performs setup; a missing or invalid account file is reported in the chat.
+Turning it off stops protected agents in all enabled rooms of the same user.
+The menu also shows running Codex/Claude agents without confirmed VPN and asks you
+to restart them with `/restart`. Checks and setup run in the background, so the chat
+stays usable while they wait; closing the menu does not cancel a request already started.
+The same controls are available from a terminal:
+
+```sh
+collab vpn setup
+collab vpn status
+collab vpn off
+collab vpn on
+```
+
+Setup requires an active private VLESS WebSocket account at
+`~/.config/collab-vpn/agents.json`, in a directory with mode 0700 and a file with mode
+0600. It downloads a pinned official sing-box release and passes the account through a
+pipe. Each proxy generation requires fresh random local credentials, supplied to agent
+proxy environment variables through the private control socket; they are not included
+in status output. This restricts proxy clients, not ownership of the local port.
+The transport check contacts `api.ipify.org` through the proxy.
+
+The setting applies to subsequent agent launches in this room; restart existing agents
+to apply it. A proxy is shared by enabled rooms for the same macOS user, so on/off affects
+those rooms together. A proxy restart ends the agents of its previous generation.
+
+The wrapper restricts network sockets and leaves file permissions unchanged. For these
+launches Codex uses `--dangerously-bypass-approvals-and-sandbox`; its configuration stays
+unchanged. Claude keeps its normal launch options. Local IPC needed by other tools may
+be refused. This mode provides no general isolation from other processes of your OS
+account. Verification covers the original process group; detached descendants and IPC
+workarounds require separate review. An unconfirmed shutdown blocks another supervisor
+start until its state has been checked.
 
 ## Contributing
 

@@ -127,9 +127,11 @@ Agents outside tmux cannot be viewed, answered or opened.
 
 In a Codex terminal opened with `/open` or `/answer`, the mouse wheel scrolls tmux history instead
 of recalling old messages into Codex's input. Press **q** to leave scrollback before typing or
-before Ctrl+] to return. Mouse selection there is tmux's; copying to the system clipboard depends
-on your terminal. Text selection in the room chat is unchanged. A Codex started or restarted by the
-room keeps its full output; an existing fullscreen Codex has only the history its pane saved.
+before Ctrl+] to return. Dragging selects text in tmux; releasing copies it to tmux's buffer and to
+the system clipboard when `COLLAB_CLIPBOARD`, `pbcopy`, `wl-copy` or `xclip` is available. Without a
+clipboard command, the selection remains in tmux's buffer. Text selection in the room chat is
+unchanged. A Codex started or restarted by the room keeps its full output; an existing fullscreen
+Codex has only the history its pane saved.
 
 ## /mine
 
