@@ -5678,6 +5678,118 @@ class RoomTest(Base):
             self.assertEqual(mod.agent_session({**p, "id": "kodi3"}), "", "asked no one by that id")
             self.assertEqual(mod.agent_session({**p, "join_code": "0000"}), "", "another code is another check")
 
+    def test_codex_session_finds_the_current_process_check_in_a_large_rollout_middle(self):
+        from types import SimpleNamespace
+
+        mod = _Loader("collab_large_session", str(COLLAB)).load_module()
+        sid = "01a14da8-636e-7f72-b641-4efd93e5f7e8"
+        home = self.root / "large-codex"
+        logs = home / "sessions"
+        logs.mkdir(parents=True)
+        path = logs / f"rollout-{sid}.jsonl"
+        header = json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": str(self.root)}}) + "\n"
+        padding = (
+            json.dumps({"type": "event_msg", "payload": {"type": "token_count", "padding": "я" * 500_000}}, ensure_ascii=False)
+            + "\n"
+        )
+        check = (
+            json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": '[room → probe] 09:17\n  Connection check: reply in the room with "connected f302".',
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        with path.open("w", encoding="utf-8") as stream:
+            stream.write(header)
+            for _ in range(46):
+                stream.write(padding)
+            stream.write(check)
+            for _ in range(46):
+                stream.write(padding)
+        participant = {
+            "id": "probe",
+            "kind": "codex",
+            "folder": str(self.root),
+            "join_code": "f302",
+            "joined_at": mod.now(),
+            "target": "%1",
+            "pane_pid": "1234",
+        }
+        read_open, read_sizes = Path.open, []
+
+        def measured_open(file, *args, **kwargs):
+            stream = read_open(file, *args, **kwargs)
+            proxy = mock.MagicMock(wraps=stream)
+            proxy.__enter__.return_value = proxy
+            proxy.__exit__.side_effect = stream.__exit__
+
+            def measured(method, amount):
+                data = method(amount)
+                read_sizes.append(len(data))
+                return data
+
+            proxy.read.side_effect = lambda amount: measured(stream.read, amount)
+            proxy.readline.side_effect = lambda amount: measured(stream.readline, amount)
+            return proxy
+
+        with (
+            mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}),
+            seam(mod, "tmuxio.tmux", lambda *_a, **_kw: SimpleNamespace(returncode=0, stdout="1234\n")),
+            seam(mod, "screen.subprocess.run", lambda *_a, **_kw: SimpleNamespace(returncode=0, stdout=f"p1234\nn{path}\n")),
+            seam(mod, "screen.Path.open", measured_open),
+        ):
+            self.assertEqual(mod.agent_session(participant), sid)
+            self.assertLessEqual(max(read_sizes), 1_000_000)
+            self.assertEqual(mod.agent_session({**participant, "pane_pid": "9999"}), "")
+            read_sizes.clear()
+            self.assertEqual(mod.agent_session({**participant, "join_code": "0000"}), "")
+            self.assertLessEqual(max(read_sizes), 1_000_000)
+        # An early check remains reachable after the session grows.
+        with path.open("w", encoding="utf-8") as stream:
+            stream.write(header + check)
+            for _ in range(92):
+                stream.write(padding)
+        with (
+            mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}),
+            seam(mod, "tmuxio.tmux", lambda *_a, **_kw: SimpleNamespace(returncode=0, stdout="1234\n")),
+            seam(mod, "screen.subprocess.run", lambda *_a, **_kw: SimpleNamespace(returncode=0, stdout=f"p1234\nn{path}\n")),
+        ):
+            self.assertEqual(mod.agent_session(participant), sid)
+
+    def test_reverse_codex_records_keep_whole_utf8_records_and_bounded_memory(self):
+        import io
+
+        mod = _Loader("collab_reverse_records", str(COLLAB)).load_module()
+        record = json.dumps({"text": "я" * 600_000 + "f302"}, ensure_ascii=False).encode()
+        self.assertEqual(
+            list(mod.codex_session_records(io.BytesIO(record + b"\n{}\n"), 0, time.monotonic() + 2, b"f302")), [record]
+        )
+        small = b'{"text":"f302"}'
+        oversized = b"f302" + b"x" * 20_000_000
+        stream = io.BytesIO(small + b"\n" + oversized + b"\n{}\n")
+        self.assertEqual(list(mod.codex_session_records(stream, 0, time.monotonic() + 2, b"f302")), [small])
+
+    def test_reverse_codex_records_refuse_a_read_that_exhausts_the_deadline(self):
+        import io
+
+        mod = _Loader("collab_reverse_deadline", str(COLLAB)).load_module()
+        clock = [0.0]
+
+        class SlowRead(io.BytesIO):
+            def read(self, size=-1):
+                data = super().read(size)
+                clock[0] = 3.0
+                return data
+
+        with seam(mod, "screen.time.monotonic", lambda: clock[0]):
+            self.assertEqual(list(mod.codex_session_records(SlowRead(b'{"text":"f302"}\n'), 0, 2.0, b"f302")), [])
+
     def test_a_new_agents_id_spells_its_name(self):
         # «Яна» got the id «ana» — я, ю lost their «y»; ь, ъ became «_».
         mod = _Loader("collab_slug", str(COLLAB)).load_module()

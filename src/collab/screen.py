@@ -11,7 +11,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence, cast
+from typing import Any, BinaryIO, Callable, Iterator, Sequence, cast
 import collab.text as m_text
 import collab.i18n as m_i18n
 import collab.store as m_store
@@ -225,8 +225,9 @@ def agent_session(p: dict[str, Any]) -> str:
     since = m_text.at_time(p.get("joined_at", "")) - 60
     logs = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser() / "sessions"
     deadline = time.monotonic() + 2
+    process_bound = bool(p.get("target") and p.get("pane_pid"))
     try:
-        if p.get("target") and p.get("pane_pid"):
+        if process_bound:
             # The current process's open rollout is stronger than hints in another log.
             current = m_tmuxio.tmux("display-message", "-p", "-t", p["target"], "#{pane_pid}", check=False)
             if current.returncode or current.stdout.strip() != str(p["pane_pid"]) or not str(p["pane_pid"]).isdigit():
@@ -273,24 +274,29 @@ def agent_session(p: dict[str, Any]) -> str:
         if time.monotonic() > deadline or budget <= 0:
             return ""
         try:
-            with f.open(encoding="utf-8", errors="replace") as fh:
-                header = fh.readline(65_537)
+            with f.open("rb") as fh:
+                header = fh.readline(min(65_537, budget))
+                budget -= len(header)
                 if len(header) > 65_536:
                     continue
-                first = json.loads(header)
+                first = json.loads(header.decode("utf-8", errors="replace"))
                 meta: dict[str, Any] = first.get("payload") or {}
                 if first.get("type") != "session_meta" or os.path.realpath(str(meta.get("cwd", ""))) != folder:
                     continue
                 sid = str(meta.get("id", ""))
                 if not SESSION_ID.fullmatch(sid):
                     continue
-                text = fh.read(budget)
-                budget -= len(header) + len(text)
-                for line in text.splitlines():
+                if process_bound:
+                    records = codex_session_records(fh, fh.tell(), deadline, str(p["join_code"]).encode())
+                else:
+                    text = fh.read(budget)
+                    budget -= len(text)
+                    records = iter(text.split(b"\n"))
+                for line in records:
                     if time.monotonic() > deadline:
                         return ""
                     try:
-                        record = json.loads(line)
+                        record = json.loads(line.decode("utf-8", errors="replace"))
                     except ValueError:
                         continue
                     for content, tool in codex_check_texts(record):
@@ -307,7 +313,39 @@ def agent_session(p: dict[str, Any]) -> str:
                         break
         except (OSError, ValueError, AttributeError):
             continue
-    return next(iter(matches)) if len(matches) == 1 else ""
+    return next(iter(matches)) if len(matches) == 1 and time.monotonic() <= deadline else ""
+
+
+def codex_session_records(fh: BinaryIO, begin: int, deadline: float, marker: bytes) -> Iterator[bytes]:
+    """Read complete candidate records backwards, with bounded blocks and partial-record memory."""
+    position = fh.seek(0, os.SEEK_END)
+    carry = b""
+    dropping = False
+    while position > begin:
+        if time.monotonic() > deadline:
+            return
+        size = min(1_000_000, position - begin)
+        position -= size
+        fh.seek(position)
+        chunk = fh.read(size)
+        if time.monotonic() > deadline:
+            return
+        if dropping:
+            boundary = chunk.rfind(b"\n")
+            if boundary < 0:
+                continue
+            chunk = chunk[: boundary + 1]
+            dropping = False
+        lines = (chunk + carry).split(b"\n")
+        carry = lines.pop(0)
+        if len(carry) > 20_000_000:
+            carry = b""
+            dropping = True  # Never parse a fragment of an oversized record as a new record.
+        for line in reversed(lines):
+            if len(line) <= 20_000_000 and marker in line:
+                yield line
+    if not dropping and marker in carry:
+        yield carry
 
 
 def codex_check_texts(record: Any) -> list[tuple[str, bool]]:

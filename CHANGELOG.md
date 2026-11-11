@@ -2,6 +2,10 @@
 
 What each release brings. Newest first. · Что приносит каждый выпуск, новые сверху.
 
+## 0.1.33
+
+- `/restart` can confirm a running Codex conversation even when its session log has grown large. The search stays tied to the current process and conversation, with bounded memory and a time limit. · `/restart` подтверждает текущий разговор Codex и при большом журнале сессии. Поиск остаётся привязан к текущему процессу и разговору, с ограничением памяти и времени.
+
 ## 0.1.32
 
 - Configure agent VPN in `/vpn` by pasting a private `vless://` link into hidden input. Links are validated and saved atomically with private permissions; supported Marzban account files keep working. · Настройте VPN агентов в `/vpn`, вставив приватную ссылку `vless://` в скрытое поле. Ссылка проверяется и сохраняется атомарно с приватными правами; поддерживаемые файлы учёток Marzban продолжают работать.
