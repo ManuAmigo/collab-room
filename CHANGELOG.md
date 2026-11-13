@@ -2,6 +2,12 @@
 
 What each release brings. Newest first. · Что приносит каждый выпуск, новые сверху.
 
+## 0.1.34
+
+- Turning agent VPN off also disables VPN for subsequent agent launches in the current room after protected agents stop. · Выключение VPN агентов после их остановки также отключает VPN для следующих запусков агентов в текущей комнате.
+- `/restart` can resume a confirmed Codex or Claude conversation when its agent window has disappeared. A lost window without a confirmed conversation requires an explicit choice before starting a new one. · `/restart` может продолжить подтверждённый разговор Codex или Claude после исчезновения окна агента. Для пропавшего окна без подтверждённого разговора запуск нового требует явного выбора.
+- A limited `inbox` reports how many older messages were omitted and prints a command to include them, preserving the recipient and `--all`. · `inbox` с ограничением количества сообщает, сколько старых писем не показано, и печатает команду для их чтения с сохранением адресата и `--all`.
+
 ## 0.1.33
 
 - `/restart` can confirm a running Codex conversation even when its session log has grown large. The search stays tied to the current process and conversation, with bounded memory and a time limit. · `/restart` подтверждает текущий разговор Codex и при большом журнале сессии. Поиск остаётся привязан к текущему процессу и разговору, с ограничением памяти и времени.

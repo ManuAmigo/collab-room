@@ -13,6 +13,20 @@ LANGS = ("en", "ru")
 LANG_NAMES = {"en": "English", "ru": "Русский"}
 
 CATALOG: dict[str, dict[str, Any]] = {
+    "t.e200b6162c": {"en": "Starting a new conversation for {p0}.", "ru": "Запускается новый разговор для {p0}."},
+    "t.db41ce55d9": {
+        "en": "The agent changed. Choose it again in /restart.",
+        "ru": "Агент изменился. Выберите его заново в /restart.",
+    },
+    "t.8cbdc5508a": {"en": "Yes, start a new conversation", "ru": "Да, начать новый разговор"},
+    "t.d826a159fc": {
+        "en": "{p0}: no confirmed conversation was found. Start a new conversation? The previous conversation will not be resumed.",
+        "ru": "{p0}: подтверждённый разговор не найден. Начать новый разговор? Прежний разговор не будет продолжен.",
+    },
+    "t.823489391d": {
+        "en": "Showing the latest {shown} of {total} messages; {older} older messages are not shown. To include them, repeat with:\n{command}\n--all includes acknowledged messages; --limit still applies.",
+        "ru": "Показаны последние {shown} из {total} сообщений; ещё {older} старых сообщений не показаны. Чтобы включить их, повторите команду:\n{command}\n--all включает прочитанные сообщения; --limit продолжает действовать.",
+    },
     "t.ab86c4ef03": {
         "en": "VPN supervisor uses a different account file. Turn VPN off and on in /vpn, then retry the change.",
         "ru": "Служба VPN использует другой файл учётки. Выключите и включите VPN в /vpn, затем повторите смену.",
@@ -160,9 +174,9 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "Turn agent VPN off (stops protected agents)",
         "ru": "Выключить VPN агентов (защищённые агенты остановятся)",
     },
-    "t.c2e1df7db6": {
-        "en": "Agent VPN is off. Protected agents are stopped.",
-        "ru": "VPN агентов выключен. Защищённые агенты остановлены.",
+    "t.91481e5a6e": {
+        "en": "Agent VPN is off. Protected agents are stopped. New agents in this room will start without VPN.",
+        "ru": "VPN агентов выключен. Защищённые агенты остановлены. Новые агенты этой комнаты будут запускаться без VPN.",
     },
     "t.799eb08bda": {
         "en": "Agent VPN did not become ready. Protected agents remain blocked.",

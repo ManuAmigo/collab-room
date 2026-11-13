@@ -34,17 +34,18 @@ class ChatVpnTest(LedgerRoom):
             time.sleep(0.005)
         self.assertNotEqual(self.ctx.wizard.get("step"), "install_running", "menu work did not finish")
 
-    def test_menu_sets_up_once_then_toggles_without_restarting_agents(self):
+    def test_menu_disables_room_then_sets_up_again_without_restarting_agents(self):
         actions = []
         status = {"actual": "off", "room_enabled": False}
 
         def action(verb):
             actions.append(verb)
             if verb == "setup":
-                self.mod.mac_vpn_record_setup()
+                self.mod.mac_vpn_record_enabled(True)
                 status.update(actual="ready", room_enabled=True, restart_required=True)
             elif verb == "off":
-                status.update(actual="off")
+                self.mod.mac_vpn_record_enabled(False)
+                status.update(actual="off", room_enabled=False)
             elif verb == "on":
                 status.update(actual="ready", restart_required=False)
             return dict(status)
@@ -59,10 +60,15 @@ class ChatVpnTest(LedgerRoom):
             self.assertIn("restart", " ".join(self.said).lower())
             self.step("/vpn")
             self.assertIn("running", self.ctx.wizard.get("prompt", ""))
+            self.assertTrue(
+                any("stops protected agents" in label for label, value in self.ctx.wizard["options"] if value == "off")
+            )
             self.step("off")
+            self.assertFalse(self.mod.load_config()["macos_vpn"])
+            self.assertIn("without VPN", " ".join(self.said))
             self.step("/vpn")
             self.step("on")
-        self.assertEqual(actions, ["status", "setup", "status", "off", "status", "on"])
+        self.assertEqual(actions, ["status", "setup", "status", "off", "status", "setup"])
         self.assertFalse(self.ctx.wizard)
 
     def test_first_enable_without_account_is_a_clear_refusal_not_a_download(self):

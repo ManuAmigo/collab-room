@@ -460,7 +460,7 @@ chmod +x "$KIMI_INSTALL_DIR/bin/kimi"
     def test_exited_worker_descendant_and_object_schema_do_not_block_or_pass(self):
         cases = {
             "stderr_descendant": "import os,time;pid=os.fork();time.sleep(.1) if pid==0 else None;os.close(1);time.sleep(60) if pid==0 else None",
-            "dict_schema": 'print(\'{"ok":null,"detail":null}\',flush=True)',
+            "dict_schema": 'import time;time.sleep(.25);print(\'{"ok":null,"detail":null}\',flush=True)',
         }
         for mode, code in cases.items():
             with self.subTest(mode=mode):
@@ -483,17 +483,17 @@ chmod +x "$KIMI_INSTALL_DIR/bin/kimi"
                         outcome.append((type(exc), str(exc)))
 
                 with seam(self.mod, "agents.AGENT_DOWNLOAD_BOOTSTRAP", code):
-                    with seam(self.mod, "agents.AGENT_CLI_DOWNLOAD_TIMEOUT", 0.2):
-                        with seam(self.mod, "agents.subprocess.Popen", tracked_popen):
-                            worker = threading.Thread(target=work)
-                            worker.start()
-                            try:
-                                worker.join(0.7)
-                                self.assertFalse(worker.is_alive())
-                            finally:
-                                for process in processes:
-                                    self.mod.stop_installer(process)
-                                worker.join(3)
+                    # Keep the protocol assertion independent of startup; the outer join still bounds failure.
+                    with seam(self.mod, "agents.subprocess.Popen", tracked_popen):
+                        worker = threading.Thread(target=work)
+                        worker.start()
+                        try:
+                            worker.join(0.7)
+                            self.assertFalse(worker.is_alive())
+                        finally:
+                            for process in processes:
+                                self.mod.stop_installer(process)
+                            worker.join(3)
                 self.assertFalse(worker.is_alive())
                 self.assertTrue(processes)
                 self.assertTrue(all(process.poll() is not None for process in processes))

@@ -1533,32 +1533,56 @@ def send_briefs(config: dict[str, Any]) -> None:
         m_store.write_json(brief_path(), state)
 
 
-_WINDOW_SESSION_SEEN: dict[str, float] = {}
+_WINDOW_SESSION_SEEN: dict[str, tuple[dict[str, Any], float]] = {}
 
 
 @m_store.room_locked
-def remember_window_session(p: dict[str, Any], pane: str) -> None:
-    """While a Claude runs in a window delivery types into, keep the session its window's process
-    records — what /restart continues once the process is gone, and where its spending is read. Any
-    Claude in the room's tmux, not only one /add started: `init`'s example seats are opened by `start`,
-    and their spending went uncounted. Read at most every minute."""
-    if time.time() - _WINDOW_SESSION_SEEN.get(p["id"], 0) < 60:
-        return
-    _WINDOW_SESSION_SEEN[p["id"]] = time.time()
-    sid = m_screen.claude_of_window(Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser(), pane)
-    if not m_screen.SESSION_ID.fullmatch(sid) or sid == p.get("window_session"):
-        return
+def record_window_session(p: dict[str, Any], sid: str) -> None:
     data = m_store.read_config_raw()
     for q in data["participants"]:
-        if q["id"] == p["id"]:
-            q["window_session"] = sid
+        if q["id"] == p["id"] and m_screen.session_generation(q) == m_screen.session_generation(p):
+            if m_screen.agent_kind(p) == "claude":
+                q["window_session"] = sid
+            if p.get("started_by_room") and p.get("join_code"):
+                q["confirmed_session"] = {"session_id": sid, "generation": m_screen.session_generation(p)}
     m_store.write_config(data)
+
+
+def remember_window_session(p: dict[str, Any], pane: str) -> None:
+    """Keep a live process's conversation once a minute; do slow discovery outside the room lock."""
+    generation = m_screen.session_generation(p)
+    seen, at = _WINDOW_SESSION_SEEN.get(p["id"], ({}, 0))
+    if seen == generation and time.time() - at < 60:
+        return
+    _WINDOW_SESSION_SEEN[p["id"]] = (generation, time.time())
+    if m_screen.agent_kind(p) == "claude":
+        home = Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser()
+        sid = (
+            m_screen.claude_of_window(home, pane, str(p.get("pane_pid") or ""))
+            if p.get("started_by_room")
+            else m_screen.claude_of_window(home, pane)
+        )
+        if not p.get("started_by_room") and sid == p.get("window_session"):
+            return
+    else:
+        sid = m_screen.agent_session(p)
+    if not m_screen.SESSION_ID.fullmatch(sid):
+        return
+    # A lost or replaced pane cannot turn a cached conversation into new live proof.
+    if p.get("started_by_room"):
+        current = m_tmuxio.tmux("display-message", "-p", "-t", pane, "#{pane_pid}", check=False)
+        if current.returncode or current.stdout.strip() != str(p.get("pane_pid")):
+            return
+    if (m_screen.agent_kind(p) == "claude" and sid != p.get("window_session")) or sid != m_screen.confirmed_agent_session(p):
+        record_window_session(p, sid)
 
 
 def deliver_one(p: dict[str, Any], pane: str, config: dict[str, Any], messages: list[dict[str, Any]]) -> str:
     """One participant's tick: its state from the screen, a limit, a wait for its answer, a message."""
     rp = m_store.room().paths
-    if m_screen.agent_kind(p) == "claude":
+    if m_screen.agent_kind(p) == "claude" or (
+        m_screen.agent_kind(p) == "codex" and p.get("started_by_room") and p.get("joined") is True
+    ):
         remember_window_session(p, pane)
     rules = m_screen.screen_rules(p)
     # One tmux call per agent a tick: its state, its window's check, its model,

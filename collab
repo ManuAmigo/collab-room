@@ -262,7 +262,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.33"
+VERSION = "0.1.34"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:
@@ -1307,6 +1307,20 @@ LANGS = ("en", "ru")
 LANG_NAMES = {"en": "English", "ru": "Русский"}
 
 CATALOG: dict[str, dict[str, Any]] = {
+    "t.e200b6162c": {"en": "Starting a new conversation for {p0}.", "ru": "Запускается новый разговор для {p0}."},
+    "t.db41ce55d9": {
+        "en": "The agent changed. Choose it again in /restart.",
+        "ru": "Агент изменился. Выберите его заново в /restart.",
+    },
+    "t.8cbdc5508a": {"en": "Yes, start a new conversation", "ru": "Да, начать новый разговор"},
+    "t.d826a159fc": {
+        "en": "{p0}: no confirmed conversation was found. Start a new conversation? The previous conversation will not be resumed.",
+        "ru": "{p0}: подтверждённый разговор не найден. Начать новый разговор? Прежний разговор не будет продолжен.",
+    },
+    "t.823489391d": {
+        "en": "Showing the latest {shown} of {total} messages; {older} older messages are not shown. To include them, repeat with:\n{command}\n--all includes acknowledged messages; --limit still applies.",
+        "ru": "Показаны последние {shown} из {total} сообщений; ещё {older} старых сообщений не показаны. Чтобы включить их, повторите команду:\n{command}\n--all включает прочитанные сообщения; --limit продолжает действовать.",
+    },
     "t.ab86c4ef03": {
         "en": "VPN supervisor uses a different account file. Turn VPN off and on in /vpn, then retry the change.",
         "ru": "Служба VPN использует другой файл учётки. Выключите и включите VPN в /vpn, затем повторите смену.",
@@ -1454,9 +1468,9 @@ CATALOG: dict[str, dict[str, Any]] = {
         "en": "Turn agent VPN off (stops protected agents)",
         "ru": "Выключить VPN агентов (защищённые агенты остановятся)",
     },
-    "t.c2e1df7db6": {
-        "en": "Agent VPN is off. Protected agents are stopped.",
-        "ru": "VPN агентов выключен. Защищённые агенты остановлены.",
+    "t.91481e5a6e": {
+        "en": "Agent VPN is off. Protected agents are stopped. New agents in this room will start without VPN.",
+        "ru": "VPN агентов выключен. Защищённые агенты остановлены. Новые агенты этой комнаты будут запускаться без VPN.",
     },
     "t.799eb08bda": {
         "en": "Agent VPN did not become ready. Protected agents remain blocked.",
@@ -8288,9 +8302,9 @@ def mac_vpn_ensure(folder: Path, binary: Path, account: Path) -> None:
 
 
 @room_locked
-def mac_vpn_record_setup() -> None:
+def mac_vpn_record_enabled(enabled: bool) -> None:
     config = load_config()
-    config["macos_vpn"] = True
+    config["macos_vpn"] = enabled
     write_config(config)
 
 
@@ -8306,7 +8320,7 @@ def mac_vpn_room_action(action: str) -> dict[str, Any]:
         except (FileNotFoundError, ConnectionRefusedError):
             status = {"actual": "blocked" if (folder / "unconfirmed.json").exists() else "off"}
         return {**status, "room_enabled": enabled}
-    if action not in ("setup", "on", "off") or (action != "setup" and not enabled):
+    if action not in ("setup", "on", "off") or (action == "on" and not enabled):
         raise ValueError("run VPN setup for this room first")
     if action in ("setup", "on"):
         account = Path.home() / ".config" / "collab-vpn" / "agents.json"
@@ -8319,12 +8333,17 @@ def mac_vpn_room_action(action: str) -> dict[str, Any]:
         if action != "off" or (folder / "unconfirmed.json").exists():
             raise
         status = {"actual": "off"}
-    if action == "off" and status.get("off_exits") is True:
-        mac_vpn_wait_stopped(folder)
+    if action == "off":
+        if status.get("actual") != "off":
+            raise ValueError("proxy did not stop")
+        if status.get("off_exits") is True:
+            mac_vpn_wait_stopped(folder)
+        mac_vpn_record_enabled(False)
+        enabled = False
     if action == "setup":
         if status.get("actual") != "ready":
             raise ValueError("proxy did not become ready")
-        mac_vpn_record_setup()
+        mac_vpn_record_enabled(True)
     return {**status, "room_enabled": enabled or action == "setup", "restart_required": action == "setup"}
 
 
@@ -8718,14 +8737,14 @@ def only_own_seat(config: dict[str, Any], pid: str, verb: str) -> None:
             )
 
 
-def claude_of_window(home: Path, target: str) -> str:
+def claude_of_window(home: Path, target: str, expected_pid: str = "") -> str:
     """The session of the Claude in this window, as Claude itself records it — only when that record
     is of this very process: its pid, this window, and its start time (a pid is used again on macOS,
     and an old record with it would name another conversation)."""
     if not target:
         return ""
     pid = tmux("display-message", "-p", "-t", target, "#{pane_pid}", check=False).stdout.strip()
-    if not pid.isdigit():
+    if not pid.isdigit() or expected_pid and pid != expected_pid:
         return ""
     info = read_json(home / "sessions" / f"{pid}.json")
     started = subprocess.run(["ps", "-o", "lstart=", "-p", pid], capture_output=True, text=True).stdout.strip()
@@ -8768,6 +8787,27 @@ def brief_owner(config: dict[str, Any], sid: object) -> str:
 SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
+def session_generation(p: dict[str, Any]) -> dict[str, Any]:
+    """The room's launch identity, changed by every managed restart or relaunch."""
+    return {key: p.get(key) for key in ("id", "kind", "target", "pane_pid", "join_code", "joined_at", "folder")}
+
+
+def confirmed_agent_session(p: dict[str, Any]) -> str:
+    binding = p.get("confirmed_session")
+    if (
+        not p.get("started_by_room")
+        or not all(p.get(key) for key in ("target", "join_code", "joined_at"))
+        or not str(p.get("pane_pid") or "").isdigit()
+        or not isinstance(binding, dict)
+    ):
+        return ""
+    checked = cast(dict[str, Any], binding)
+    sid: Any = checked.get("session_id")
+    if isinstance(sid, str) and SESSION_ID.fullmatch(sid) and checked.get("generation") == session_generation(p):
+        return sid
+    return ""
+
+
 def agent_session(p: dict[str, Any]) -> str:
     """The conversation of an agent the room started, to continue it: Claude's is told by its hooks;
     Codex's is the session log in its folder where it answered its connection check — the code is
@@ -8781,7 +8821,17 @@ def agent_session(p: dict[str, Any]) -> str:
         # agent's own words, and five Claudes share one folder — a borrowed id would open someone
         # else's conversation here.
         home = Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser()
-        for sid in [claude_of_window(home, p.get("target") or ""), str(p.get("window_session") or "")]:
+        expected = str(p.get("pane_pid") or "") if p.get("started_by_room") else ""
+        live = not p.get("started_by_room") or bool(expected)
+        if expected:
+            current = tmux("display-message", "-p", "-t", p.get("target") or "", "#{pane_pid}", check=False)
+            if current.returncode == 0 and current.stdout.strip() != expected:
+                return ""
+            live = current.returncode == 0
+        for sid in [
+            claude_of_window(home, p.get("target") or "", expected) if live else "",
+            confirmed_agent_session(p) if "confirmed_session" in p else str(p.get("window_session") or ""),
+        ]:
             if (
                 SESSION_ID.fullmatch(sid)
                 and (home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", folder) / f"{sid}.jsonl").is_file()
@@ -8798,7 +8848,9 @@ def agent_session(p: dict[str, Any]) -> str:
         if process_bound:
             # The current process's open rollout is stronger than hints in another log.
             current = tmux("display-message", "-p", "-t", p["target"], "#{pane_pid}", check=False)
-            if current.returncode or current.stdout.strip() != str(p["pane_pid"]) or not str(p["pane_pid"]).isdigit():
+            if current.returncode:
+                return confirmed_agent_session(p)
+            if current.stdout.strip() != str(p["pane_pid"]) or not str(p["pane_pid"]).isdigit():
                 return ""
             opened = subprocess.run(["lsof", "-a", "-p", str(p["pane_pid"]), "-Fn"], capture_output=True, text=True, timeout=1)
             if opened.returncode or len(opened.stdout) > 1_000_000:
@@ -15594,32 +15646,56 @@ def send_briefs(config: dict[str, Any]) -> None:
         write_json(brief_path(), state)
 
 
-_WINDOW_SESSION_SEEN: dict[str, float] = {}
+_WINDOW_SESSION_SEEN: dict[str, tuple[dict[str, Any], float]] = {}
 
 
 @room_locked
-def remember_window_session(p: dict[str, Any], pane: str) -> None:
-    """While a Claude runs in a window delivery types into, keep the session its window's process
-    records — what /restart continues once the process is gone, and where its spending is read. Any
-    Claude in the room's tmux, not only one /add started: `init`'s example seats are opened by `start`,
-    and their spending went uncounted. Read at most every minute."""
-    if time.time() - _WINDOW_SESSION_SEEN.get(p["id"], 0) < 60:
-        return
-    _WINDOW_SESSION_SEEN[p["id"]] = time.time()
-    sid = claude_of_window(Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser(), pane)
-    if not SESSION_ID.fullmatch(sid) or sid == p.get("window_session"):
-        return
+def record_window_session(p: dict[str, Any], sid: str) -> None:
     data = read_config_raw()
     for q in data["participants"]:
-        if q["id"] == p["id"]:
-            q["window_session"] = sid
+        if q["id"] == p["id"] and session_generation(q) == session_generation(p):
+            if agent_kind(p) == "claude":
+                q["window_session"] = sid
+            if p.get("started_by_room") and p.get("join_code"):
+                q["confirmed_session"] = {"session_id": sid, "generation": session_generation(p)}
     write_config(data)
+
+
+def remember_window_session(p: dict[str, Any], pane: str) -> None:
+    """Keep a live process's conversation once a minute; do slow discovery outside the room lock."""
+    generation = session_generation(p)
+    seen, at = _WINDOW_SESSION_SEEN.get(p["id"], ({}, 0))
+    if seen == generation and time.time() - at < 60:
+        return
+    _WINDOW_SESSION_SEEN[p["id"]] = (generation, time.time())
+    if agent_kind(p) == "claude":
+        home = Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser()
+        sid = (
+            claude_of_window(home, pane, str(p.get("pane_pid") or ""))
+            if p.get("started_by_room")
+            else claude_of_window(home, pane)
+        )
+        if not p.get("started_by_room") and sid == p.get("window_session"):
+            return
+    else:
+        sid = agent_session(p)
+    if not SESSION_ID.fullmatch(sid):
+        return
+    # A lost or replaced pane cannot turn a cached conversation into new live proof.
+    if p.get("started_by_room"):
+        current = tmux("display-message", "-p", "-t", pane, "#{pane_pid}", check=False)
+        if current.returncode or current.stdout.strip() != str(p.get("pane_pid")):
+            return
+    if (agent_kind(p) == "claude" and sid != p.get("window_session")) or sid != confirmed_agent_session(p):
+        record_window_session(p, sid)
 
 
 def deliver_one(p: dict[str, Any], pane: str, config: dict[str, Any], messages: list[dict[str, Any]]) -> str:
     """One participant's tick: its state from the screen, a limit, a wait for its answer, a message."""
     rp = room().paths
-    if agent_kind(p) == "claude":
+    if agent_kind(p) == "claude" or (
+        agent_kind(p) == "codex" and p.get("started_by_room") and p.get("joined") is True
+    ):
         remember_window_session(p, pane)
     rules = screen_rules(p)
     # One tmux call per agent a tick: its state, its window's check, its model,
@@ -18686,6 +18762,8 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
     for q in data["participants"]:
         if q["id"] == p["id"]:
             q.update(target=pane, pane_pid=pane_pid, joined="pending", joined_at=now(), join_code=code)
+            q.pop("confirmed_session", None)
+            q.pop("window_session", None)
             q.update(mac_vpn_process_fields(data, pane_pid))
             if token:
                 q["kimi_usage_generation"] = token
@@ -19084,6 +19162,8 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str, adop
     for q in data["participants"]:
         if q["id"] == p["id"]:
             q.update(target=pane, pane_pid=pane_pid, joined="pending", joined_at=now(), join_code=code)
+            q.pop("confirmed_session", None)
+            q.pop("window_session", None)
             q.update(mac_vpn_process_fields(data, pane_pid))
             if token:
                 q["kimi_usage_generation"] = token
@@ -23231,7 +23311,7 @@ def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
         options = []
         if actual != "ready":
             options.append((tr("Turn agent VPN on"), "on"))
-        if status.get("room_enabled") and actual != "off":
+        if status.get("room_enabled"):
             options.append((tr("Turn agent VPN off (stops protected agents)"), "off"))
         options.append((tr("Change VPN (stops protected agents)"), "change"))
         ctx.wizard.update(
@@ -23252,7 +23332,7 @@ def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
             )
         )
     elif actual == "off":
-        say_(tr("Agent VPN is off. Protected agents are stopped."))
+        say_(tr("Agent VPN is off. Protected agents are stopped. New agents in this room will start without VPN."))
     else:
         say_(tr("Agent VPN did not become ready. Protected agents remain blocked."))
 
@@ -23943,6 +24023,20 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         )
         ctx.wizard.clear()
         if not found:
+            if agent_kind(q) in ("codex", "claude") and not agent_window_alive(q):
+                prompt = tr(
+                    "{p0}: no confirmed conversation was found. Start a new conversation? The previous conversation will not be resumed.",
+                    p0=label_of(cfg, line),
+                )
+                ctx.wizard.update(
+                    step="restart_new_confirm",
+                    pid=line,
+                    generation=session_generation(q),
+                    options=[(tr("No"), "n"), (tr("Yes, start a new conversation"), "y")],
+                    prompt=prompt,
+                )
+                say_(prompt)
+                return
             say_(
                 tr(
                     "{p0}: its conversation could not be confirmed. The running program was left unchanged.",
@@ -23967,6 +24061,31 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
                 p0=label_of(cfg, line),
             )
         )
+        return
+    if step_ == "restart_new_confirm":
+        pid, generation = ctx.wizard["pid"], ctx.wizard.get("generation")
+        ctx.wizard.clear()
+        if line != "y":
+            say_(tr("Canceled."))
+            return
+        cfg = load_config()
+        q = next((p for p in cfg["participants"] if p["id"] == pid), None)
+        if (
+            not q
+            or not q.get("started_by_room")
+            or agent_kind(q) not in ("codex", "claude")
+            or session_generation(q) != generation
+            or agent_window_alive(q)
+        ):
+            say_(tr("The agent changed. Choose it again in /restart."))
+            return
+        try:
+            restart_agent(cfg.get("session", "collab-room"), q, fresh=True)
+        except (OperationFailed, SystemExit) as exc:
+            ctx.feed(paint(tr("! Could not restart: {exc}", exc=exc), "1;38;5;196"))
+            return
+        say_(tr("Starting a new conversation for {p0}.", p0=label_of(cfg, pid)))
+        ctx.refresh_people()
         return
     if step_ == "restart_confirm":
         pid, found = ctx.wizard["pid"], str(ctx.wizard.get("sid") or "")
@@ -26808,6 +26927,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -27020,6 +27140,7 @@ def cmd_inbox(args: argparse.Namespace) -> None:
     if not args.all:
         acked = read_set(rp.receipts_dir, args.participant)
         mine = [m for m in mine if m["id"] not in acked]
+    total = len(mine)
     mine = mine[-args.limit :]
     # Notes that wake no one — «Taking», the merge queue's «waits», «Merged» — are read here and done with: no
     # answer is due, and left unread they hung in every inbox among the questions. A line each, marked read now.
@@ -27036,6 +27157,21 @@ def cmd_inbox(args: argparse.Namespace) -> None:
         + (f"\n  ({hint})" if hints and (hint := answer_hint(me, m, config, check_rule=False)) else "")
         for m in mine
     ]
+    if total > args.limit:
+        all_flag = "--all " if args.all else ""
+        command = room_cmd(
+            "inbox", f"--for {shlex.quote(args.participant)} {all_flag}--limit {total}", me.get("cli", "")
+        )
+        blocks.insert(
+            0,
+            tr(
+                "Showing the latest {shown} of {total} messages; {older} older messages are not shown. To include them, repeat with:\n{command}\n--all includes acknowledged messages; --limit still applies.",
+                shown=args.limit,
+                total=total,
+                older=total - args.limit,
+                command=command,
+            ),
+        )
     if notes:
         blocks.append(tr("Notices (no answer due; marked read):") + "".join(f"\n  {note_line(m, config)}" for m in notes))
         mark_notes_read(args.participant, {m["id"] for m in notes})
@@ -27694,7 +27830,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("inbox", help="unacknowledged messages for a participant")
     s.add_argument("--for", dest="participant", required=True)
     s.add_argument("--limit", type=positive_int, default=50)
-    s.add_argument("--all", action="store_true", help="include acknowledged")
+    s.add_argument("--all", action="store_true", help="include acknowledged; --limit still applies")
     s.set_defaults(func=cmd_inbox)
 
     s = sub.add_parser("ack", help="mark messages as read and handled")

@@ -443,6 +443,31 @@ Before changing shared files, a participant runs `collab take --from <own id> '<
 
 Together with «Taking», take the task: `collab take --from <own id> --task <id> --kind <kind> [--lane A|B|C] [--by <who assigned it>] '<task or files>'`, or `collab task take <id> --as <own id> --kind <kind> …` alone; together with «Merged» or «done», run `collab task done <id> --as <own id> [--commit <hash>]`. This way the room knows which task a participant is on, and token usage is counted per task. The id is any short task name: `4.2`, `T1`, `fix-12`. The kind is one of: refactor, fix, review, diagnosis, research, tests, docs, coordination. A participant has one current task: a second-opinion check in the middle of one's own work is also a `take`, and one's own task is then put aside, not finished. To see who is doing what: `collab task show`. Codex agents replying through the restricted copy have `take` but not `task`: the coordinator sets their task otherwise — `collab task take <id> --as <Codex id> --kind <kind> --by <own id>`.
 
+## Review handoff
+
+After a work report or review, name the **next owner, action and blocker** in one message:
+`task / commit → next owner: action; blocker: none | condition; resume when: event`.
+This is a human-readable decision, not a command or an automatic scheduler.
+
+- The author names the reviewer, exact commit and checkout, checks and what remains unverified.
+  Ready for review does not mean merged or deployed.
+- The reviewer gives a verdict on that commit and hands it on: approved → author performs the
+  next authorized checks or landing; changes required → author fixes and returns a new commit
+  to the reviewer; missing evidence → name who must obtain it and what is needed. Approval does
+  not replace required checks or permission to publish, deploy or take other external actions.
+- With an external blocker, preserve the candidate and record who handles the dependency and
+  which event permits work to resume. Stop retries and periodic waiting messages until new evidence
+  or instructions arrive. Questions for the person go through the room's coordinator, if one is assigned.
+- The coordinator fills any missing next assignment when processing the review. Without a
+  coordinator, the task owner does so. An already authorized, unblocked next step needs no extra
+  acknowledgement round; read the current inbox before acting. Use `take` when resuming the task
+  and `task done` only when the task is complete, as described above.
+
+Do not send a separate “got it” or ask “what next?” when the report already names the next step.
+Close messages needing no reply with `ack --no-reply`; send only a decision or new evidence.
+To assess the rule, follow a real task through review, changes and external waiting, checking that
+ownership and the resumption event stay explicit. A written rule alone is not proof of reduced delay.
+
 ## Completion and the Git summary
 
 `collab report --repo <path>` shows the last commit, the files it touched, the upstream/push state and whether the tree is clean. `--send-from <id>` sends this summary to the room; `--note` adds a line with the checks and the limits of what they prove.

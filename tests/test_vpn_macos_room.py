@@ -71,6 +71,40 @@ class MacVpnRoomRouteTests(unittest.TestCase):
         self.assertNotIn("vpn-agent", command)
         self.assertIn("/private/codex --no-alt-screen", command)
 
+    def test_off_makes_the_next_add_direct_only_after_confirmed_stop(self):
+        with (
+            seam(self.mod, "vpn_macos_daemon.mac_vpn_folder", mock.Mock(return_value=self.home)),
+            seam(self.mod, "vpn_macos_daemon.mac_control_request", mock.Mock(return_value={"actual": "off", "off_exits": True})),
+            seam(self.mod, "vpn_macos_room.mac_vpn_wait_stopped", mock.Mock()) as stopped,
+        ):
+            result = self.mod.mac_vpn_room_action("off")
+        stopped.assert_called_once_with(self.home)
+        self.assertFalse(result["room_enabled"])
+        self.assertFalse(self.mod.read_config_raw()["macos_vpn"])
+        self.mod.launch_new_agent(self.config, "codex", str(self.project), "Probe")
+        command = next(call.args[-1] for call in self.tmux.call_args_list if call.args[0] == "new-window")
+        self.assertNotIn("vpn-agent", command)
+        self.assertIn("/private/codex --no-alt-screen", command)
+
+    def test_failed_off_keeps_new_launches_protected(self):
+        for status in ({"actual": "blocked"}, {"actual": "ready"}):
+            with (
+                self.subTest(status=status),
+                seam(self.mod, "vpn_macos_daemon.mac_vpn_folder", mock.Mock(return_value=self.home)),
+                seam(self.mod, "vpn_macos_daemon.mac_control_request", mock.Mock(return_value=status)),
+            ):
+                with self.assertRaises(ValueError):
+                    self.mod.mac_vpn_room_action("off")
+            self.assertTrue(self.mod.read_config_raw()["macos_vpn"])
+        with (
+            seam(self.mod, "vpn_macos_daemon.mac_vpn_folder", mock.Mock(return_value=self.home)),
+            seam(self.mod, "vpn_macos_daemon.mac_control_request", mock.Mock(return_value={"actual": "off", "off_exits": True})),
+            seam(self.mod, "vpn_macos_room.mac_vpn_wait_stopped", mock.Mock(side_effect=ValueError("not stopped"))),
+        ):
+            with self.assertRaises(ValueError):
+                self.mod.mac_vpn_room_action("off")
+        self.assertTrue(self.mod.read_config_raw()["macos_vpn"])
+
     def test_relaunch_uses_wrapper(self):
         participant = {"id": "probe", "kind": "codex", "folder": str(self.project), "started_by_room": True}
         self.config["participants"].append(participant)
@@ -162,14 +196,20 @@ class MacVpnRoomActionTests(unittest.TestCase):
             seam(self.mod, "vpn_macos_install.mac_vpn_install", mock.Mock(return_value=self.folder / "sing-box"))
         )
         self.ensure = self.enterContext(seam(self.mod, "vpn_macos_room.mac_vpn_ensure", mock.Mock()))
-        self.record = self.enterContext(seam(self.mod, "vpn_macos_room.mac_vpn_record_setup", mock.Mock()))
+        self.record = self.enterContext(
+            seam(
+                self.mod,
+                "vpn_macos_room.mac_vpn_record_enabled",
+                mock.Mock(side_effect=lambda value: self.config.update(macos_vpn=value)),
+            )
+        )
         self.account = self.enterContext(seam(self.mod, "vpn_config.vpn_account", mock.Mock()))
 
     def test_setup_records_opt_in_only_after_ready(self):
         result = self.mod.mac_vpn_room_action("setup")
         self.assertTrue(result["room_enabled"])
         self.assertTrue(result["restart_required"])
-        self.record.assert_called_once()
+        self.record.assert_called_once_with(True)
         self.install.assert_called_once()
         self.control.assert_called_once_with(self.folder, "on")
         self.assertEqual(self.account.call_args.args[0], self.folder / ".config/collab-vpn/agents.json")

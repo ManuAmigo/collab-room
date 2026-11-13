@@ -198,16 +198,17 @@ class Base(unittest.TestCase):
         """Wait for a condition instead of a fixed sleep: returns the last result. 30 s by default: a pass
         is as fast, and under the queue's low priority 5 s ran out (a chat's screen, a client's). A check
         that raises is «not yet»: a screen read while the chat repaints is empty or half drawn, and
-        `[...][-1]` on it failed the test instead of waiting; at the deadline it raises."""
-        end = time.time() + timeout
+        `[...][-1]` on it failed the test instead of waiting; at the deadline it raises.
+        Elapsed time stays independent of wall-clock jumps and macOS system sleep."""
+        end = time.monotonic() + timeout
         while True:
             try:
                 result = check()
             except Exception:
-                if time.time() > end:
+                if time.monotonic() > end:
                     raise
                 result = None
-            if result or time.time() > end:
+            if result or time.monotonic() > end:
                 return result
             time.sleep(0.1)
 
@@ -229,6 +230,26 @@ class Base(unittest.TestCase):
     def messages(self):
         path = self.state / "messages.jsonl"
         return [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+
+class WaitClockTest(unittest.TestCase):
+    def test_a_wall_clock_jump_does_not_expire_an_active_wait(self):
+        checks = mock.Mock(side_effect=[False, False, True])
+        with mock.patch.object(time, "time", side_effect=[100, 100_000]), mock.patch.object(time, "sleep"):
+            self.assertTrue(Base.until(None, checks, timeout=20))
+        self.assertEqual(checks.call_count, 3)
+
+    def test_a_transient_read_error_does_not_use_wall_time_for_its_deadline(self):
+        checks = mock.Mock(side_effect=[IndexError("repainting"), True])
+        with mock.patch.object(time, "time", side_effect=[100, 100_000]), mock.patch.object(time, "sleep"):
+            self.assertTrue(Base.until(None, checks, timeout=20))
+        self.assertEqual(checks.call_count, 2)
+
+    def test_a_failed_condition_still_expires_at_the_same_elapsed_budget(self):
+        checks = mock.Mock(return_value=False)
+        with mock.patch.object(time, "monotonic", side_effect=[100, 100.1, 100.3]), mock.patch.object(time, "sleep"):
+            self.assertFalse(Base.until(None, checks, timeout=0.2))
+        self.assertEqual(checks.call_count, 2)
 
 
 class RoomTest(Base):
@@ -22078,6 +22099,7 @@ class RestartUxTest(Base):
 
         with (
             seam(mod, "screen.agent_session", missing),
+            seam(mod, "agents.agent_window_alive", lambda p: True),
             seam(mod, "agents.restart_agent", lambda *a, **k: self.fail("must preserve process")),
         ):
             said = []

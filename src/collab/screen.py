@@ -150,14 +150,14 @@ def only_own_seat(config: dict[str, Any], pid: str, verb: str) -> None:
             )
 
 
-def claude_of_window(home: Path, target: str) -> str:
+def claude_of_window(home: Path, target: str, expected_pid: str = "") -> str:
     """The session of the Claude in this window, as Claude itself records it — only when that record
     is of this very process: its pid, this window, and its start time (a pid is used again on macOS,
     and an old record with it would name another conversation)."""
     if not target:
         return ""
     pid = m_tmuxio.tmux("display-message", "-p", "-t", target, "#{pane_pid}", check=False).stdout.strip()
-    if not pid.isdigit():
+    if not pid.isdigit() or expected_pid and pid != expected_pid:
         return ""
     info = m_store.read_json(home / "sessions" / f"{pid}.json")
     started = subprocess.run(["ps", "-o", "lstart=", "-p", pid], capture_output=True, text=True).stdout.strip()
@@ -200,6 +200,27 @@ def brief_owner(config: dict[str, Any], sid: object) -> str:
 SESSION_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
+def session_generation(p: dict[str, Any]) -> dict[str, Any]:
+    """The room's launch identity, changed by every managed restart or relaunch."""
+    return {key: p.get(key) for key in ("id", "kind", "target", "pane_pid", "join_code", "joined_at", "folder")}
+
+
+def confirmed_agent_session(p: dict[str, Any]) -> str:
+    binding = p.get("confirmed_session")
+    if (
+        not p.get("started_by_room")
+        or not all(p.get(key) for key in ("target", "join_code", "joined_at"))
+        or not str(p.get("pane_pid") or "").isdigit()
+        or not isinstance(binding, dict)
+    ):
+        return ""
+    checked = cast(dict[str, Any], binding)
+    sid: Any = checked.get("session_id")
+    if isinstance(sid, str) and SESSION_ID.fullmatch(sid) and checked.get("generation") == session_generation(p):
+        return sid
+    return ""
+
+
 def agent_session(p: dict[str, Any]) -> str:
     """The conversation of an agent the room started, to continue it: Claude's is told by its hooks;
     Codex's is the session log in its folder where it answered its connection check — the code is
@@ -213,7 +234,17 @@ def agent_session(p: dict[str, Any]) -> str:
         # agent's own words, and five Claudes share one folder — a borrowed id would open someone
         # else's conversation here.
         home = Path(os.environ.get("COLLAB_CLAUDE_HOME", "~/.claude")).expanduser()
-        for sid in [claude_of_window(home, p.get("target") or ""), str(p.get("window_session") or "")]:
+        expected = str(p.get("pane_pid") or "") if p.get("started_by_room") else ""
+        live = not p.get("started_by_room") or bool(expected)
+        if expected:
+            current = m_tmuxio.tmux("display-message", "-p", "-t", p.get("target") or "", "#{pane_pid}", check=False)
+            if current.returncode == 0 and current.stdout.strip() != expected:
+                return ""
+            live = current.returncode == 0
+        for sid in [
+            claude_of_window(home, p.get("target") or "", expected) if live else "",
+            confirmed_agent_session(p) if "confirmed_session" in p else str(p.get("window_session") or ""),
+        ]:
             if (
                 SESSION_ID.fullmatch(sid)
                 and (home / "projects" / re.sub(r"[^A-Za-z0-9]", "-", folder) / f"{sid}.jsonl").is_file()
@@ -230,7 +261,9 @@ def agent_session(p: dict[str, Any]) -> str:
         if process_bound:
             # The current process's open rollout is stronger than hints in another log.
             current = m_tmuxio.tmux("display-message", "-p", "-t", p["target"], "#{pane_pid}", check=False)
-            if current.returncode or current.stdout.strip() != str(p["pane_pid"]) or not str(p["pane_pid"]).isdigit():
+            if current.returncode:
+                return confirmed_agent_session(p)
+            if current.stdout.strip() != str(p["pane_pid"]) or not str(p["pane_pid"]).isdigit():
                 return ""
             opened = subprocess.run(["lsof", "-a", "-p", str(p["pane_pid"]), "-Fn"], capture_output=True, text=True, timeout=1)
             if opened.returncode or len(opened.stdout) > 1_000_000:

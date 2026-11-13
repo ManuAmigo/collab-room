@@ -666,7 +666,7 @@ def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
         options = []
         if actual != "ready":
             options.append((m_i18n.tr("Turn agent VPN on"), "on"))
-        if status.get("room_enabled") and actual != "off":
+        if status.get("room_enabled"):
             options.append((m_i18n.tr("Turn agent VPN off (stops protected agents)"), "off"))
         options.append((m_i18n.tr("Change VPN (stops protected agents)"), "change"))
         ctx.wizard.update(
@@ -687,7 +687,7 @@ def vpn_running_step(ctx: ChatCommandContext, line: str, say_: Any) -> None:
             )
         )
     elif actual == "off":
-        say_(m_i18n.tr("Agent VPN is off. Protected agents are stopped."))
+        say_(m_i18n.tr("Agent VPN is off. Protected agents are stopped. New agents in this room will start without VPN."))
     else:
         say_(m_i18n.tr("Agent VPN did not become ready. Protected agents remain blocked."))
 
@@ -1378,6 +1378,20 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         )
         ctx.wizard.clear()
         if not found:
+            if m_screen.agent_kind(q) in ("codex", "claude") and not m_agents.agent_window_alive(q):
+                prompt = m_i18n.tr(
+                    "{p0}: no confirmed conversation was found. Start a new conversation? The previous conversation will not be resumed.",
+                    p0=m_store.label_of(cfg, line),
+                )
+                ctx.wizard.update(
+                    step="restart_new_confirm",
+                    pid=line,
+                    generation=m_screen.session_generation(q),
+                    options=[(m_i18n.tr("No"), "n"), (m_i18n.tr("Yes, start a new conversation"), "y")],
+                    prompt=prompt,
+                )
+                say_(prompt)
+                return
             say_(
                 m_i18n.tr(
                     "{p0}: its conversation could not be confirmed. The running program was left unchanged.",
@@ -1402,6 +1416,31 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
                 p0=m_store.label_of(cfg, line),
             )
         )
+        return
+    if step_ == "restart_new_confirm":
+        pid, generation = ctx.wizard["pid"], ctx.wizard.get("generation")
+        ctx.wizard.clear()
+        if line != "y":
+            say_(m_i18n.tr("Canceled."))
+            return
+        cfg = m_store.load_config()
+        q = next((p for p in cfg["participants"] if p["id"] == pid), None)
+        if (
+            not q
+            or not q.get("started_by_room")
+            or m_screen.agent_kind(q) not in ("codex", "claude")
+            or m_screen.session_generation(q) != generation
+            or m_agents.agent_window_alive(q)
+        ):
+            say_(m_i18n.tr("The agent changed. Choose it again in /restart."))
+            return
+        try:
+            m_agents.restart_agent(cfg.get("session", "collab-room"), q, fresh=True)
+        except (m_store.OperationFailed, SystemExit) as exc:
+            ctx.feed(m_text.paint(m_i18n.tr("! Could not restart: {exc}", exc=exc), "1;38;5;196"))
+            return
+        say_(m_i18n.tr("Starting a new conversation for {p0}.", p0=m_store.label_of(cfg, pid)))
+        ctx.refresh_people()
         return
     if step_ == "restart_confirm":
         pid, found = ctx.wizard["pid"], str(ctx.wizard.get("sid") or "")

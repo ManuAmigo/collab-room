@@ -246,8 +246,10 @@ The full protocol: [docs/protocol.md](docs/protocol.md).
   left in the agent's input (**Unsent draft**) blocks typing until you send or clear it there.
 - **Usage limit:** the room recognises the agent's limit notice, holds messages until the time
   shown, and posts when the agent is back. If the limit was lifted early, `/unlimit`.
-- **An agent is stuck or confused:** `/restart` restarts its program in the same window and
-  continues its saved conversation (if none is found, it asks before starting a new one).
+- **An agent is stuck or confused:** `/restart` continues its confirmed conversation. If its
+  window disappeared, a new window resumes the conversation saved for that launch. For a lost
+  Codex/Claude window without a confirmed conversation, the chat asks before starting a new one;
+  a running program with no confirmed conversation is left unchanged.
 - **Grey `?` for everyone:** delivery is not running. Run `collab` and choose the room — delivery
   restarts.
 
@@ -285,6 +287,10 @@ How delivery decides and what it can get wrong: [docs/delivery.md](docs/delivery
 | `collab deliver` | The delivery loop (`start` runs it for you) |
 | `collab task` · `usage` | The task a participant is on · tokens spent by task |
 | `collab hook-model` | Used by the Claude Code hooks |
+
+`inbox` shows the latest 50 matching messages by default. `--all` also includes
+acknowledged messages; `--limit N` still applies. If older messages are left out,
+the output reports their count and the limit needed to include them.
 
 Run `collab COMMAND --help` for the arguments. Commands that act on a room take `--room
 <project-folder>`; without it they use `COLLAB_ROOT`, then the current folder.
@@ -339,7 +345,9 @@ afterwards. The link is saved atomically with private permissions at
 Do not share that file or link. Check `/vpn` or `collab vpn status` after setup;
 only a running state confirms the proxy transport check. This does not prove CLI login.
 Turning it off stops protected agents in all enabled rooms of the same user and
-shuts down the VPN service after confirmed cleanup; turning it on starts a new service.
+shuts down the VPN service after confirmed cleanup. It also disables VPN for new
+agent launches in the current room; other rooms keep their VPN launch setting.
+Turning it on again in `/vpn` starts a new service and enables VPN launches for this room.
 An older service may require signing out of macOS or restarting the computer once
 before changing accounts; the existing account file is preserved on this refusal.
 The menu also shows running Codex/Claude agents without confirmed VPN and asks you

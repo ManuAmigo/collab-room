@@ -1320,6 +1320,8 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
     for q in data["participants"]:
         if q["id"] == p["id"]:
             q.update(target=pane, pane_pid=pane_pid, joined="pending", joined_at=m_store.now(), join_code=code)
+            q.pop("confirmed_session", None)
+            q.pop("window_session", None)
             q.update(m_vpn_macos_process.mac_vpn_process_fields(data, pane_pid))
             if token:
                 q["kimi_usage_generation"] = token
@@ -1718,6 +1720,8 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str, adop
     for q in data["participants"]:
         if q["id"] == p["id"]:
             q.update(target=pane, pane_pid=pane_pid, joined="pending", joined_at=m_store.now(), join_code=code)
+            q.pop("confirmed_session", None)
+            q.pop("window_session", None)
             q.update(m_vpn_macos_process.mac_vpn_process_fields(data, pane_pid))
             if token:
                 q["kimi_usage_generation"] = token

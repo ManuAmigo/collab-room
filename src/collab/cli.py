@@ -4,6 +4,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -216,6 +217,7 @@ def cmd_inbox(args: argparse.Namespace) -> None:
     if not args.all:
         acked = m_log.read_set(rp.receipts_dir, args.participant)
         mine = [m for m in mine if m["id"] not in acked]
+    total = len(mine)
     mine = mine[-args.limit :]
     # Notes that wake no one — «Taking», the merge queue's «waits», «Merged» — are read here and done with: no
     # answer is due, and left unread they hung in every inbox among the questions. A line each, marked read now.
@@ -232,6 +234,21 @@ def cmd_inbox(args: argparse.Namespace) -> None:
         + (f"\n  ({hint})" if hints and (hint := m_deliver.answer_hint(me, m, config, check_rule=False)) else "")
         for m in mine
     ]
+    if total > args.limit:
+        all_flag = "--all " if args.all else ""
+        command = m_deliver.room_cmd(
+            "inbox", f"--for {shlex.quote(args.participant)} {all_flag}--limit {total}", me.get("cli", "")
+        )
+        blocks.insert(
+            0,
+            m_i18n.tr(
+                "Showing the latest {shown} of {total} messages; {older} older messages are not shown. To include them, repeat with:\n{command}\n--all includes acknowledged messages; --limit still applies.",
+                shown=args.limit,
+                total=total,
+                older=total - args.limit,
+                command=command,
+            ),
+        )
     if notes:
         blocks.append(m_i18n.tr("Notices (no answer due; marked read):") + "".join(f"\n  {note_line(m, config)}" for m in notes))
         mark_notes_read(args.participant, {m["id"] for m in notes})
@@ -890,7 +907,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("inbox", help="unacknowledged messages for a participant")
     s.add_argument("--for", dest="participant", required=True)
     s.add_argument("--limit", type=positive_int, default=50)
-    s.add_argument("--all", action="store_true", help="include acknowledged")
+    s.add_argument("--all", action="store_true", help="include acknowledged; --limit still applies")
     s.set_defaults(func=cmd_inbox)
 
     s = sub.add_parser("ack", help="mark messages as read and handled")

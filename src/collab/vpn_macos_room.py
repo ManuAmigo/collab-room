@@ -77,9 +77,9 @@ def mac_vpn_ensure(folder: Path, binary: Path, account: Path) -> None:
 
 
 @m_store.room_locked
-def mac_vpn_record_setup() -> None:
+def mac_vpn_record_enabled(enabled: bool) -> None:
     config = m_store.load_config()
-    config["macos_vpn"] = True
+    config["macos_vpn"] = enabled
     m_store.write_config(config)
 
 
@@ -95,7 +95,7 @@ def mac_vpn_room_action(action: str) -> dict[str, Any]:
         except (FileNotFoundError, ConnectionRefusedError):
             status = {"actual": "blocked" if (folder / "unconfirmed.json").exists() else "off"}
         return {**status, "room_enabled": enabled}
-    if action not in ("setup", "on", "off") or (action != "setup" and not enabled):
+    if action not in ("setup", "on", "off") or (action == "on" and not enabled):
         raise ValueError("run VPN setup for this room first")
     if action in ("setup", "on"):
         account = Path.home() / ".config" / "collab-vpn" / "agents.json"
@@ -108,12 +108,17 @@ def mac_vpn_room_action(action: str) -> dict[str, Any]:
         if action != "off" or (folder / "unconfirmed.json").exists():
             raise
         status = {"actual": "off"}
-    if action == "off" and status.get("off_exits") is True:
-        mac_vpn_wait_stopped(folder)
+    if action == "off":
+        if status.get("actual") != "off":
+            raise ValueError("proxy did not stop")
+        if status.get("off_exits") is True:
+            mac_vpn_wait_stopped(folder)
+        mac_vpn_record_enabled(False)
+        enabled = False
     if action == "setup":
         if status.get("actual") != "ready":
             raise ValueError("proxy did not become ready")
-        mac_vpn_record_setup()
+        mac_vpn_record_enabled(True)
     return {**status, "room_enabled": enabled or action == "setup", "restart_required": action == "setup"}
 
 
