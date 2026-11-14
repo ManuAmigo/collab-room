@@ -377,6 +377,8 @@ def team_problems(config: dict[str, Any]) -> list[str]:
         out.append(f"the room's goal must be text of 1 to {GOAL_LIMIT} characters without control characters")
     if "round" in team and team["round"] is not False and round_of(config) is None:
         out.append("the lead's round must be minutes from 1 to 1440, or false")
+    if "codex_sandbox" in team and type(team["codex_sandbox"]) is not bool:
+        out.append("codex_sandbox must be a boolean")
     if team.get("output") and not output_of(config):
         out.append("the result file must be a path inside the project folder")
     return out
@@ -1253,9 +1255,11 @@ def set_room_language(lang: str) -> None:
 
 @room_locked
 def set_team(team: dict[str, Any]) -> None:
-    """The room's `team` block, replaced whole under the room's lock."""
+    """Replace the scenario under the room's lock, keeping its explicit Codex permission policy."""
     data = read_config_raw()
-    data["team"] = team
+    previous = team_of(data)
+    policy = {"codex_sandbox": previous["codex_sandbox"]} if "codex_sandbox" in previous else {}
+    data["team"] = {**policy, **team}
     write_config(data)
     note_settings(data)
 
@@ -1263,7 +1267,7 @@ def set_team(team: dict[str, Any]) -> None:
 # What the person changes in a running team (/team), and what the lead changes for them later: each a record
 # of the room's history, «who · what · before → after», under the room's lock. «None» after: the explicit value
 # goes, and the layer below applies again (its seat's, the room's, the built-in one).
-ROOM_KEYS = ("lead", "goal", "round", "output", "without_person")
+ROOM_KEYS = ("lead", "goal", "round", "output", "without_person", "codex_sandbox")
 
 
 def changes_path() -> Path:
@@ -1408,6 +1412,8 @@ def change_words(data: dict[str, Any], rec: dict[str, Any], lang: str = "") -> s
         return m_i18n.words_in(key, lang)
 
     def shown(key: str, v: object, who: str) -> str:
+        if key == "codex_sandbox":
+            return m_i18n.tr("On", lang=lang) if v else m_i18n.tr("Off — no sandbox or approvals", lang=lang)
         if v is None:
             return w("change.default")
         if key == "topic" and isinstance(v, str):

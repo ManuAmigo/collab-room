@@ -31,11 +31,18 @@ def mac_vpn_enabled(config: Mapping[str, Any]) -> bool:
 def mac_vpn_wrap(kind: str, command: str, config: Mapping[str, Any]) -> str:
     if not mac_vpn_enabled(config):
         return command
+    if kind == "codex" and config.get("team", {}).get("codex_sandbox", False):
+        raise ValueError("Codex sandbox cannot run inside the macOS VPN sandbox; turn /vpn off first")
     if sys.platform != "darwin" or kind not in ("codex", "claude"):
         raise ValueError("network-only VPN supports macOS Codex and Claude only")
     arguments = shlex.split(command)
     if not arguments:
         raise ValueError("VPN agent command is empty")
+    options = arguments[1 : arguments.index("--")] if "--" in arguments else arguments[1:]
+    if kind == "codex" and any(
+        arg.split("=", 1)[0] in ("--sandbox", "--ask-for-approval", "--full-auto") or arg[:2] in ("-s", "-a") for arg in options
+    ):
+        raise ValueError("Saved Codex sandbox/approval options cannot run inside the macOS VPN sandbox; turn /vpn off first")
     return shlex.join([sys.executable, "-I", "-S", m_boot.SELF, "vpn-agent", "--kind", kind, "--", *arguments])
 
 

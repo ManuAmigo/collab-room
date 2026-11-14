@@ -516,7 +516,19 @@ def ensure_agent_cli(kind: str, progress: Any = None, cancel: Any = None) -> str
     return use_agent_cli(installed_agent_path(kind, root))
 
 
-def agent_command(kind: str, resume: list[str] | None = None, model: str = "", yolo: bool = False) -> str:
+def codex_sandbox_flags(enabled: bool) -> list[str]:
+    if type(enabled) is not bool:
+        raise ValueError("codex_sandbox must be a boolean")
+    return (
+        ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
+        if enabled
+        else ["--dangerously-bypass-approvals-and-sandbox"]
+    )
+
+
+def agent_command(
+    kind: str, resume: list[str] | None = None, model: str = "", yolo: bool = False, codex_sandbox: bool = False
+) -> str:
     """The same preset arguments for /add, relaunch and /restart, including resume, the model its
     settings give it and, for a Kimi that explicitly opted in, Ask When Needed."""
     preset = m_screen.PRESETS[kind]["command"]
@@ -527,8 +539,9 @@ def agent_command(kind: str, resume: list[str] | None = None, model: str = "", y
     if kind == "codex":
         # Its own process, not the shared background server (the person's Codex app keeps one): through
         # it a room's Codex did not take the rule written for it just before its start, and the person
-        # approved every say by hand. Sandbox and approvals stay as they are.
+        # approved every say by hand.
         flags = ["--no-daemon"] if codex_knows_no_daemon(program, (resume or [])[:1]) else []
+        flags += codex_sandbox_flags(codex_sandbox)
         if resume:
             return shlex.join([program, resume[0], *preset[1:], *flags, *chosen, *resume[1:]])
         return shlex.join([program, *preset[1:], *flags, *chosen])
@@ -570,7 +583,9 @@ def launch_new_agent(
     cli = (
         m_installer.codex_room_rule(pid, folder, label) if kind == "codex" and not m_vpn_macos_room.mac_vpn_enabled(fresh) else ""
     )
-    command = m_vpn_macos_room.mac_vpn_wrap(kind, agent_command(kind, model=model, yolo=yolo), fresh)
+    command = m_vpn_macos_room.mac_vpn_wrap(
+        kind, agent_command(kind, model=model, yolo=yolo, codex_sandbox=m_store.team_of(fresh).get("codex_sandbox", False)), fresh
+    )
     pane = ""
     code = uuid.uuid4().hex[:4]
     token = m_usage.prepare_kimi_launch(pid, code, folder, m_usage.kimi_usage_adapter(command)) if kind == "kimi" else ""
@@ -1292,7 +1307,14 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
     )
     code = uuid.uuid4().hex[:4]
     command = m_vpn_macos_room.mac_vpn_wrap(
-        kind, agent_command(kind, model=model_for(p), yolo=bool(p.get("yolo"))), launch_config
+        kind,
+        agent_command(
+            kind,
+            model=model_for(p),
+            yolo=bool(p.get("yolo")),
+            codex_sandbox=m_store.team_of(launch_config).get("codex_sandbox", False),
+        ),
+        launch_config,
     )
     token = m_usage.prepare_kimi_launch(p["id"], code, folder, m_usage.kimi_usage_adapter(command)) if kind == "kimi" else ""
     if token:
@@ -1612,7 +1634,15 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str, adop
     )  # the newest rule, read at its start
     resume = (["--resume" if kind == "claude" else "--session", sid] if kind != "codex" else ["resume", sid]) if sid else []
     command = m_vpn_macos_room.mac_vpn_wrap(
-        kind, agent_command(kind, resume, model_for(p), yolo=bool(p.get("yolo"))), launch_config
+        kind,
+        agent_command(
+            kind,
+            resume,
+            model_for(p),
+            yolo=bool(p.get("yolo")),
+            codex_sandbox=m_store.team_of(launch_config).get("codex_sandbox", False),
+        ),
+        launch_config,
     )
     code = uuid.uuid4().hex[:4]
     token = ""

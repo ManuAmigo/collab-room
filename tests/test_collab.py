@@ -4922,10 +4922,14 @@ class RoomTest(Base):
                 seam(mod, "agents.CODEX_HELP_WAIT", 60),
             ):
                 prog = str(folder / "codex")
-                self.assertEqual(shlex.split(mod.agent_command("codex")), [prog, "--no-alt-screen", *new_flags], name)
+                self.assertEqual(
+                    shlex.split(mod.agent_command("codex")),
+                    [prog, "--no-alt-screen", *new_flags, "--dangerously-bypass-approvals-and-sandbox"],
+                    name,
+                )
                 self.assertEqual(
                     shlex.split(mod.agent_command("codex", ["resume", "sid-1"])),
-                    [prog, "resume", "--no-alt-screen", *resume_flags, "sid-1"],
+                    [prog, "resume", "--no-alt-screen", *resume_flags, "--dangerously-bypass-approvals-and-sandbox", "sid-1"],
                     name,
                 )
             calls = log.read_text(encoding="utf-8").splitlines()
@@ -4933,7 +4937,10 @@ class RoomTest(Base):
         folder, _ = fake("silent", {})  # answers nothing: starts as before, and soon
         with mock.patch.dict(os.environ, {"PATH": f"{folder}{os.pathsep}{os.environ['PATH']}"}):
             began = time.monotonic()
-            self.assertEqual(shlex.split(mod.agent_command("codex")), [str(folder / "codex"), "--no-alt-screen"])
+            self.assertEqual(
+                shlex.split(mod.agent_command("codex")),
+                [str(folder / "codex"), "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox"],
+            )
             self.assertLess(time.monotonic() - began, 10)
         self.assertNotIn("--no-daemon", mod.agent_command("claude"), "Claude is not touched")
 
@@ -15457,7 +15464,9 @@ class DeliveryTest(Base):
         self.assertTrue(self.wait_for(pane, "Restarting Коди with its conversation"), self.screen(pane))
         self.assertTrue(self.until(argv.exists), "the program started again")
         self.assertEqual(
-            argv.read_text().split(), ["resume", "--no-alt-screen", sid], "its own conversation, not the other Codex's"
+            argv.read_text().split(),
+            ["resume", "--no-alt-screen", "--dangerously-bypass-approvals-and-sandbox", sid],
+            "its own conversation, not the other Codex's",
         )
         kodi = next(p for p in json.loads(self.cfg.read_text())["participants"] if p["id"] == "kodi")
         self.assertEqual(kodi["target"], agent[0], "the same window")
@@ -17482,12 +17491,14 @@ class DeliveryTest(Base):
             self.assertEqual(flags[0], "0", "Codex must not discard its output in an alternate screen")
             self.assertGreater(int(flags[1]), 0, "output remains available for the wheel")
             history = subprocess.run(
-                ["tmux", "capture-pane", "-p", "-S", "-", "-t", pane], capture_output=True, text=True, check=True
+                ["tmux", "capture-pane", "-p", "-J", "-S", "-", "-t", pane], capture_output=True, text=True, check=True
             ).stdout
             self.assertIn("history 0", history)
             self.assertIn("--no-alt-screen", history)
             if resumed:
-                self.assertIn("['resume', '--no-alt-screen', 'conversation-123']", history)
+                self.assertIn(
+                    "['resume', '--no-alt-screen', '--dangerously-bypass-approvals-and-sandbox', 'conversation-123']", history
+                )
 
         pid = mod.launch_new_agent(mod.load_config(), "codex", str(self.root), "Probe")
         entry = next(p for p in mod.load_config()["participants"] if p["id"] == pid)

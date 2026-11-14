@@ -109,7 +109,8 @@ def open_scenarios_into(wizard: dict[str, Any], lang: str = "en") -> None:
         + [
             (m_i18n.tr("{p0} — {p1}", p0=m_store.scenario_title(name, lang), p1=m_store.scenario_hint(name, lang)), name)
             for name in [*m_store.SCENARIOS, *m_store.own_scenarios(list(m_screen.PRESETS))[0]]
-        ],
+        ]
+        + [(m_i18n.tr("Room settings", lang=lang), "room")],
     )
 
 
@@ -146,6 +147,7 @@ ROOM_FIELDS = {
     "round": lambda: m_i18n.tr("Lead's rounds"),
     "output": lambda: m_i18n.tr("Result file"),
     "without_person": lambda: m_i18n.tr("Without you"),
+    "codex_sandbox": lambda: m_i18n.tr("Codex sandbox"),
 }
 MODELS = {"claude": ["opus", "sonnet", "haiku"], "codex": []}
 
@@ -181,6 +183,8 @@ def open_team_menu(ctx: ChatCommandContext, cfg: dict[str, Any]) -> None:
 
 
 def setting_shown(key: str, value: object, cfg: dict[str, Any]) -> str:
+    if key == "codex_sandbox":
+        return m_i18n.tr("On") if value else m_i18n.tr("Off — no sandbox or approvals")
     if value is None:
         return "default"
     if key == "context_trim":
@@ -194,6 +198,8 @@ def setting_shown(key: str, value: object, cfg: dict[str, Any]) -> str:
 
 def when_words(cfg: dict[str, Any], who: str, key: str) -> str:
     """When a change starts to act — said before it is saved."""
+    if who == "room" and key == "codex_sandbox":
+        return m_i18n.tr("Applies on the next Codex start or /restart. Turn /vpn off before starting Codex with its sandbox on.")
     if who == "room":
         return m_i18n.tr("The agents get it with their next assignment.")
     if key == "use_model":
@@ -213,6 +219,11 @@ def when_words(cfg: dict[str, Any], who: str, key: str) -> str:
 def field_options(cfg: dict[str, Any], who: str, key: str) -> list[tuple[str, str]]:
     """The values to choose from for one field; «the default» takes the explicit one away."""
     if who == "room":
+        if key == "codex_sandbox":
+            return [
+                (m_i18n.tr("On — workspace writes, approvals on request"), "on"),
+                (m_i18n.tr("Off — no sandbox or approvals (default)"), "off"),
+            ]
         if key == "lead":
             return [(m_text.visible(p.get("label") or p["id"]), p["id"]) for p in m_deliver.agents_of(cfg)]
         if key == "round":
@@ -253,6 +264,8 @@ def field_options(cfg: dict[str, Any], who: str, key: str) -> list[tuple[str, st
 def chosen_value(key: str, value: str, cfg: dict[str, Any]) -> object:
     if value == "default":
         return None
+    if key == "codex_sandbox":
+        return value == "on"
     if key == "context_trim":
         return m_store.MEMORY[value]
     if key == "round":
@@ -1141,6 +1154,10 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         return
     lang = m_store.room_language(ctx.config)
     if ctx.wizard.get("step") == "scenario_pick":
+        if line == "room":
+            open_team_menu(ctx, m_store.load_config())
+            team_step(ctx, "room", say_)
+            return
         if line == "none":
             ctx.wizard.clear()
             say_(m_i18n.words_in("team.none.said", lang))

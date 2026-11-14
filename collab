@@ -262,7 +262,7 @@ def paths() -> InstallPaths:
 
 # The version of this collab: each public release carries it as its tag, v<VERSION>. A new release
 # raises it — the publishing refuses a version that is already released.
-VERSION = "0.1.34"
+VERSION = "0.1.35"
 
 
 def _safe_mode(st: os.stat_result, group_may_write: bool = False) -> bool:
@@ -1307,6 +1307,27 @@ LANGS = ("en", "ru")
 LANG_NAMES = {"en": "English", "ru": "Русский"}
 
 CATALOG: dict[str, dict[str, Any]] = {
+    "t.2e77763e91": {"en": "Room settings", "ru": "Настройки комнаты"},
+    "t.e6ccef54b8": {
+        "en": "Keeping the saved Codex sandbox/approval options; choose /team → The room → Codex sandbox to replace them.",
+        "ru": "Сохранены прежние параметры песочницы/подтверждений Codex; чтобы заменить их, выберите /team → Комната → Песочница Codex.",
+    },
+    "t.95184c9597": {"en": "Codex sandbox", "ru": "Песочница Codex"},
+    "t.e0049a6651": {"en": "On", "ru": "Вкл"},
+    "t.84e7aa55fe": {"en": "Off — no sandbox or approvals", "ru": "Выкл — без песочницы и подтверждений"},
+    "t.1587d42fba": {
+        "en": "Applies on the next Codex start or /restart. Turn /vpn off before starting Codex with its sandbox on.",
+        "ru": "Применится при следующем запуске Codex или /restart. Перед запуском Codex с песочницей выключите /vpn.",
+    },
+    "t.deb2af250d": {
+        "en": "On — workspace writes, approvals on request",
+        "ru": "Вкл — запись в проекте, подтверждения по запросу",
+    },
+    "t.ca47aaad14": {
+        "en": "Off — no sandbox or approvals (default)",
+        "ru": "Выкл — без песочницы и подтверждений (по умолчанию)",
+    },
+    "change.field.codex_sandbox": {"en": "Codex sandbox", "ru": "песочница Codex"},
     "t.e200b6162c": {"en": "Starting a new conversation for {p0}.", "ru": "Запускается новый разговор для {p0}."},
     "t.db41ce55d9": {
         "en": "The agent changed. Choose it again in /restart.",
@@ -4245,6 +4266,8 @@ def team_problems(config: dict[str, Any]) -> list[str]:
         out.append(f"the room's goal must be text of 1 to {GOAL_LIMIT} characters without control characters")
     if "round" in team and team["round"] is not False and round_of(config) is None:
         out.append("the lead's round must be minutes from 1 to 1440, or false")
+    if "codex_sandbox" in team and type(team["codex_sandbox"]) is not bool:
+        out.append("codex_sandbox must be a boolean")
     if team.get("output") and not output_of(config):
         out.append("the result file must be a path inside the project folder")
     return out
@@ -5121,9 +5144,11 @@ def set_room_language(lang: str) -> None:
 
 @room_locked
 def set_team(team: dict[str, Any]) -> None:
-    """The room's `team` block, replaced whole under the room's lock."""
+    """Replace the scenario under the room's lock, keeping its explicit Codex permission policy."""
     data = read_config_raw()
-    data["team"] = team
+    previous = team_of(data)
+    policy = {"codex_sandbox": previous["codex_sandbox"]} if "codex_sandbox" in previous else {}
+    data["team"] = {**policy, **team}
     write_config(data)
     note_settings(data)
 
@@ -5131,7 +5156,7 @@ def set_team(team: dict[str, Any]) -> None:
 # What the person changes in a running team (/team), and what the lead changes for them later: each a record
 # of the room's history, «who · what · before → after», under the room's lock. «None» after: the explicit value
 # goes, and the layer below applies again (its seat's, the room's, the built-in one).
-ROOM_KEYS = ("lead", "goal", "round", "output", "without_person")
+ROOM_KEYS = ("lead", "goal", "round", "output", "without_person", "codex_sandbox")
 
 
 def changes_path() -> Path:
@@ -5276,6 +5301,8 @@ def change_words(data: dict[str, Any], rec: dict[str, Any], lang: str = "") -> s
         return words_in(key, lang)
 
     def shown(key: str, v: object, who: str) -> str:
+        if key == "codex_sandbox":
+            return tr("On", lang=lang) if v else tr("Off — no sandbox or approvals", lang=lang)
         if v is None:
             return w("change.default")
         if key == "topic" and isinstance(v, str):
@@ -7252,7 +7279,8 @@ def mac_vpn_environment(environment: Mapping[str, str], endpoint: MacVpnEndpoint
 def mac_vpn_command(kind: str, command: Tuple[str, ...], endpoint: MacVpnEndpoint) -> Tuple[str, ...]:
     if kind not in ("codex", "claude") or not command or any(not part or "\x00" in part for part in command):
         raise ValueError("unsupported VPN agent command")
-    if kind == "codex":
+    options = command[1 : command.index("--")] if "--" in command else command[1:]
+    if kind == "codex" and "--dangerously-bypass-approvals-and-sandbox" not in options:
         # The outer Seatbelt is the network boundary; nested sandbox_apply fails on macOS.
         command = (command[0], "--dangerously-bypass-approvals-and-sandbox", *command[1:])
     return ("/usr/bin/sandbox-exec", "-p", mac_vpn_profile(endpoint), *command)
@@ -8256,11 +8284,18 @@ def mac_vpn_enabled(config: Mapping[str, Any]) -> bool:
 def mac_vpn_wrap(kind: str, command: str, config: Mapping[str, Any]) -> str:
     if not mac_vpn_enabled(config):
         return command
+    if kind == "codex" and config.get("team", {}).get("codex_sandbox", False):
+        raise ValueError("Codex sandbox cannot run inside the macOS VPN sandbox; turn /vpn off first")
     if sys.platform != "darwin" or kind not in ("codex", "claude"):
         raise ValueError("network-only VPN supports macOS Codex and Claude only")
     arguments = shlex.split(command)
     if not arguments:
         raise ValueError("VPN agent command is empty")
+    options = arguments[1 : arguments.index("--")] if "--" in arguments else arguments[1:]
+    if kind == "codex" and any(
+        arg.split("=", 1)[0] in ("--sandbox", "--ask-for-approval", "--full-auto") or arg[:2] in ("-s", "-a") for arg in options
+    ):
+        raise ValueError("Saved Codex sandbox/approval options cannot run inside the macOS VPN sandbox; turn /vpn off first")
     return shlex.join([sys.executable, "-I", "-S", SELF, "vpn-agent", "--kind", kind, "--", *arguments])
 
 
@@ -17958,7 +17993,19 @@ def ensure_agent_cli(kind: str, progress: Any = None, cancel: Any = None) -> str
     return use_agent_cli(installed_agent_path(kind, root))
 
 
-def agent_command(kind: str, resume: list[str] | None = None, model: str = "", yolo: bool = False) -> str:
+def codex_sandbox_flags(enabled: bool) -> list[str]:
+    if type(enabled) is not bool:
+        raise ValueError("codex_sandbox must be a boolean")
+    return (
+        ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
+        if enabled
+        else ["--dangerously-bypass-approvals-and-sandbox"]
+    )
+
+
+def agent_command(
+    kind: str, resume: list[str] | None = None, model: str = "", yolo: bool = False, codex_sandbox: bool = False
+) -> str:
     """The same preset arguments for /add, relaunch and /restart, including resume, the model its
     settings give it and, for a Kimi that explicitly opted in, Ask When Needed."""
     preset = PRESETS[kind]["command"]
@@ -17969,8 +18016,9 @@ def agent_command(kind: str, resume: list[str] | None = None, model: str = "", y
     if kind == "codex":
         # Its own process, not the shared background server (the person's Codex app keeps one): through
         # it a room's Codex did not take the rule written for it just before its start, and the person
-        # approved every say by hand. Sandbox and approvals stay as they are.
+        # approved every say by hand.
         flags = ["--no-daemon"] if codex_knows_no_daemon(program, (resume or [])[:1]) else []
+        flags += codex_sandbox_flags(codex_sandbox)
         if resume:
             return shlex.join([program, resume[0], *preset[1:], *flags, *chosen, *resume[1:]])
         return shlex.join([program, *preset[1:], *flags, *chosen])
@@ -18012,7 +18060,9 @@ def launch_new_agent(
     cli = (
         codex_room_rule(pid, folder, label) if kind == "codex" and not mac_vpn_enabled(fresh) else ""
     )
-    command = mac_vpn_wrap(kind, agent_command(kind, model=model, yolo=yolo), fresh)
+    command = mac_vpn_wrap(
+        kind, agent_command(kind, model=model, yolo=yolo, codex_sandbox=team_of(fresh).get("codex_sandbox", False)), fresh
+    )
     pane = ""
     code = uuid.uuid4().hex[:4]
     token = prepare_kimi_launch(pid, code, folder, kimi_usage_adapter(command)) if kind == "kimi" else ""
@@ -18734,7 +18784,14 @@ def relaunch_agent(session: str, p: dict[str, Any]) -> str:
     )
     code = uuid.uuid4().hex[:4]
     command = mac_vpn_wrap(
-        kind, agent_command(kind, model=model_for(p), yolo=bool(p.get("yolo"))), launch_config
+        kind,
+        agent_command(
+            kind,
+            model=model_for(p),
+            yolo=bool(p.get("yolo")),
+            codex_sandbox=team_of(launch_config).get("codex_sandbox", False),
+        ),
+        launch_config,
     )
     token = prepare_kimi_launch(p["id"], code, folder, kimi_usage_adapter(command)) if kind == "kimi" else ""
     if token:
@@ -19054,7 +19111,15 @@ def restart_in_window(session: str, p: dict[str, Any], kind: str, sid: str, adop
     )  # the newest rule, read at its start
     resume = (["--resume" if kind == "claude" else "--session", sid] if kind != "codex" else ["resume", sid]) if sid else []
     command = mac_vpn_wrap(
-        kind, agent_command(kind, resume, model_for(p), yolo=bool(p.get("yolo"))), launch_config
+        kind,
+        agent_command(
+            kind,
+            resume,
+            model_for(p),
+            yolo=bool(p.get("yolo")),
+            codex_sandbox=team_of(launch_config).get("codex_sandbox", False),
+        ),
+        launch_config,
     )
     code = uuid.uuid4().hex[:4]
     token = ""
@@ -19887,6 +19952,31 @@ def open_room_windows(
         if p.get("command"):
             cmd = current_chat_command(p["command"])
             cmd[0] = shutil.which(cmd[0]) or cmd[0]
+            if not is_chat_command(p["command"]) and agent_kind(p) == "codex" and Path(cmd[0]).name == "codex":
+                team = team_of(config)
+                switches = ("--dangerously-bypass-approvals-and-sandbox", "--full-auto")
+                valued = ("--sandbox", "-s", "--ask-for-approval", "-a")
+                options = cmd[1 : cmd.index("--")] if "--" in cmd else cmd[1:]
+                safety = any(arg.split("=", 1)[0] in (*switches, *valued) or arg[:2] in ("-s", "-a") for arg in options)
+                if safety and "codex_sandbox" not in team:
+                    print(
+                        tr(
+                            "Keeping the saved Codex sandbox/approval options; choose /team → The room → Codex sandbox to replace them."
+                        )
+                    )
+                else:
+                    # An explicit room choice replaces legacy safety options, preserving the other arguments.
+                    args = iter(cmd[1:])
+                    kept = []
+                    for arg in args:
+                        if arg == "--":
+                            kept.extend([arg, *args])
+                            break
+                        if arg in valued:
+                            next(args, None)
+                        elif arg.split("=", 1)[0] not in (*switches, *valued) and arg[:2] not in ("-s", "-a"):
+                            kept.append(arg)
+                    cmd = [cmd[0], *codex_sandbox_flags(team.get("codex_sandbox", False)), *kept]
             program = " ".join(shlex.quote(x) for x in cmd)
             if not is_chat_command(p["command"]):
                 program = mac_vpn_wrap(agent_kind(p), program, config)
@@ -22754,7 +22844,8 @@ def open_scenarios_into(wizard: dict[str, Any], lang: str = "en") -> None:
         + [
             (tr("{p0} — {p1}", p0=scenario_title(name, lang), p1=scenario_hint(name, lang)), name)
             for name in [*SCENARIOS, *own_scenarios(list(PRESETS))[0]]
-        ],
+        ]
+        + [(tr("Room settings", lang=lang), "room")],
     )
 
 
@@ -22791,6 +22882,7 @@ ROOM_FIELDS = {
     "round": lambda: tr("Lead's rounds"),
     "output": lambda: tr("Result file"),
     "without_person": lambda: tr("Without you"),
+    "codex_sandbox": lambda: tr("Codex sandbox"),
 }
 MODELS = {"claude": ["opus", "sonnet", "haiku"], "codex": []}
 
@@ -22826,6 +22918,8 @@ def open_team_menu(ctx: ChatCommandContext, cfg: dict[str, Any]) -> None:
 
 
 def setting_shown(key: str, value: object, cfg: dict[str, Any]) -> str:
+    if key == "codex_sandbox":
+        return tr("On") if value else tr("Off — no sandbox or approvals")
     if value is None:
         return "default"
     if key == "context_trim":
@@ -22839,6 +22933,8 @@ def setting_shown(key: str, value: object, cfg: dict[str, Any]) -> str:
 
 def when_words(cfg: dict[str, Any], who: str, key: str) -> str:
     """When a change starts to act — said before it is saved."""
+    if who == "room" and key == "codex_sandbox":
+        return tr("Applies on the next Codex start or /restart. Turn /vpn off before starting Codex with its sandbox on.")
     if who == "room":
         return tr("The agents get it with their next assignment.")
     if key == "use_model":
@@ -22858,6 +22954,11 @@ def when_words(cfg: dict[str, Any], who: str, key: str) -> str:
 def field_options(cfg: dict[str, Any], who: str, key: str) -> list[tuple[str, str]]:
     """The values to choose from for one field; «the default» takes the explicit one away."""
     if who == "room":
+        if key == "codex_sandbox":
+            return [
+                (tr("On — workspace writes, approvals on request"), "on"),
+                (tr("Off — no sandbox or approvals (default)"), "off"),
+            ]
         if key == "lead":
             return [(visible(p.get("label") or p["id"]), p["id"]) for p in agents_of(cfg)]
         if key == "round":
@@ -22898,6 +22999,8 @@ def field_options(cfg: dict[str, Any], who: str, key: str) -> list[tuple[str, st
 def chosen_value(key: str, value: str, cfg: dict[str, Any]) -> object:
     if value == "default":
         return None
+    if key == "codex_sandbox":
+        return value == "on"
     if key == "context_trim":
         return MEMORY[value]
     if key == "round":
@@ -23786,6 +23889,10 @@ def wizard_step(ctx: ChatCommandContext, line: str, said: list[str]) -> None:
         return
     lang = room_language(ctx.config)
     if ctx.wizard.get("step") == "scenario_pick":
+        if line == "room":
+            open_team_menu(ctx, load_config())
+            team_step(ctx, "room", say_)
+            return
         if line == "none":
             ctx.wizard.clear()
             say_(words_in("team.none.said", lang))

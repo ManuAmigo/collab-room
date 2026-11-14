@@ -710,6 +710,31 @@ def open_room_windows(
         if p.get("command"):
             cmd = m_store.current_chat_command(p["command"])
             cmd[0] = shutil.which(cmd[0]) or cmd[0]
+            if not m_store.is_chat_command(p["command"]) and m_screen.agent_kind(p) == "codex" and Path(cmd[0]).name == "codex":
+                team = m_store.team_of(config)
+                switches = ("--dangerously-bypass-approvals-and-sandbox", "--full-auto")
+                valued = ("--sandbox", "-s", "--ask-for-approval", "-a")
+                options = cmd[1 : cmd.index("--")] if "--" in cmd else cmd[1:]
+                safety = any(arg.split("=", 1)[0] in (*switches, *valued) or arg[:2] in ("-s", "-a") for arg in options)
+                if safety and "codex_sandbox" not in team:
+                    print(
+                        m_i18n.tr(
+                            "Keeping the saved Codex sandbox/approval options; choose /team → The room → Codex sandbox to replace them."
+                        )
+                    )
+                else:
+                    # An explicit room choice replaces legacy safety options, preserving the other arguments.
+                    args = iter(cmd[1:])
+                    kept = []
+                    for arg in args:
+                        if arg == "--":
+                            kept.extend([arg, *args])
+                            break
+                        if arg in valued:
+                            next(args, None)
+                        elif arg.split("=", 1)[0] not in (*switches, *valued) and arg[:2] not in ("-s", "-a"):
+                            kept.append(arg)
+                    cmd = [cmd[0], *m_agents.codex_sandbox_flags(team.get("codex_sandbox", False)), *kept]
             program = " ".join(shlex.quote(x) for x in cmd)
             if not m_store.is_chat_command(p["command"]):
                 program = m_vpn_macos_room.mac_vpn_wrap(m_screen.agent_kind(p), program, config)

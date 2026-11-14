@@ -2,6 +2,11 @@
 
 What each release brings. Newest first. · Что приносит каждый выпуск, новые сверху.
 
+## 0.1.35
+
+- Room-managed Codex now starts without its own sandbox or approval prompts by default, with VPN on or off. Restore `workspace-write` and approvals on request in `/team` → The room → Codex sandbox → On, then restart Codex. Existing explicit options in legacy commands remain until a room choice is made; user configuration is unchanged. · Codex, запускаемый комнатой, теперь по умолчанию работает без собственной песочницы и подтверждений, с VPN и без. Вернуть `workspace-write` и подтверждения по запросу можно в `/team` → Комната → Песочница Codex → Вкл, затем перезапустить Codex. Явные параметры старых команд сохраняются до выбора настройки комнаты; пользовательские конфиги не меняются.
+- The Codex sandbox setting is available before the first agent starts and stays selected when launching a scenario. Combining it with the macOS VPN sandbox refuses the launch explicitly; turn VPN off first. · Настройка песочницы Codex доступна до запуска первого агента и сохраняется при старте сценария. При сочетании с песочницей VPN macOS запуск явно отклоняется; сначала выключите VPN.
+
 ## 0.1.34
 
 - Turning agent VPN off also disables VPN for subsequent agent launches in the current room after protected agents stop. · Выключение VPN агентов после их остановки также отключает VPN для следующих запусков агентов в текущей комнате.

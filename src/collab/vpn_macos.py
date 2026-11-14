@@ -124,7 +124,8 @@ def mac_vpn_environment(environment: Mapping[str, str], endpoint: MacVpnEndpoint
 def mac_vpn_command(kind: str, command: Tuple[str, ...], endpoint: MacVpnEndpoint) -> Tuple[str, ...]:
     if kind not in ("codex", "claude") or not command or any(not part or "\x00" in part for part in command):
         raise ValueError("unsupported VPN agent command")
-    if kind == "codex":
+    options = command[1 : command.index("--")] if "--" in command else command[1:]
+    if kind == "codex" and "--dangerously-bypass-approvals-and-sandbox" not in options:
         # The outer Seatbelt is the network boundary; nested sandbox_apply fails on macOS.
         command = (command[0], "--dangerously-bypass-approvals-and-sandbox", *command[1:])
     return ("/usr/bin/sandbox-exec", "-p", mac_vpn_profile(endpoint), *command)

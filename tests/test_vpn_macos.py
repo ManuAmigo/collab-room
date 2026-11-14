@@ -53,6 +53,12 @@ class MacVpnPolicyTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mod.mac_vpn_command("kimi", ("/bin/agent",), endpoint)
 
+    def test_codex_bypass_is_not_duplicated_or_taken_from_prompt(self):
+        flag = "--dangerously-bypass-approvals-and-sandbox"
+        endpoint = mod.MacVpnEndpoint(43210)
+        self.assertEqual(mod.mac_vpn_command("codex", ("/bin/agent", flag), endpoint).count(flag), 1)
+        self.assertEqual(mod.mac_vpn_command("codex", ("/bin/agent", "--", flag), endpoint).count(flag), 2)
+
     def test_config_has_only_vless_route_and_no_local_resolver(self):
         secret = mod.VpnCredentials(str(uuid.uuid4()), "/private-ws")
         account = mod.VpnAccount(secret, "8.8.4.4", None)

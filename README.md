@@ -382,6 +382,25 @@ account. Verification covers the original process group; detached descendants an
 workarounds require separate review. An unconfirmed shutdown blocks another supervisor
 start until its state has been checked.
 
+## Codex permissions
+
+Room-managed Codex starts **without its own sandbox or approval prompts by default**,
+using `--dangerously-bypass-approvals-and-sandbox`, with VPN on or off. It can access
+files and run commands with your OS account’s permissions. This also applies to
+new agents, room reopening, and `/restart`, including resumed conversations.
+Legacy saved commands with explicit sandbox/approval options keep those options
+until you explicitly choose the room setting below; a launch hint explains this.
+Custom launch commands for other executables keep their arguments unchanged.
+
+To restore Codex’s sandbox, choose `/team` → **The room** → **Codex sandbox** →
+**On**, then save and restart Codex. In an empty room, choose **Room settings**
+from `/team` before adding your first agent. Subsequent launches explicitly use
+`--sandbox workspace-write --ask-for-approval on-request`. Existing processes keep
+their current permissions until restarted. This room setting does not modify your
+`~/.codex` configuration. Codex’s own sandbox cannot nest inside the macOS VPN
+sandbox: turn `/vpn` off before launching Codex with its own sandbox enabled;
+otherwise the launch is refused. Turning the setting off restores the default.
+
 ## Contributing
 
 ```sh

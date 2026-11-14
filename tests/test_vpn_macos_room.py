@@ -34,6 +34,7 @@ class MacVpnRoomRouteTests(unittest.TestCase):
         }
         self.mod.write_config(self.config)
         self.rules = mock.Mock(return_value="")
+        self.real_agent_command = self.mod.agent_command
 
         def fake_tmux(*arguments, **_):
             if arguments[0] == "display-message":
@@ -54,6 +55,160 @@ class MacVpnRoomRouteTests(unittest.TestCase):
             ("log", "append_message", mock.Mock()),
         ):
             self.enterContext(seam(self.mod, owner + "." + name, replacement))
+
+    def test_room_policy_reaches_every_launch_route(self):
+        participant = {
+            "id": "probe",
+            "kind": "codex",
+            "folder": str(self.project),
+            "started_by_room": True,
+            "target": "%5",
+            "pane_pid": "8123",
+        }
+        self.config["participants"].append(participant)
+        with (
+            seam(self.mod, "agents.agent_command", self.real_agent_command),
+            seam(self.mod, "agents.codex_knows_no_daemon", mock.Mock(return_value=False)),
+            seam(self.mod, "agents.agent_window_alive", mock.Mock(return_value=True)),
+        ):
+            for vpn in (False, True):
+                for sandbox in (False, True):
+                    self.config.update(macos_vpn=vpn, team={"codex_sandbox": sandbox})
+                    self.mod.write_config(self.config)
+                    routes = {
+                        "add": lambda: self.mod.launch_new_agent(self.config, "codex", str(self.project), "New"),
+                        "relaunch": lambda: self.mod.relaunch_agent("vpn-test", participant),
+                        "restart": lambda: self.mod.restart_in_window("vpn-test", participant, "codex", ""),
+                        "resume": lambda: self.mod.restart_in_window("vpn-test", participant, "codex", "session-id"),
+                        "initial": lambda: self.mod.open_room_windows(
+                            "vpn-test", self.config, [{**participant, "command": ["codex", "--no-alt-screen"]}], [], [], {}
+                        ),
+                    }
+                    for route, launch in routes.items():
+                        with self.subTest(vpn=vpn, sandbox=sandbox, route=route):
+                            self.tmux.reset_mock()
+                            if vpn and sandbox:
+                                with self.assertRaisesRegex(ValueError, "VPN"):
+                                    launch()
+                                self.assertFalse(
+                                    any(
+                                        c.args[0] in ("new-window", "respawn-pane", "new-session")
+                                        for c in self.tmux.call_args_list
+                                    )
+                                )
+                                continue
+                            launch()
+                            command = next(
+                                c.args[-1]
+                                for c in self.tmux.call_args_list
+                                if c.args[0] in ("new-window", "respawn-pane", "new-session")
+                            )
+                            argv = shlex.split(command)
+                            self.assertEqual(argv.count("--dangerously-bypass-approvals-and-sandbox"), 0 if sandbox else 1)
+                            self.assertEqual("vpn-agent" in argv, vpn)
+                            if sandbox:
+                                self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
+                                self.assertEqual(argv[argv.index("--ask-for-approval") + 1], "on-request")
+
+    def test_legacy_command_keeps_explicit_options_until_room_choice(self):
+        self.config["macos_vpn"] = False
+        for flag in ("--dangerously-bypass-approvals-and-sandbox", "--sandbox=read-only", "--full-auto"):
+            with self.subTest(flag=flag):
+                self.tmux.reset_mock()
+                self.mod.open_room_windows(
+                    "vpn-test", self.config, [{"id": "probe", "kind": "codex", "command": ["codex", flag]}], [], [], {}
+                )
+                command = next(c.args[-1] for c in self.tmux.call_args_list if c.args[0] == "new-session")
+                self.assertIn(flag, shlex.split(command))
+                if flag != "--dangerously-bypass-approvals-and-sandbox":
+                    self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", shlex.split(command))
+
+    def test_explicit_room_choice_replaces_legacy_options_preserving_arguments(self):
+        self.config["macos_vpn"] = False
+        for sandbox in (False, True):
+            self.config["team"] = {"codex_sandbox": sandbox}
+            self.tmux.reset_mock()
+            self.mod.open_room_windows(
+                "vpn-test",
+                self.config,
+                [
+                    {
+                        "id": "probe",
+                        "kind": "codex",
+                        "command": [
+                            "codex",
+                            "--full-auto",
+                            "--dangerously-bypass-approvals-and-sandbox",
+                            "--sandbox=read-only",
+                            "-a",
+                            "never",
+                            "--model",
+                            "example",
+                            "--",
+                            "prompt with spaces",
+                        ],
+                    }
+                ],
+                [],
+                [],
+                {},
+            )
+            command = next(c.args[-1] for c in self.tmux.call_args_list if c.args[0] == "new-session")
+            argv = shlex.split(command)
+            self.assertEqual("--dangerously-bypass-approvals-and-sandbox" in argv, not sandbox)
+            self.assertNotIn("--full-auto", argv)
+            self.assertNotIn("--sandbox=read-only", argv)
+            self.assertNotIn("never", argv)
+            self.assertEqual(argv[-4:], ["--model", "example", "--", "prompt with spaces"])
+            if sandbox:
+                self.assertIn("workspace-write", argv)
+                self.assertIn("on-request", argv)
+
+    def test_legacy_sandbox_resume_and_vpn_preserve_the_choice(self):
+        commands = [
+            ["codex", "resume", "-s", "read-only", "-a", "on-request", "sid"],
+            ["codex", "resume", "--sandbox=read-only", "--ask-for-approval=on-request", "sid"],
+            ["codex", "resume", "-sread-only", "-aon-request", "sid"],
+        ]
+        for command in commands:
+            participant = {"id": "probe", "kind": "codex", "command": command}
+            self.config["participants"] = [self.config["participants"][0], participant]
+            self.config.pop("team", None)
+            self.config["macos_vpn"] = False
+            self.mod.write_config(self.config)
+            self.tmux.reset_mock()
+            self.mod.open_room_windows("vpn-test", self.config, [participant], [], [], {})
+            actual = next(c.args[-1] for c in self.tmux.call_args_list if c.args[0] == "new-session")
+            self.assertEqual(shlex.split(actual)[-(len(command) - 1) :], command[1:])
+            self.config["macos_vpn"] = True
+            self.tmux.reset_mock()
+            with self.assertRaisesRegex(ValueError, "VPN"):
+                self.mod.open_room_windows("vpn-test", self.config, [participant], [], [], {})
+            self.tmux.assert_not_called()
+            self.config["team"] = {"codex_sandbox": False}
+            self.mod.write_config(self.config)
+            self.mod.open_room_windows("vpn-test", self.config, [participant], [], [], {})
+            actual = next(c.args[-1] for c in self.tmux.call_args_list if c.args[0] == "new-session")
+            argv = shlex.split(actual)
+            self.assertIn("--dangerously-bypass-approvals-and-sandbox", argv)
+            self.assertIn("resume", argv)
+            self.assertEqual(argv[-1], "sid")
+
+    def test_safety_words_after_separator_are_only_prompt_text(self):
+        self.config["macos_vpn"] = True
+        self.config["participants"].append({"id": "probe", "kind": "codex"})
+        self.mod.write_config(self.config)
+        self.mod.open_room_windows(
+            "vpn-test",
+            self.config,
+            [{"id": "probe", "kind": "codex", "command": ["codex", "--", "--sandbox=read-only"]}],
+            [],
+            [],
+            {},
+        )
+        actual = next(c.args[-1] for c in self.tmux.call_args_list if c.args[0] == "new-session")
+        self.assertEqual(shlex.split(actual)[-2:], ["--", "--sandbox=read-only"])
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", shlex.split(actual))
 
     def test_add_uses_network_wrapper_when_room_enabled(self):
         self.mod.launch_new_agent(self.config, "codex", str(self.project), "Probe")

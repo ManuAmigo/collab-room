@@ -13,6 +13,27 @@ LANGS = ("en", "ru")
 LANG_NAMES = {"en": "English", "ru": "Русский"}
 
 CATALOG: dict[str, dict[str, Any]] = {
+    "t.2e77763e91": {"en": "Room settings", "ru": "Настройки комнаты"},
+    "t.e6ccef54b8": {
+        "en": "Keeping the saved Codex sandbox/approval options; choose /team → The room → Codex sandbox to replace them.",
+        "ru": "Сохранены прежние параметры песочницы/подтверждений Codex; чтобы заменить их, выберите /team → Комната → Песочница Codex.",
+    },
+    "t.95184c9597": {"en": "Codex sandbox", "ru": "Песочница Codex"},
+    "t.e0049a6651": {"en": "On", "ru": "Вкл"},
+    "t.84e7aa55fe": {"en": "Off — no sandbox or approvals", "ru": "Выкл — без песочницы и подтверждений"},
+    "t.1587d42fba": {
+        "en": "Applies on the next Codex start or /restart. Turn /vpn off before starting Codex with its sandbox on.",
+        "ru": "Применится при следующем запуске Codex или /restart. Перед запуском Codex с песочницей выключите /vpn.",
+    },
+    "t.deb2af250d": {
+        "en": "On — workspace writes, approvals on request",
+        "ru": "Вкл — запись в проекте, подтверждения по запросу",
+    },
+    "t.ca47aaad14": {
+        "en": "Off — no sandbox or approvals (default)",
+        "ru": "Выкл — без песочницы и подтверждений (по умолчанию)",
+    },
+    "change.field.codex_sandbox": {"en": "Codex sandbox", "ru": "песочница Codex"},
     "t.e200b6162c": {"en": "Starting a new conversation for {p0}.", "ru": "Запускается новый разговор для {p0}."},
     "t.db41ce55d9": {
         "en": "The agent changed. Choose it again in /restart.",
